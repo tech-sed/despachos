@@ -11,13 +11,36 @@ const VUELTAS = [
   { vuelta: 4, label: 'Vuelta 4 — 15:00 a 17:00hs' },
 ]
 
+const SUCURSAL_MAP: { [key: string]: string } = {
+  '520': 'LP520',
+  '139': 'LP139',
+  'GUERNICA': 'Guernica',
+  'CAÑUELAS': 'Cañuelas',
+  'CANUELAS': 'Cañuelas',
+}
+
+function detectarSucursal(texto: string): string {
+  const upper = texto.toUpperCase()
+  if (upper.includes('520')) return 'LP520'
+  if (upper.includes('139')) return 'LP139'
+  if (upper.includes('GUERNICA')) return 'Guernica'
+  if (upper.includes('CAÑUELAS') || upper.includes('CANUELAS')) return 'Cañuelas'
+  return ''
+}
+
 export default function NuevoDespacho() {
   const router = useRouter()
   const [loading, setLoading] = useState(false)
+  const [leyendoPDF, setLeyendoPDF] = useState(false)
   const [error, setError] = useState('')
   const [exito, setExito] = useState(false)
   const [cuposDisponibles, setCuposDisponibles] = useState<number[]>([])
   const [verificando, setVerificando] = useState(false)
+  const [productosNV, setProductosNV] = useState<any[]>([])
+  const [pesoTotal, setPesoTotal] = useState(0)
+  const [posicionesTotal, setPosicionesTotal] = useState(0)
+  const [pdfFile, setPdfFile] = useState<File | null>(null)
+  const [pdfListo, setPdfListo] = useState(false)
 
   const [form, setForm] = useState({
     nv: '',
@@ -61,7 +84,6 @@ export default function NuevoDespacho() {
         .eq('vuelta', vuelta)
         .neq('estado', 'reprogramado')
 
-      // Buscar configuracion de cupos para esa sucursal/fecha/vuelta
       const { data: cupo } = await supabase
         .from('cupos')
         .select('camiones_disponibles, pedidos_max_por_camion')
@@ -70,25 +92,88 @@ export default function NuevoDespacho() {
         .eq('vuelta', vuelta)
         .single()
 
-      // Si no hay config de cupos, usar default (1 camion, 6 pedidos)
-      const max = cupo
-        ? cupo.camiones_disponibles * cupo.pedidos_max_por_camion
-        : 6
-
-      if ((count || 0) < max) {
-        disponibles.push(vuelta)
-      }
+      const max = cupo ? cupo.camiones_disponibles * cupo.pedidos_max_por_camion : 6
+      if ((count || 0) < max) disponibles.push(vuelta)
     }
 
     setCuposDisponibles(disponibles)
     setVerificando(false)
   }
 
-  const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>) => {
-    setForm({ ...form, [e.target.name]: e.target.value })
-    if (e.target.name === 'sucursal' || e.target.name === 'fecha_entrega') {
-      setForm(prev => ({ ...prev, [e.target.name]: e.target.value, vuelta: '' }))
+  const handlePDF = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+
+    setPdfFile(file)
+    setLeyendoPDF(true)
+    setError('')
+    setPdfListo(false)
+
+    const formData = new FormData()
+    formData.append('pdf', file)
+
+    try {
+      const res = await fetch('/api/leer-nv', {
+        method: 'POST',
+        body: formData
+      })
+      const data = await res.json()
+
+      if (!data.success) {
+        setError('No se pudo leer el PDF.')
+        setLeyendoPDF(false)
+        return
+      }
+
+      const { datos } = data
+      const sucursal = detectarSucursal(datos.deposito || '')
+
+      setForm(prev => ({
+        ...prev,
+        nv: datos.nv || '',
+        id_despacho: datos.id_despacho || '',
+        cliente: datos.cliente || '',
+        telefono: datos.telefono || '',
+        direccion: datos.direccion || '',
+        sucursal: sucursal,
+      }))
+
+      // Buscar productos en materiales
+      if (datos.productos?.length > 0) {
+        const ids = datos.productos.map((p: any) => p.id_producto)
+        const { data: materiales } = await supabase
+          .from('materiales')
+          .select('*')
+          .in('id', ids)
+
+        const productosConDatos = datos.productos.map((p: any) => {
+          const material = materiales?.find((m: any) => m.id === p.id_producto)
+          return {
+            ...p,
+            material,
+            posiciones: material ? Math.ceil(p.cantidad / material.cant_x_unid_log) * material.posiciones_x_unid_log : 0,
+            peso: material ? Math.ceil(p.cantidad / material.cant_x_unid_log) * material.peso_kg_x_posicion : 0,
+          }
+        })
+
+        setProductosNV(productosConDatos)
+        const totalPos = productosConDatos.reduce((acc: number, p: any) => acc + p.posiciones, 0)
+        const totalPeso = productosConDatos.reduce((acc: number, p: any) => acc + p.peso, 0)
+        setPosicionesTotal(totalPos)
+        setPesoTotal(totalPeso)
+      }
+
+      setPdfListo(true)
+    } catch (err) {
+      setError('Error al procesar el PDF.')
     }
+
+    setLeyendoPDF(false)
+  }
+
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>) => {
+    const { name, value } = e.target
+    setForm(prev => ({ ...prev, [name]: value }))
   }
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -96,11 +181,36 @@ export default function NuevoDespacho() {
     setLoading(true)
     setError('')
 
+    // Subir PDF a Storage
+    let pdf_url = null
+    if (pdfFile) {
+      const fileName = `${form.id_despacho || form.nv}_${Date.now()}.pdf`
+      const { data: uploadData, error: uploadError } = await supabase.storage
+        .from('solicitudes-despacho')
+        .upload(fileName, pdfFile)
+
+      if (uploadError) {
+        console.error('Error subiendo PDF:', uploadError)
+      } else {
+        pdf_url = uploadData?.path
+      }
+    }
+
     const { error } = await supabase.from('pedidos').insert({
-      ...form,
+      nv: form.nv,
+      id_despacho: form.id_despacho,
+      cliente: form.cliente,
+      telefono: form.telefono,
+      direccion: form.direccion,
+      sucursal: form.sucursal,
+      fecha_entrega: form.fecha_entrega,
       vuelta: parseInt(form.vuelta),
+      estado_pago: form.estado_pago,
+      notas: form.notas,
       vendedor_id: null,
-      estado: 'pendiente'
+      estado: 'pendiente',
+      peso_total_kg: pesoTotal,
+      volumen_total_m3: posicionesTotal,
     })
 
     if (error) {
@@ -123,6 +233,11 @@ export default function NuevoDespacho() {
           <button onClick={() => {
             setExito(false)
             setForm({ nv: '', id_despacho: '', cliente: '', telefono: '', direccion: '', sucursal: '', fecha_entrega: '', vuelta: '', estado_pago: '', notas: '' })
+            setProductosNV([])
+            setPesoTotal(0)
+            setPosicionesTotal(0)
+            setPdfFile(null)
+            setPdfListo(false)
           }} className="bg-blue-600 text-white px-6 py-2 rounded-lg hover:bg-blue-700 transition">
             Nuevo pedido
           </button>
@@ -143,89 +258,146 @@ export default function NuevoDespacho() {
         </button>
       </nav>
 
-      <main className="p-6 max-w-2xl mx-auto">
-        <form onSubmit={handleSubmit} className="bg-white rounded-xl shadow p-6 space-y-4">
+      <main className="p-6 max-w-2xl mx-auto space-y-4">
 
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Nota de Venta (NV)</label>
-              <input name="nv" value={form.nv} onChange={handleChange} required className="w-full border border-gray-300 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="Ej: NV-12345" />
+        {/* Lector de PDF */}
+        <div className="bg-white rounded-xl shadow p-6">
+          <h2 className="text-lg font-semibold text-gray-700 mb-1">📄 Subir Solicitud de Despacho</h2>
+          <p className="text-sm text-gray-500 mb-4">El sistema completará los datos automáticamente desde el PDF.</p>
+          <input
+            type="file"
+            accept=".pdf"
+            onChange={handlePDF}
+            className="w-full border border-dashed border-gray-300 rounded-lg px-4 py-3 text-sm text-gray-600 cursor-pointer hover:border-blue-400 transition"
+          />
+          {leyendoPDF && (
+            <div className="mt-3 flex items-center gap-2 text-blue-500 text-sm">
+              <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
+              </svg>
+              Leyendo PDF...
             </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">ID Despacho</label>
-              <input name="id_despacho" value={form.id_despacho} onChange={handleChange} className="w-full border border-gray-300 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="Opcional" />
-            </div>
-          </div>
+          )}
+          {pdfListo && !leyendoPDF && (
+            <p className="mt-2 text-green-600 text-sm">✓ PDF leído correctamente</p>
+          )}
+        </div>
 
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Cliente</label>
-              <input name="cliente" value={form.cliente} onChange={handleChange} required className="w-full border border-gray-300 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="Nombre del cliente" />
+        {/* Productos detectados */}
+        {productosNV.length > 0 && (
+          <div className="bg-white rounded-xl shadow p-6">
+            <h2 className="text-lg font-semibold text-gray-700 mb-3">📦 Productos del pedido</h2>
+            <div className="space-y-2">
+              {productosNV.map((p, i) => (
+                <div key={i} className="flex justify-between items-center text-sm border-b pb-2">
+                  <div>
+                    <span className="font-medium">{p.descripcion}</span>
+                    <span className="text-gray-400 ml-2">x{p.cantidad}</span>
+                  </div>
+                  <div className="text-right text-gray-500">
+                    {p.material ? (
+                      <>
+                        <span>{p.posiciones.toFixed(1)} pos</span>
+                        <span className="ml-2">{(p.peso / 1000).toFixed(1)} tn</span>
+                      </>
+                    ) : (
+                      <span className="text-orange-400">Sin datos logísticos</span>
+                    )}
+                  </div>
+                </div>
+              ))}
             </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Teléfono</label>
-              <input name="telefono" value={form.telefono} onChange={handleChange} required className="w-full border border-gray-300 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="Ej: 221-555-1234" />
-            </div>
-          </div>
-
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Dirección de entrega</label>
-            <input name="direccion" value={form.direccion} onChange={handleChange} required className="w-full border border-gray-300 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="Calle, número, localidad" />
-          </div>
-
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Sucursal</label>
-              <select name="sucursal" value={form.sucursal} onChange={handleChange} required className="w-full border border-gray-300 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500">
-                <option value="">Seleccionar...</option>
-                <option value="LP520">La Plata — Depósito 520</option>
-                <option value="LP139">La Plata — Depósito 139</option>
-                <option value="Guernica">Guernica</option>
-                <option value="Cañuelas">Cañuelas</option>
-              </select>
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Estado de pago</label>
-              <select name="estado_pago" value={form.estado_pago} onChange={handleChange} required className="w-full border border-gray-300 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500">
-                <option value="">Seleccionar...</option>
-                <option value="cobrado">Cobrado</option>
-                <option value="cuenta_corriente">Cuenta corriente</option>
-                <option value="pendiente_cobro">Pendiente de cobro</option>
-              </select>
-            </div>
-          </div>
-
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Fecha de entrega</label>
-              <input type="date" name="fecha_entrega" value={form.fecha_entrega} onChange={handleChange} required className="w-full border border-gray-300 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500" />
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Vuelta</label>
-              <select name="vuelta" value={form.vuelta} onChange={handleChange} required className="w-full border border-gray-300 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500" disabled={!form.sucursal || !form.fecha_entrega}>
-                <option value="">
-                  {!form.sucursal || !form.fecha_entrega ? 'Primero elegí sucursal y fecha' : verificando ? 'Verificando cupos...' : 'Seleccionar vuelta'}
-                </option>
-                {VUELTAS.map(({ vuelta, label }) => (
-                  cuposDisponibles.includes(vuelta)
-                    ? <option key={vuelta} value={vuelta}>{label}</option>
-                    : <option key={vuelta} value={vuelta} disabled>{label} — SIN CUPO</option>
-                ))}
-              </select>
+            <div className="mt-3 pt-3 border-t flex justify-between font-semibold text-sm">
+              <span>Total del pedido</span>
+              <span>{posicionesTotal.toFixed(1)} posiciones — {(pesoTotal / 1000).toFixed(1)} toneladas</span>
             </div>
           </div>
+        )}
 
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Notas adicionales</label>
-            <textarea name="notas" value={form.notas} onChange={handleChange} className="w-full border border-gray-300 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500" rows={3} placeholder="Instrucciones especiales, restricciones de acceso, etc." />
-          </div>
+        {/* Formulario */}
+        {pdfListo && (
+          <form onSubmit={handleSubmit} className="bg-white rounded-xl shadow p-6 space-y-4">
 
-          {error && <p className="text-red-500 text-sm">{error}</p>}
+            {/* Datos del PDF — solo lectura */}
+            <div className="bg-gray-50 rounded-lg p-4 space-y-3">
+              <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide">Datos del PDF — no editables</p>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs text-gray-500 mb-1">Presupuesto (NV)</label>
+                  <p className="font-medium text-gray-800">{form.nv || '—'}</p>
+                </div>
+                <div>
+                  <label className="block text-xs text-gray-500 mb-1">ID Despacho</label>
+                  <p className="font-medium text-gray-800">{form.id_despacho || '—'}</p>
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs text-gray-500 mb-1">Cliente</label>
+                  <p className="font-medium text-gray-800">{form.cliente || '—'}</p>
+                </div>
+                <div>
+                  <label className="block text-xs text-gray-500 mb-1">Teléfono</label>
+                  <p className="font-medium text-gray-800">{form.telefono || '—'}</p>
+                </div>
+              </div>
+              <div>
+                <label className="block text-xs text-gray-500 mb-1">Dirección de entrega</label>
+                <p className="font-medium text-gray-800">{form.direccion || '—'}</p>
+              </div>
+              <div>
+                <label className="block text-xs text-gray-500 mb-1">Sucursal</label>
+                <p className="font-medium text-gray-800">{form.sucursal || '—'}</p>
+              </div>
+            </div>
 
-          <button type="submit" disabled={loading || !form.vuelta} className="w-full bg-blue-600 text-white py-3 rounded-lg font-medium hover:bg-blue-700 transition disabled:opacity-50">
-            {loading ? 'Guardando...' : 'Confirmar solicitud de despacho'}
-          </button>
-        </form>
+            {/* Datos a completar por el vendedor */}
+            <div className="space-y-4">
+              <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide">Completar</p>
+
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Fecha de entrega</label>
+                  <input type="date" name="fecha_entrega" value={form.fecha_entrega} onChange={handleChange} required className="w-full border border-gray-300 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Vuelta</label>
+                  <select name="vuelta" value={form.vuelta} onChange={handleChange} required className="w-full border border-gray-300 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500" disabled={!form.fecha_entrega}>
+                    <option value="">{!form.fecha_entrega ? 'Primero elegí la fecha' : verificando ? 'Verificando cupos...' : 'Seleccionar vuelta'}</option>
+                    {VUELTAS.map(({ vuelta, label }) => (
+                      cuposDisponibles.includes(vuelta)
+                        ? <option key={vuelta} value={vuelta}>{label}</option>
+                        : <option key={vuelta} value={vuelta} disabled>{label} — SIN CUPO</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Estado de pago</label>
+                <select name="estado_pago" value={form.estado_pago} onChange={handleChange} required className="w-full border border-gray-300 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500">
+                  <option value="">Seleccionar...</option>
+                  <option value="cobrado">Cobrado</option>
+                  <option value="cuenta_corriente">Cuenta corriente</option>
+                  <option value="pendiente_cobro">Pendiente de cobro</option>
+                  <option value="provisorio">Provisorio</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Notas adicionales</label>
+                <textarea name="notas" value={form.notas} onChange={handleChange} className="w-full border border-gray-300 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500" rows={3} placeholder="Instrucciones especiales, restricciones de acceso, etc." />
+              </div>
+            </div>
+
+            {error && <p className="text-red-500 text-sm">{error}</p>}
+
+            <button type="submit" disabled={loading || !form.vuelta} className="w-full bg-blue-600 text-white py-3 rounded-lg font-medium hover:bg-blue-700 transition disabled:opacity-50">
+              {loading ? 'Guardando...' : 'Confirmar solicitud de despacho'}
+            </button>
+          </form>
+        )}
       </main>
     </div>
   )

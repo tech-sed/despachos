@@ -64,41 +64,84 @@ export default function NuevoDespacho() {
   }, [])
 
   useEffect(() => {
-    if (form.sucursal && form.fecha_entrega) {
-      verificarCupos()
-    } else {
-      setCuposDisponibles([])
-    }
-  }, [form.sucursal, form.fecha_entrega])
+  if (form.sucursal && form.fecha_entrega) {
+    verificarCupos()
+  } else {
+    setCuposDisponibles([])
+  }
+}, [form.sucursal, form.fecha_entrega, pesoTotal, posicionesTotal])
 
   const verificarCupos = async () => {
-    setVerificando(true)
-    const disponibles: number[] = []
+  setVerificando(true)
+  const disponibles: number[] = []
 
-    for (const { vuelta } of VUELTAS) {
-      const { count } = await supabase
-        .from('pedidos')
-        .select('*', { count: 'exact', head: true })
-        .eq('sucursal', form.sucursal)
-        .eq('fecha_entrega', form.fecha_entrega)
-        .eq('vuelta', vuelta)
-        .neq('estado', 'reprogramado')
+  const { data: flotaData } = await supabase
+    .from('flota_dia')
+    .select('camion_codigo')
+    .eq('fecha', form.fecha_entrega)
+    .eq('sucursal', form.sucursal)
+    .eq('activo', true)
 
-      const { data: cupo } = await supabase
-        .from('cupos')
-        .select('camiones_disponibles, pedidos_max_por_camion')
-        .eq('sucursal', form.sucursal)
-        .eq('fecha', form.fecha_entrega)
-        .eq('vuelta', vuelta)
-        .single()
+  const codigos = (flotaData ?? []).map((f: any) => f.camion_codigo)
 
-      const max = cupo ? cupo.camiones_disponibles * cupo.pedidos_max_por_camion : 6
-      if ((count || 0) < max) disponibles.push(vuelta)
-    }
-
-    setCuposDisponibles(disponibles)
+  if (codigos.length === 0) {
+    setCuposDisponibles([1, 2, 3, 4])
     setVerificando(false)
+    return
   }
+
+  // Traer capacidad de cada camión (kg Y posiciones)
+  const { data: camionesData } = await supabase
+    .from('camiones_flota')
+    .select('codigo, tonelaje_max_kg, posiciones_total')
+    .in('codigo', codigos)
+
+  const camiones = camionesData ?? []
+
+  for (const { vuelta } of VUELTAS) {
+    const { data: pedidosVuelta } = await supabase
+      .from('pedidos')
+      .select('camion_id, peso_total_kg, volumen_total_m3')
+      .eq('sucursal', form.sucursal)
+      .eq('fecha_entrega', form.fecha_entrega)
+      .eq('vuelta', vuelta)
+      .neq('estado', 'cancelado')
+
+    // Acumular peso Y posiciones por camión
+    const pesoAcumulado: Record<string, number> = {}
+    const posicionesAcumuladas: Record<string, number> = {}
+    camiones.forEach(c => {
+      pesoAcumulado[c.codigo] = 0
+      posicionesAcumuladas[c.codigo] = 0
+    })
+    ;(pedidosVuelta ?? []).forEach((p: any) => {
+      if (p.camion_id) {
+        pesoAcumulado[p.camion_id] = (pesoAcumulado[p.camion_id] ?? 0) + (p.peso_total_kg ?? 0)
+        posicionesAcumuladas[p.camion_id] = (posicionesAcumuladas[p.camion_id] ?? 0) + (p.volumen_total_m3 ?? 0)
+      }
+    })
+
+    // Peso y posiciones del pedido actual (si ya se leyó el PDF)
+    const pesoNuevo = pesoTotal > 0 ? pesoTotal : 0
+    const posicionesNuevas = posicionesTotal > 0 ? posicionesTotal : 0
+
+    // Hay lugar si algún camión tiene AMBOS: kg y posiciones libres
+    const hayLugar = camiones.some(c => {
+      const kgLibres = c.tonelaje_max_kg - (pesoAcumulado[c.codigo] ?? 0)
+      const posLibres = c.posiciones_total - (posicionesAcumuladas[c.codigo] ?? 0)
+
+      // Si no tenemos peso/posiciones del pedido aún, solo verificamos que haya camiones disponibles
+      if (pesoNuevo === 0 && posicionesNuevas === 0) return true
+
+      return kgLibres >= pesoNuevo && posLibres >= posicionesNuevas
+    })
+
+    if (hayLugar) disponibles.push(vuelta)
+  }
+
+  setCuposDisponibles(disponibles)
+  setVerificando(false)
+}
 
   const handlePDF = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]

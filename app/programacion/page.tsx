@@ -1,5 +1,6 @@
 'use client'
 
+import { useRouter } from 'next/navigation'
 import { useEffect, useState, useRef } from 'react'
 import { supabase } from '@/app/supabase'
 
@@ -285,7 +286,7 @@ export default function ProgramacionPage() {
 
   const dragPedido = useRef<Pedido | null>(null)
   const [dragOver, setDragOver] = useState<string | null>(null)
-
+const router = useRouter()
   useEffect(() => {
     const ahora = new Date()
     const fechaTarget = new Date(fecha + 'T00:00:00')
@@ -415,49 +416,60 @@ export default function ProgramacionPage() {
     <div className="min-h-screen bg-gray-100">
 
       {/* Header */}
-      <div className="bg-white border-b border-gray-200 px-6 py-4">
-        <div className="max-w-screen-2xl mx-auto">
-          <div className="flex items-center justify-between flex-wrap gap-4">
-            <div>
-              <h1 className="text-xl font-bold text-gray-900">Programación de despachos</h1>
-              <p className="text-sm text-gray-500">Asignación de pedidos a camiones</p>
-            </div>
-            <div className="flex items-center gap-3 flex-wrap">
-              <input
-                type="date"
-                value={fecha}
-                onChange={e => { setFecha(e.target.value); setConfirmado(false) }}
-                className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-              />
-              <select
-                value={sucursal}
-                onChange={e => { setSucursal(e.target.value); setConfirmado(false) }}
-                className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-              >
-                {SUCURSALES.map(s => <option key={s} value={s}>{s}</option>)}
-              </select>
-            </div>
-          </div>
-
-          {/* Tabs de vuelta */}
-          <div className="flex gap-1 mt-4 flex-wrap">
-            {VUELTAS.map(v => (
-              <button
-                key={v.num}
-                onClick={() => setVueltaActiva(v.num)}
-                className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
-                  vueltaActiva === v.num
-                    ? 'bg-blue-600 text-white'
-                    : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
-                }`}
-              >
-                {v.label}
-                <span className="ml-1 text-xs opacity-70">{v.horario}</span>
-              </button>
-            ))}
-          </div>
+<div className="bg-white border-b border-gray-200 px-6 py-4">
+  <div className="max-w-screen-2xl mx-auto">
+    <div className="flex items-center justify-between flex-wrap gap-4">
+      <div className="flex items-center gap-4">
+        <button
+          onClick={() => router.push('/dashboard')}
+          className="flex items-center gap-2 text-sm text-gray-500 hover:text-gray-900 bg-gray-100 hover:bg-gray-200 px-3 py-2 rounded-lg transition-colors font-medium"
+        >
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <path d="M10 3L5 8L10 13" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+          </svg>
+          Volver
+        </button>
+        <div>
+          <h1 className="text-xl font-bold text-gray-900">Programación de despachos</h1>
+          <p className="text-sm text-gray-500">Asignación de pedidos a camiones</p>
         </div>
       </div>
+      <div className="flex items-center gap-3 flex-wrap">
+        <input
+          type="date"
+          value={fecha}
+          onChange={e => { setFecha(e.target.value); setConfirmado(false) }}
+          className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+        />
+        <select
+          value={sucursal}
+          onChange={e => { setSucursal(e.target.value); setConfirmado(false) }}
+          className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+        >
+          {SUCURSALES.map(s => <option key={s} value={s}>{s}</option>)}
+        </select>
+      </div>
+    </div>
+
+    {/* Tabs de vuelta */}
+    <div className="flex gap-1 mt-4 flex-wrap">
+      {VUELTAS.map(v => (
+        <button
+          key={v.num}
+          onClick={() => setVueltaActiva(v.num)}
+          className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+            vueltaActiva === v.num
+              ? 'bg-blue-600 text-white'
+              : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+          }`}
+        >
+          {v.label}
+          <span className="ml-1 text-xs opacity-70">{v.horario}</span>
+        </button>
+      ))}
+    </div>
+  </div>
+</div>
 
       {/* Barra de acciones */}
       <div className="bg-white border-b border-gray-200 px-6 py-3">

@@ -81,7 +81,7 @@ export default function NuevoDespacho() {
     .eq('fecha', form.fecha_entrega)
     .eq('sucursal', form.sucursal)
     .eq('activo', true)
-
+ console.log('FLOTA:', flotaData, 'sucursal:', form.sucursal, 'fecha:', form.fecha_entrega)
   const codigos = (flotaData ?? []).map((f: any) => f.camion_codigo)
 
   if (codigos.length === 0) {
@@ -388,37 +388,53 @@ export default function NuevoDespacho() {
           <form onSubmit={handleSubmit} className="bg-white rounded-xl shadow p-6 space-y-4">
 
             {/* Datos del PDF — solo lectura */}
-            <div className="bg-gray-50 rounded-lg p-4 space-y-3">
-              <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide">Datos del PDF — no editables</p>
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-xs text-gray-500 mb-1">Presupuesto (NV)</label>
-                  <p className="font-medium text-gray-800">{form.nv || '—'}</p>
-                </div>
-                <div>
-                  <label className="block text-xs text-gray-500 mb-1">ID Despacho</label>
-                  <p className="font-medium text-gray-800">{form.id_despacho || '—'}</p>
-                </div>
-              </div>
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-xs text-gray-500 mb-1">Cliente</label>
-                  <p className="font-medium text-gray-800">{form.cliente || '—'}</p>
-                </div>
-                <div>
-                  <label className="block text-xs text-gray-500 mb-1">Teléfono</label>
-                  <p className="font-medium text-gray-800">{form.telefono || '—'}</p>
-                </div>
-              </div>
-              <div>
-                <label className="block text-xs text-gray-500 mb-1">Dirección de entrega</label>
-                <p className="font-medium text-gray-800">{form.direccion || '—'}</p>
-              </div>
-              <div>
-                <label className="block text-xs text-gray-500 mb-1">Sucursal</label>
-                <p className="font-medium text-gray-800">{form.sucursal || '—'}</p>
-              </div>
-            </div>
+<div className="bg-gray-50 rounded-lg p-4 space-y-3">
+  <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide">Datos del PDF — no editables</p>
+  <div className="grid grid-cols-2 gap-4">
+    <div>
+      <label className="block text-xs text-gray-500 mb-1">Presupuesto (NV)</label>
+      <p className="font-medium text-gray-800">{form.nv || '—'}</p>
+    </div>
+    <div>
+      <label className="block text-xs text-gray-500 mb-1">ID Despacho</label>
+      <p className="font-medium text-gray-800">{form.id_despacho || '—'}</p>
+    </div>
+  </div>
+  <div className="grid grid-cols-2 gap-4">
+    <div>
+      <label className="block text-xs text-gray-500 mb-1">Cliente</label>
+      <p className="font-medium text-gray-800">{form.cliente || '—'}</p>
+    </div>
+    <div>
+      <label className="block text-xs text-gray-500 mb-1">Teléfono</label>
+      <p className="font-medium text-gray-800">{form.telefono || '—'}</p>
+    </div>
+  </div>
+  <div>
+    <label className="block text-xs text-gray-500 mb-1">Dirección de entrega</label>
+    <p className="font-medium text-gray-800">{form.direccion || '—'}</p>
+  </div>
+  <div>
+    <label className="block text-xs text-gray-500 mb-1">Sucursal</label>
+    {form.sucursal ? (
+      <p className="font-medium text-gray-800">{form.sucursal}</p>
+    ) : (
+      <select
+        name="sucursal"
+        value={form.sucursal}
+        onChange={handleChange}
+        required
+        className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+      >
+        <option value="">Seleccionar sucursal...</option>
+        <option value="LP520">LP520</option>
+        <option value="LP139">LP139</option>
+        <option value="Guernica">Guernica</option>
+        <option value="Cañuelas">Cañuelas</option>
+      </select>
+    )}
+  </div>
+</div>
 
             {/* Datos a completar por el vendedor */}
             <div className="space-y-4">

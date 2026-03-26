@@ -8,7 +8,7 @@ const CARDS = [
   { href: '/despachos', icon: '📦', titulo: 'Nuevo despacho', descripcion: 'Cargar solicitud desde PDF', disponible: true },
   { href: '/flota', icon: '🚛', titulo: 'Flota del día', descripcion: 'Configurar camiones disponibles', disponible: true },
   { href: '/programacion', icon: '📅', titulo: 'Programación', descripcion: 'Asignar pedidos a camiones', disponible: true },
-  { href: '/ruteo', icon: '🗺️', titulo: 'Ruteo', descripcion: 'Hoja de ruta por chofer', disponible: false },
+  { href: '/ruteo', icon: '🗺️', titulo: 'Ruteo', descripcion: 'Hoja de ruta por chofer', disponible: true },
   { href: '/metricas', icon: '📊', titulo: 'Métricas', descripcion: 'KPIs y estadísticas', disponible: false },
 ]
  
@@ -33,15 +33,34 @@ export default function Dashboard() {
   const [stats, setStats] = useState({ pendientes: 0, hoy: 0, enCamino: 0, entregadosHoy: 0 })
   const [recientes, setRecientes] = useState<PedidoReciente[]>([])
   const [cargando, setCargando] = useState(true)
+const [verificando, setVerificando] = useState(true)
   const router = useRouter()
  
   useEffect(() => {
-    supabase.auth.getUser().then(({ data: { user } }) => {
-      if (!user) { router.push('/'); return }
-      setUsuario(user)
-    })
+  supabase.auth.getUser().then(async ({ data: { user } }) => {
+    if (!user) { router.push('/'); return }
+
+    console.log('Usuario ID:', user.id)
+
+    const { data: userData, error } = await supabase
+      .from('usuarios')
+      .select('rol')
+      .eq('id', user.id)
+      .single()
+
+    console.log('userData:', userData, 'error:', error)
+
+    if (userData?.rol === 'chofer') {
+      console.log('Es chofer, redirigiendo...')
+      router.push('/ruteo')
+      return
+    }
+
+    setUsuario(user)
+    setVerificando(false)
     cargarDatos()
-  }, [])
+  })
+}, [])
  
   const cargarDatos = async () => {
     const hoy = new Date().toISOString().split('T')[0]
@@ -57,7 +76,7 @@ export default function Dashboard() {
     setCargando(false)
   }
  
-  if (!usuario || cargando) return (
+  if (!usuario || cargando || verificando) return (
     <div className="min-h-screen flex items-center justify-center bg-gray-50">
       <div className="w-6 h-6 border-2 border-t-transparent rounded-full animate-spin" style={{ borderColor: '#254A96', borderTopColor: 'transparent' }} />
     </div>

@@ -46,8 +46,8 @@ export async function POST(request: NextRequest) {
   "latitud": -37.254967,
   "longitud": -56.984971,
   "productos": [
-    {"id_producto": 1234, "descripcion": "nombre", "cantidad": 10}
-  ]
+  {"descripcion": "nombre exacto del producto como figura en el PDF", "cantidad": 10}
+]
 }
 No incluyas productos cuya descripción contenga "Transporte" ni "Pallet". Solo el JSON, sin markdown.`
             }

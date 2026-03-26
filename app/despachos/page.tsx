@@ -146,20 +146,27 @@ export default function NuevoDespacho() {
       }))
 
       if (datos.productos?.length > 0) {
-        const ids = datos.productos.map((p: any) => p.id_producto)
-        const { data: materiales } = await supabase.from('materiales').select('*').in('id', ids)
-        const productosConDatos = datos.productos.map((p: any) => {
-          const material = materiales?.find((m: any) => m.id === p.id_producto)
-          return {
-            ...p, material,
-            posiciones: material ? Math.ceil(p.cantidad / material.cant_x_unid_log) * material.posiciones_x_unid_log : 0,
-            peso: material ? Math.ceil(p.cantidad / material.cant_x_unid_log) * material.peso_kg_x_posicion : 0,
-          }
-        })
-        setProductosNV(productosConDatos)
-        setPosicionesTotal(productosConDatos.reduce((acc: number, p: any) => acc + p.posiciones, 0))
-        setPesoTotal(productosConDatos.reduce((acc: number, p: any) => acc + p.peso, 0))
-      }
+  const { data: todosMateriales } = await supabase
+    .from('materiales')
+    .select('*')
+
+  const productosConDatos = datos.productos.map((p: any) => {
+    const nombrePDF = p.descripcion.toLowerCase().replace(/\s+/g, ' ').trim()
+    const material = todosMateriales?.find((m: any) => {
+      const nombreTabla = m.nombre.toLowerCase().replace(/\s+/g, ' ').trim()
+      return nombreTabla === nombrePDF ||
+             nombreTabla.includes(nombrePDF) ||
+             nombrePDF.includes(nombreTabla)
+    })
+    return { ...p, material,
+      posiciones: material ? Math.ceil(p.cantidad / material.cant_x_unid_log) * material.posiciones_x_unid_log : 0,
+      peso: material ? Math.ceil(p.cantidad / material.cant_x_unid_log) * material.peso_kg_x_posicion : 0,
+    }
+  })
+  setProductosNV(productosConDatos)
+  setPosicionesTotal(productosConDatos.reduce((acc: number, p: any) => acc + p.posiciones, 0))
+  setPesoTotal(productosConDatos.reduce((acc: number, p: any) => acc + p.peso, 0))
+}
       setPdfListo(true)
     } catch { setError('Error al procesar el PDF.') }
     setLeyendoPDF(false)

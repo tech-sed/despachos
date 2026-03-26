@@ -8,6 +8,7 @@ interface Pedido {
   id: string; nv: string; cliente: string; direccion: string; sucursal: string
   vuelta: number; estado: string; estado_pago: string; peso_total_kg: number | null
   notas: string | null; camion_id: string | null
+  latitud: number | null; longitud: number | null
   items?: { nombre: string; cantidad: number; unidad: string }[]
 }
 interface Camion {
@@ -17,7 +18,7 @@ interface Camion {
 }
 interface ColumnaKanban { camion: Camion; pedidos: Pedido[]; pesoTotal: number }
 
-const SUCURSALES = ['LP139', 'LP520', 'Guernica', 'Cañuelas']
+const SUCURSALES = ['LP139', 'LP520', 'Guernica', 'Cañuelas', 'Pinamar']
 const VUELTAS = [
   { num: 1, label: 'V1', horario: '8:00–10:00' },
   { num: 2, label: 'V2', horario: '10:00–12:00' },
@@ -142,7 +143,42 @@ function ColumnaCamion({ columna, sinAsignar = false, onDrop, onDragOver, onDrag
     </div>
   )
 }
+const DEPOSITOS: Record<string, { lat: number; lng: number }> = {
+  'LP520':    { lat: -34.9205, lng: -57.9536 },
+  'LP139':    { lat: -34.9205, lng: -57.9536 },
+  'Guernica': { lat: -35.0647, lng: -58.3731 },
+  'Cañuelas': { lat: -35.0511, lng: -58.7613 },
+  'Pinamar':  { lat: -37.1097, lng: -56.8621 },
+}
 
+function calcularOrdenRuta(pedidos: Pedido[], sucursal: string): Record<string, number> {
+  const deposito = DEPOSITOS[sucursal] ?? { lat: -34.9205, lng: -57.9536 }
+  const conCoords = pedidos.filter(p => p.latitud && p.longitud)
+  const sinCoords = pedidos.filter(p => !p.latitud || !p.longitud)
+
+  const ordenados: Pedido[] = []
+  const restantes = [...conCoords]
+  let latActual = deposito.lat
+  let lngActual = deposito.lng
+
+  while (restantes.length > 0) {
+    let minDist = Infinity
+    let minIdx = 0
+    restantes.forEach((p, i) => {
+      const d = Math.pow((p.latitud ?? 0) - latActual, 2) + Math.pow((p.longitud ?? 0) - lngActual, 2)
+      if (d < minDist) { minDist = d; minIdx = i }
+    })
+    const siguiente = restantes.splice(minIdx, 1)[0]
+    ordenados.push(siguiente)
+    latActual = siguiente.latitud!
+    lngActual = siguiente.longitud!
+  }
+
+  const todos = [...ordenados, ...sinCoords]
+  const resultado: Record<string, number> = {}
+  todos.forEach((p, i) => { resultado[p.id] = i + 1 })
+  return resultado
+}
 export default function ProgramacionPage() {
   const router = useRouter()
   const [fecha, setFecha] = useState(hoy())
@@ -198,13 +234,44 @@ export default function ProgramacionPage() {
   }
 
   async function handleConfirmar() {
-    setGuardando(true)
-    await Promise.all([
-      ...pedidos.filter(p => p.camion_id).map(p => supabase.from('pedidos').update({ camion_id: p.camion_id, estado: 'programado' }).eq('id', p.id)),
-      ...pedidos.filter(p => !p.camion_id).map(p => supabase.from('pedidos').update({ camion_id: null, estado: 'pendiente' }).eq('id', p.id)),
-    ])
-    setGuardando(false); setConfirmado(true); showToast('Programación confirmada')
-  }
+  setGuardando(true)
+
+  const asignados = pedidos.filter(p => p.camion_id)
+  const sinCamion = pedidos.filter(p => !p.camion_id)
+
+  const porCamion: Record<string, Pedido[]> = {}
+  asignados.forEach(p => {
+    if (!porCamion[p.camion_id!]) porCamion[p.camion_id!] = []
+    porCamion[p.camion_id!].push(p)
+  })
+
+  const ordenes: Record<string, number> = {}
+  Object.entries(porCamion).forEach(([, pedidosCamion]) => {
+    const orden = calcularOrdenRuta(pedidosCamion, sucursal)
+    Object.assign(ordenes, orden)
+  })
+
+  await Promise.all([
+    ...asignados.map(p =>
+      supabase.from('pedidos').update({
+        camion_id: p.camion_id,
+        estado: 'programado',
+        orden_entrega: ordenes[p.id] ?? null,
+      }).eq('id', p.id)
+    ),
+    ...sinCamion.map(p =>
+      supabase.from('pedidos').update({
+        camion_id: null,
+        estado: 'pendiente',
+        orden_entrega: null,
+      }).eq('id', p.id)
+    ),
+  ])
+
+  setGuardando(false)
+  setConfirmado(true)
+  showToast('Programación confirmada')
+}
 
   const totalAsig = pedidos.filter(p => p.camion_id).length
   const totalSin = pedidos.length - totalAsig

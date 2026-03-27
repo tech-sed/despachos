@@ -61,6 +61,10 @@ export default function FlotaDia() {
   }, [])
 
   const abrirEditar = (fecha: string) => {
+    if (fecha < hoy()) {
+      showToast('No podés modificar flotas de días pasados', 'err')
+      return
+    }
     setFechaEditar(fecha)
     setVista('editar')
   }
@@ -151,6 +155,7 @@ function VistaLista({ onEditar, onVolver, showToast }: {
 
   const handleNuevaFlota = () => {
     if (!nuevaFecha) { showToast('Seleccioná una fecha', 'err'); return }
+    if (nuevaFecha < hoy()) { showToast('No podés crear una flota para días pasados', 'err'); return }
     const yaExiste = flotas.some(f => f.fecha === nuevaFecha)
     if (yaExiste) {
       showToast('Ya hay una flota para esa fecha, hacé clic en ella para editarla', 'err')
@@ -281,12 +286,14 @@ function CardFlota({ flota, onEditar, destacar, opaco }: {
   return (
     <button
       onClick={() => onEditar(flota.fecha)}
-      className="w-full bg-white rounded-xl p-4 flex items-center gap-4 text-left transition-all hover:shadow-md"
+      disabled={opaco}
+      className="w-full bg-white rounded-xl p-4 flex items-center gap-4 text-left transition-all"
       style={{
         border: `2px solid ${destacar ? '#254A96' : '#f0f0f0'}`,
-        opacity: opaco ? 0.65 : 1,
+        opacity: opaco ? 0.5 : 1,
+        cursor: opaco ? 'not-allowed' : 'pointer',
       }}
-      onMouseEnter={e => { (e.currentTarget as HTMLElement).style.transform = 'translateX(3px)' }}
+      onMouseEnter={e => { if (!opaco) (e.currentTarget as HTMLElement).style.transform = 'translateX(3px)' }}
       onMouseLeave={e => { (e.currentTarget as HTMLElement).style.transform = 'translateX(0)' }}
     >
       {/* Ícono fecha */}

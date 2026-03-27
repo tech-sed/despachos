@@ -367,6 +367,10 @@ export default function ProgramacionPage() {
   }
 
   async function handleConfirmar() {
+    if (fecha < hoy()) {
+      showToast('No podés programar para días pasados', 'err')
+      return
+    }
     setGuardando(true)
 
     const asignados = pedidos.filter(p => p.camion_id)
@@ -465,7 +469,7 @@ export default function ProgramacionPage() {
               </div>
             </div>
             <div className="flex items-center gap-2 flex-wrap">
-              <input type="date" value={fecha} min={hoy()} onChange={e => { setFecha(e.target.value); setConfirmado(false) }}
+              <input type="date" value={fecha} min={hoy()} onChange={e => { if (e.target.value < hoy()) return; setFecha(e.target.value); setConfirmado(false) }}
                 className="border rounded-lg px-3 py-1.5 text-sm focus:outline-none" style={{ borderColor: '#e8edf8' }} />
               <select value={sucursal} onChange={e => { setSucursal(e.target.value); setConfirmado(false) }}
                 className="border rounded-lg px-3 py-1.5 text-sm focus:outline-none" style={{ borderColor: '#e8edf8' }}>

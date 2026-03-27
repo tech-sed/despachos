@@ -89,22 +89,34 @@ export default function FlotaDia() {
   const guardarFlota = async () => {
     setGuardando(true)
     try {
-      // Guardar flota del día con chofer incluido (todo en una sola operación)
-      const { error } = await supabase.from('flota_dia').upsert(
-        camiones.map(c => ({
-          fecha,
-          camion_codigo: c.codigo,
-          sucursal: c.sucursal_dia,
-          activo: c.activo_dia,
-          chofer_id: c.chofer_id || null,
-        })),
-        { onConflict: 'fecha,camion_codigo' }
+      // Guardar cada camión individualmente para evitar problemas con upsert masivo
+      const resultados = await Promise.all(
+        camiones.map(c =>
+          supabase.from('flota_dia').upsert(
+            {
+              fecha,
+              camion_codigo: c.codigo,
+              sucursal: c.sucursal_dia,
+              activo: c.activo_dia,
+              chofer_id: c.chofer_id || null,
+            },
+            { onConflict: 'fecha,camion_codigo' }
+          )
+        )
       )
-      if (error) throw error
 
-      showToast('Flota y choferes guardados correctamente')
+      const errores = resultados.filter(r => r.error)
+      if (errores.length > 0) {
+        const msg = errores[0].error?.message ?? 'error desconocido'
+        console.error('Errores al guardar flota:', errores.map(r => r.error))
+        showToast(`Error: ${msg}`, 'err')
+      } else {
+        showToast('Flota y choferes guardados correctamente')
+        await cargarFlota() // recargar para confirmar que los datos persisten
+      }
     } catch (e: any) {
-      showToast('Error al guardar la flota', 'err')
+      console.error('Error inesperado en guardarFlota:', e)
+      showToast(`Error: ${e.message}`, 'err')
     } finally {
       setGuardando(false)
     }

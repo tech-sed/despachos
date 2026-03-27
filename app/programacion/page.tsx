@@ -465,7 +465,7 @@ export default function ProgramacionPage() {
               </div>
             </div>
             <div className="flex items-center gap-2 flex-wrap">
-              <input type="date" value={fecha} onChange={e => { setFecha(e.target.value); setConfirmado(false) }}
+              <input type="date" value={fecha} min={hoy()} onChange={e => { setFecha(e.target.value); setConfirmado(false) }}
                 className="border rounded-lg px-3 py-1.5 text-sm focus:outline-none" style={{ borderColor: '#e8edf8' }} />
               <select value={sucursal} onChange={e => { setSucursal(e.target.value); setConfirmado(false) }}
                 className="border rounded-lg px-3 py-1.5 text-sm focus:outline-none" style={{ borderColor: '#e8edf8' }}>

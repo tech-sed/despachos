@@ -4,6 +4,8 @@ import { useEffect, useState } from 'react'
 import { supabase } from '../supabase'
 import { useRouter } from 'next/navigation'
 
+// ─── Constantes ────────────────────────────────────────────────────────────────
+
 const SUCURSALES = ['LP520', 'LP139', 'Guernica', 'Cañuelas', 'Pinamar', 'Fuera de servicio']
 
 const SUCURSAL_LABELS: Record<string, string> = {
@@ -20,16 +22,35 @@ const SUCURSAL_COLORS: Record<string, { border: string; bg: string; header: stri
   'Fuera de servicio': { border: '#E52322', bg: '#fde8e8', header: '#E52322' },
 }
 
+function hoy() { return new Date().toISOString().split('T')[0] }
+
+function formatFecha(f: string) {
+  const d = new Date(f + 'T00:00:00')
+  return d.toLocaleDateString('es-AR', { weekday: 'long', day: '2-digit', month: 'long', year: 'numeric' })
+}
+
+function formatRelativo(iso: string) {
+  const diff = Date.now() - new Date(iso).getTime()
+  const min = Math.floor(diff / 60000)
+  if (min < 1) return 'hace un momento'
+  if (min < 60) return `hace ${min} min`
+  const hs = Math.floor(min / 60)
+  if (hs < 24) return `hace ${hs}h`
+  const dias = Math.floor(hs / 24)
+  return `hace ${dias} día${dias > 1 ? 's' : ''}`
+}
+
+// ─── Componente principal ───────────────────────────────────────────────────────
+
 export default function FlotaDia() {
   const router = useRouter()
-  const [camiones, setCamiones] = useState<any[]>([])
-  const [choferes, setChoferes] = useState<{ id: string; nombre: string; camion_codigo: string | null }[]>([])
-  const [loading, setLoading] = useState(true)
-  const [guardando, setGuardando] = useState(false)
+  const [vista, setVista] = useState<'lista' | 'editar'>('lista')
+  const [fechaEditar, setFechaEditar] = useState('')
   const [toast, setToast] = useState<{ msg: string; tipo: 'ok' | 'err' } | null>(null)
-  const [fecha, setFecha] = useState(() => new Date().toISOString().split('T')[0])
-  const [dragging, setDragging] = useState<string | null>(null)
-  const [dragOver, setDragOver] = useState<string | null>(null)
+
+  const showToast = (msg: string, tipo: 'ok' | 'err' = 'ok') => {
+    setToast({ msg, tipo }); setTimeout(() => setToast(null), 3500)
+  }
 
   useEffect(() => {
     supabase.auth.getUser().then(async ({ data: { user } }) => {
@@ -39,11 +60,292 @@ export default function FlotaDia() {
     })
   }, [])
 
-  useEffect(() => { cargarFlota() }, [fecha])
-
-  const showToast = (msg: string, tipo: 'ok' | 'err' = 'ok') => {
-    setToast({ msg, tipo }); setTimeout(() => setToast(null), 3000)
+  const abrirEditar = (fecha: string) => {
+    setFechaEditar(fecha)
+    setVista('editar')
   }
+
+  const volverALista = () => {
+    setVista('lista')
+    setFechaEditar('')
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50" style={{ fontFamily: 'Barlow, sans-serif' }}>
+      {toast && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 px-5 py-3 rounded-xl shadow-lg text-sm font-medium text-white flex items-center gap-2"
+          style={{ background: toast.tipo === 'ok' ? '#254A96' : '#E52322' }}>
+          {toast.tipo === 'ok' ? '✓' : '✕'} {toast.msg}
+        </div>
+      )}
+
+      {vista === 'lista'
+        ? <VistaLista onEditar={abrirEditar} onVolver={() => router.push('/dashboard')} showToast={showToast} />
+        : <VistaEditar fecha={fechaEditar} onVolver={volverALista} showToast={showToast} />
+      }
+    </div>
+  )
+}
+
+// ─── Vista Lista ────────────────────────────────────────────────────────────────
+
+interface ResumenFlota {
+  fecha: string
+  totalCamiones: number
+  activos: number
+  sucursales: string[]
+  choferes: number
+  ultimaModif: string | null
+}
+
+function VistaLista({ onEditar, onVolver, showToast }: {
+  onEditar: (fecha: string) => void
+  onVolver: () => void
+  showToast: (msg: string, tipo?: 'ok' | 'err') => void
+}) {
+  const [flotas, setFlotas] = useState<ResumenFlota[]>([])
+  const [loading, setLoading] = useState(true)
+  const [nuevaFecha, setNuevaFecha] = useState('')
+  const [mostrarPicker, setMostrarPicker] = useState(false)
+
+  useEffect(() => { cargarResumen() }, [])
+
+  const cargarResumen = async () => {
+    setLoading(true)
+    const { data, error } = await supabase
+      .from('flota_dia')
+      .select('fecha, activo, sucursal, chofer_id, updated_at')
+      .order('fecha', { ascending: false })
+
+    if (error) { showToast('Error al cargar flotas', 'err'); setLoading(false); return }
+
+    // Agrupar por fecha
+    const porFecha: Record<string, typeof data> = {}
+    ;(data ?? []).forEach((row: any) => {
+      if (!porFecha[row.fecha]) porFecha[row.fecha] = []
+      porFecha[row.fecha].push(row)
+    })
+
+    const resumen: ResumenFlota[] = Object.entries(porFecha).map(([fecha, rows]) => {
+      const activos = rows.filter((r: any) => r.activo && r.sucursal !== 'Fuera de servicio')
+      const sucursalesSet = new Set(activos.map((r: any) => r.sucursal).filter(Boolean))
+      const choferes = rows.filter((r: any) => r.chofer_id).length
+      const ultimaModif = rows
+        .map((r: any) => r.updated_at)
+        .filter(Boolean)
+        .sort()
+        .at(-1) ?? null
+      return {
+        fecha,
+        totalCamiones: rows.length,
+        activos: activos.length,
+        sucursales: [...sucursalesSet],
+        choferes,
+        ultimaModif,
+      }
+    })
+
+    setFlotas(resumen)
+    setLoading(false)
+  }
+
+  const handleNuevaFlota = () => {
+    if (!nuevaFecha) { showToast('Seleccioná una fecha', 'err'); return }
+    const yaExiste = flotas.some(f => f.fecha === nuevaFecha)
+    if (yaExiste) {
+      showToast('Ya hay una flota para esa fecha, hacé clic en ella para editarla', 'err')
+      return
+    }
+    onEditar(nuevaFecha)
+  }
+
+  if (loading) return (
+    <div className="min-h-screen flex items-center justify-center">
+      <div className="w-6 h-6 border-2 border-t-transparent rounded-full animate-spin"
+        style={{ borderColor: '#254A96', borderTopColor: 'transparent' }} />
+    </div>
+  )
+
+  const flotasHoy = flotas.filter(f => f.fecha === hoy())
+  const flotasFuturas = flotas.filter(f => f.fecha > hoy())
+  const flotasPasadas = flotas.filter(f => f.fecha < hoy())
+
+  return (
+    <>
+      {/* Navbar */}
+      <nav className="bg-white border-b sticky top-0 z-40" style={{ borderColor: '#e8edf8' }}>
+        <div className="max-w-4xl mx-auto px-4 md:px-6 h-14 flex items-center justify-between gap-4">
+          <div className="flex items-center gap-4">
+            <button onClick={onVolver}
+              className="flex items-center gap-1.5 text-sm font-medium px-3 py-1.5 rounded-lg"
+              style={{ color: '#254A96', background: '#e8edf8' }}>
+              ← Volver
+            </button>
+            <div className="hidden sm:block">
+              <span className="font-semibold text-sm" style={{ color: '#254A96' }}>Flota del día</span>
+              <span className="text-xs ml-2" style={{ color: '#B9BBB7' }}>Flotas configuradas</span>
+            </div>
+          </div>
+          <button
+            onClick={() => setMostrarPicker(v => !v)}
+            className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold text-white"
+            style={{ background: '#254A96' }}>
+            + Nueva flota
+          </button>
+        </div>
+      </nav>
+
+      <main className="max-w-4xl mx-auto px-4 md:px-6 py-6">
+
+        {/* Picker nueva flota */}
+        {mostrarPicker && (
+          <div className="mb-6 bg-white rounded-xl border p-4 flex items-end gap-3"
+            style={{ borderColor: '#e8edf8' }}>
+            <div className="flex-1">
+              <label className="block text-xs font-semibold mb-1.5" style={{ color: '#254A96' }}>
+                Fecha de la nueva flota
+              </label>
+              <input
+                type="date"
+                value={nuevaFecha}
+                min={hoy()}
+                onChange={e => setNuevaFecha(e.target.value)}
+                className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none"
+                style={{ borderColor: '#e8edf8' }}
+              />
+            </div>
+            <button
+              onClick={handleNuevaFlota}
+              disabled={!nuevaFecha}
+              className="px-4 py-2 rounded-lg text-sm font-semibold text-white disabled:opacity-40"
+              style={{ background: '#254A96' }}>
+              Crear
+            </button>
+            <button
+              onClick={() => { setMostrarPicker(false); setNuevaFecha('') }}
+              className="px-3 py-2 rounded-lg text-sm"
+              style={{ color: '#B9BBB7' }}>
+              Cancelar
+            </button>
+          </div>
+        )}
+
+        {flotas.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-24 text-center">
+            <div className="text-5xl mb-4">🚛</div>
+            <p className="font-semibold text-base" style={{ color: '#254A96' }}>No hay flotas configuradas</p>
+            <p className="text-sm mt-1" style={{ color: '#B9BBB7' }}>Creá la primera flota usando el botón "Nueva flota"</p>
+          </div>
+        ) : (
+          <div className="space-y-6">
+            {flotasHoy.length > 0 && (
+              <Section titulo="Hoy" flotas={flotasHoy} onEditar={onEditar} destacar />
+            )}
+            {flotasFuturas.length > 0 && (
+              <Section titulo="Próximos días" flotas={flotasFuturas} onEditar={onEditar} />
+            )}
+            {flotasPasadas.length > 0 && (
+              <Section titulo="Días anteriores" flotas={flotasPasadas} onEditar={onEditar} opaco />
+            )}
+          </div>
+        )}
+      </main>
+    </>
+  )
+}
+
+function Section({ titulo, flotas, onEditar, destacar = false, opaco = false }: {
+  titulo: string
+  flotas: ResumenFlota[]
+  onEditar: (fecha: string) => void
+  destacar?: boolean
+  opaco?: boolean
+}) {
+  return (
+    <div>
+      <p className="text-xs font-semibold uppercase tracking-widest mb-3" style={{ color: '#B9BBB7' }}>{titulo}</p>
+      <div className="space-y-2">
+        {flotas.map(f => <CardFlota key={f.fecha} flota={f} onEditar={onEditar} destacar={destacar} opaco={opaco} />)}
+      </div>
+    </div>
+  )
+}
+
+function CardFlota({ flota, onEditar, destacar, opaco }: {
+  flota: ResumenFlota
+  onEditar: (fecha: string) => void
+  destacar: boolean
+  opaco: boolean
+}) {
+  const esHoy = flota.fecha === hoy()
+  return (
+    <button
+      onClick={() => onEditar(flota.fecha)}
+      className="w-full bg-white rounded-xl p-4 flex items-center gap-4 text-left transition-all hover:shadow-md"
+      style={{
+        border: `2px solid ${destacar ? '#254A96' : '#f0f0f0'}`,
+        opacity: opaco ? 0.65 : 1,
+      }}
+      onMouseEnter={e => { (e.currentTarget as HTMLElement).style.transform = 'translateX(3px)' }}
+      onMouseLeave={e => { (e.currentTarget as HTMLElement).style.transform = 'translateX(0)' }}
+    >
+      {/* Ícono fecha */}
+      <div className="w-12 h-12 rounded-xl flex flex-col items-center justify-center shrink-0 text-white"
+        style={{ background: destacar ? '#254A96' : '#f4f4f3' }}>
+        <span className="text-xs font-bold leading-none" style={{ color: destacar ? 'white' : '#B9BBB7' }}>
+          {new Date(flota.fecha + 'T00:00:00').toLocaleDateString('es-AR', { month: 'short' }).toUpperCase()}
+        </span>
+        <span className="text-xl font-bold leading-none" style={{ color: destacar ? 'white' : '#254A96' }}>
+          {new Date(flota.fecha + 'T00:00:00').getDate()}
+        </span>
+      </div>
+
+      {/* Info */}
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2 mb-1 flex-wrap">
+          <span className="font-semibold text-sm capitalize" style={{ color: '#1a1a1a' }}>
+            {formatFecha(flota.fecha)}
+          </span>
+          {esHoy && (
+            <span className="text-xs px-2 py-0.5 rounded-full font-semibold"
+              style={{ background: '#254A96', color: 'white' }}>Hoy</span>
+          )}
+        </div>
+        <div className="flex items-center gap-4 text-xs flex-wrap" style={{ color: '#B9BBB7' }}>
+          <span>🚛 {flota.activos} camión{flota.activos !== 1 ? 'es' : ''} activo{flota.activos !== 1 ? 's' : ''}</span>
+          <span>👤 {flota.choferes} chofer{flota.choferes !== 1 ? 'es' : ''}</span>
+          {flota.sucursales.length > 0 && (
+            <span>📍 {flota.sucursales.join(', ')}</span>
+          )}
+        </div>
+        {flota.ultimaModif && (
+          <p className="text-xs mt-1" style={{ color: '#B9BBB7' }}>
+            Última modificación: {formatRelativo(flota.ultimaModif)}
+          </p>
+        )}
+      </div>
+
+      <span className="text-xl shrink-0" style={{ color: '#B9BBB7' }}>›</span>
+    </button>
+  )
+}
+
+// ─── Vista Editar ───────────────────────────────────────────────────────────────
+
+function VistaEditar({ fecha, onVolver, showToast }: {
+  fecha: string
+  onVolver: () => void
+  showToast: (msg: string, tipo?: 'ok' | 'err') => void
+}) {
+  const [camiones, setCamiones] = useState<any[]>([])
+  const [choferes, setChoferes] = useState<{ id: string; nombre: string }[]>([])
+  const [loading, setLoading] = useState(true)
+  const [guardando, setGuardando] = useState(false)
+  const [dragging, setDragging] = useState<string | null>(null)
+  const [dragOver, setDragOver] = useState<string | null>(null)
+  const [ultimaModif, setUltimaModif] = useState<string | null>(null)
+
+  useEffect(() => { cargarFlota() }, [fecha])
 
   const cargarFlota = async () => {
     setLoading(true)
@@ -55,13 +357,16 @@ export default function FlotaDia() {
 
     setChoferes(choferesData ?? [])
 
-    setCamiones((flotaBase ?? []).map(c => {
-      const diaConfig = flotaDia?.find((d: any) => d.camion_codigo === c.codigo)
+    // Calcular última modificación
+    const fechas = (flotaDia ?? []).map((d: any) => d.updated_at).filter(Boolean).sort()
+    setUltimaModif(fechas.at(-1) ?? null)
+
+    setCamiones((flotaBase ?? []).map((c: any) => {
+      const diaConfig = (flotaDia ?? []).find((d: any) => d.camion_codigo === c.codigo)
       return {
         ...c,
         sucursal_dia: diaConfig ? diaConfig.sucursal : c.sucursal,
         activo_dia: diaConfig ? diaConfig.activo : true,
-        // chofer_id viene de flota_dia (por fecha), no de usuarios (global)
         chofer_id: diaConfig?.chofer_id ?? '',
       }
     }))
@@ -89,7 +394,6 @@ export default function FlotaDia() {
   const guardarFlota = async () => {
     setGuardando(true)
     try {
-      // Guardar cada camión individualmente para evitar problemas con upsert masivo
       const resultados = await Promise.all(
         camiones.map(c =>
           supabase.from('flota_dia').upsert(
@@ -111,11 +415,11 @@ export default function FlotaDia() {
         console.error('Errores al guardar flota:', errores.map(r => r.error))
         showToast(`Error: ${msg}`, 'err')
       } else {
-        showToast('Flota y choferes guardados correctamente')
-        await cargarFlota() // recargar para confirmar que los datos persisten
+        showToast('Flota guardada correctamente')
+        await cargarFlota()
       }
     } catch (e: any) {
-      console.error('Error inesperado en guardarFlota:', e)
+      console.error('Error inesperado:', e)
       showToast(`Error: ${e.message}`, 'err')
     } finally {
       setGuardando(false)
@@ -127,45 +431,39 @@ export default function FlotaDia() {
     camiones.some(c => c.codigo !== camionActual && c.chofer_id === choferId)
 
   if (loading) return (
-    <div className="min-h-screen flex items-center justify-center bg-gray-50">
+    <div className="min-h-screen flex items-center justify-center">
       <div className="w-6 h-6 border-2 border-t-transparent rounded-full animate-spin"
         style={{ borderColor: '#254A96', borderTopColor: 'transparent' }} />
     </div>
   )
 
   return (
-    <div className="min-h-screen bg-gray-50" style={{ fontFamily: 'Barlow, sans-serif' }}>
-
-      {toast && (
-        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 px-5 py-3 rounded-xl shadow-lg text-sm font-medium text-white flex items-center gap-2"
-          style={{ background: toast.tipo === 'ok' ? '#254A96' : '#E52322' }}>
-          {toast.tipo === 'ok' ? '✓' : '✕'} {toast.msg}
-        </div>
-      )}
-
+    <>
+      {/* Navbar */}
       <nav className="bg-white border-b sticky top-0 z-40" style={{ borderColor: '#e8edf8' }}>
         <div className="max-w-screen-xl mx-auto px-4 md:px-6 h-14 flex items-center justify-between gap-4">
           <div className="flex items-center gap-4">
-            <button onClick={() => router.push('/dashboard')}
+            <button onClick={onVolver}
               className="flex items-center gap-1.5 text-sm font-medium px-3 py-1.5 rounded-lg"
               style={{ color: '#254A96', background: '#e8edf8' }}>
-              ← Volver
+              ← Flotas
             </button>
-            <div className="hidden sm:block">
-              <span className="font-semibold text-sm" style={{ color: '#254A96' }}>Flota del día</span>
-              <span className="text-xs ml-2" style={{ color: '#B9BBB7' }}>Configurar camiones y asignar choferes</span>
+            <div>
+              <span className="font-semibold text-sm capitalize" style={{ color: '#254A96' }}>
+                {formatFecha(fecha)}
+              </span>
+              {ultimaModif && (
+                <span className="text-xs ml-2" style={{ color: '#B9BBB7' }}>
+                  · Modificado {formatRelativo(ultimaModif)}
+                </span>
+              )}
             </div>
           </div>
-          <div className="flex items-center gap-3">
-            <input type="date" value={fecha} onChange={e => setFecha(e.target.value)}
-              className="border rounded-lg px-3 py-1.5 text-sm focus:outline-none"
-              style={{ borderColor: '#e8edf8' }} />
-            <button onClick={guardarFlota} disabled={guardando}
-              className="px-4 py-2 rounded-lg text-sm font-semibold text-white disabled:opacity-50"
-              style={{ background: '#254A96' }}>
-              {guardando ? 'Guardando...' : 'Guardar flota'}
-            </button>
-          </div>
+          <button onClick={guardarFlota} disabled={guardando}
+            className="px-4 py-2 rounded-lg text-sm font-semibold text-white disabled:opacity-50"
+            style={{ background: '#254A96' }}>
+            {guardando ? 'Guardando...' : 'Guardar flota'}
+          </button>
         </div>
       </nav>
 
@@ -234,14 +532,17 @@ export default function FlotaDia() {
                         </div>
                       )}
 
-                      {/* Asignación de chofer */}
                       {sucursal !== 'Fuera de servicio' && c.activo_dia && (
                         <div onMouseDown={e => e.stopPropagation()}>
                           <select
                             value={c.chofer_id ?? ''}
                             onChange={e => asignarChofer(c.codigo, e.target.value)}
                             className="w-full text-xs border rounded-lg px-2 py-1 focus:outline-none"
-                            style={{ borderColor: c.chofer_id ? '#254A96' : '#e8edf8', color: c.chofer_id ? '#254A96' : '#B9BBB7', background: c.chofer_id ? '#e8edf8' : 'white' }}>
+                            style={{
+                              borderColor: c.chofer_id ? '#254A96' : '#e8edf8',
+                              color: c.chofer_id ? '#254A96' : '#B9BBB7',
+                              background: c.chofer_id ? '#e8edf8' : 'white',
+                            }}>
                             <option value="">🚗 Sin chofer</option>
                             {choferes.map(ch => (
                               <option key={ch.id} value={ch.id}
@@ -267,6 +568,6 @@ export default function FlotaDia() {
           })}
         </div>
       </main>
-    </div>
+    </>
   )
 }

@@ -80,7 +80,7 @@ export default function NuevoDespacho() {
     const codigos = (flotaData ?? []).map((f: any) => f.camion_codigo)
 
     if (codigos.length === 0) {
-      setCuposDisponibles([1, 2, 3, 4])
+      setCuposDisponibles([])
       setVerificando(false)
       return
     }
@@ -95,23 +95,16 @@ export default function NuevoDespacho() {
         .eq('sucursal', form.sucursal).eq('fecha_entrega', form.fecha_entrega)
         .eq('vuelta', vuelta).neq('estado', 'cancelado')
 
-      const pesoAcum: Record<string, number> = {}
-      const posAcum: Record<string, number> = {}
-      camiones.forEach(c => { pesoAcum[c.codigo] = 0; posAcum[c.codigo] = 0 })
-      ;(pedidosVuelta ?? []).forEach((p: any) => {
-        if (p.camion_id) {
-          pesoAcum[p.camion_id] = (pesoAcum[p.camion_id] ?? 0) + (p.peso_total_kg ?? 0)
-          posAcum[p.camion_id] = (posAcum[p.camion_id] ?? 0) + (p.volumen_total_m3 ?? 0)
-        }
-      })
+      const pesoTotalFlota = camiones.reduce((a, c) => a + c.tonelaje_max_kg, 0)
+      const posTotalFlota = camiones.reduce((a, c) => a + c.posiciones_total, 0)
+      const pesoUsado = (pedidosVuelta ?? []).reduce((a: number, p: any) => a + (p.peso_total_kg ?? 0), 0)
+      const posUsadas = (pedidosVuelta ?? []).reduce((a: number, p: any) => a + (p.volumen_total_m3 ?? 0), 0)
 
       const pesoNuevo = pesoTotal > 0 ? pesoTotal : 0
       const posNuevas = posicionesTotal > 0 ? posicionesTotal : 0
-      const hayLugar = camiones.some(c => {
-        if (pesoNuevo === 0 && posNuevas === 0) return true
-        return (c.tonelaje_max_kg - (pesoAcum[c.codigo] ?? 0)) >= pesoNuevo &&
-               (c.posiciones_total - (posAcum[c.codigo] ?? 0)) >= posNuevas
-      })
+      const hayLugar = pesoNuevo === 0 && posNuevas === 0
+        ? true
+        : (pesoTotalFlota - pesoUsado) >= pesoNuevo && (posTotalFlota - posUsadas) >= posNuevas
       if (hayLugar) disponibles.push(vuelta)
     }
 

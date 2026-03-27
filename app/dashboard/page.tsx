@@ -1,15 +1,16 @@
 'use client'
- 
+
 import { useEffect, useState } from 'react'
 import { supabase } from '../supabase'
 import { useRouter } from 'next/navigation'
- 
-const CARDS = [
-  { href: '/despachos', icon: '📦', titulo: 'Nuevo despacho', descripcion: 'Cargar solicitud desde PDF', disponible: true },
-  { href: '/flota', icon: '🚛', titulo: 'Flota del día', descripcion: 'Configurar camiones disponibles', disponible: true },
-  { href: '/programacion', icon: '📅', titulo: 'Programación', descripcion: 'Asignar pedidos a camiones', disponible: true },
-  { href: '/ruteo', icon: '🗺️', titulo: 'Ruteo', descripcion: 'Hoja de ruta por chofer', disponible: true },
-  { href: '/metricas', icon: '📊', titulo: 'Métricas', descripcion: 'KPIs y estadísticas', disponible: false },
+
+const TODAS_LAS_CARDS = [
+  { href: '/despachos',    icon: '📦', titulo: 'Nueva solicitud',  descripcion: 'Cargar solicitud de despacho',    disponible: true,  roles: ['gerencia','ruteador','comercial'] },
+  { href: '/flota',        icon: '🚛', titulo: 'Flota del día',    descripcion: 'Configurar camiones y choferes',  disponible: true,  roles: ['gerencia','admin_flota'] },
+  { href: '/programacion', icon: '📅', titulo: 'Programación',     descripcion: 'Asignar pedidos a camiones',      disponible: true,  roles: ['gerencia','ruteador'] },
+  { href: '/ruteo',        icon: '🗺️', titulo: 'Ruteo',            descripcion: 'Ver recorridos del día',          disponible: true,  roles: ['gerencia','admin_flota','ruteador'] },
+  { href: '/usuarios',     icon: '👥', titulo: 'Usuarios',          descripcion: 'Gestión de usuarios y permisos', disponible: true,  roles: ['gerencia'] },
+  { href: '/metricas',     icon: '📊', titulo: 'Métricas',          descripcion: 'KPIs y estadísticas',             disponible: false, roles: ['gerencia','ruteador','admin_flota','comercial'] },
 ]
  
 const ESTADO_COLOR: Record<string, string> = {
@@ -30,37 +31,50 @@ interface PedidoReciente {
  
 export default function Dashboard() {
   const [usuario, setUsuario] = useState<any>(null)
+  const [rolUsuario, setRolUsuario] = useState<string>('')
+  const [nombreUsuario, setNombreUsuario] = useState<string>('')
   const [stats, setStats] = useState({ pendientes: 0, hoy: 0, enCamino: 0, entregadosHoy: 0 })
   const [recientes, setRecientes] = useState<PedidoReciente[]>([])
   const [cargando, setCargando] = useState(true)
-const [verificando, setVerificando] = useState(true)
+  const [verificando, setVerificando] = useState(true)
+  const [modalPassword, setModalPassword] = useState(false)
+  const [nuevaPassword, setNuevaPassword] = useState('')
+  const [cambiandoPass, setCambiandoPass] = useState(false)
+  const [toastPass, setToastPass] = useState<{ msg: string; tipo: 'ok' | 'err' } | null>(null)
   const router = useRouter()
- 
-  useEffect(() => {
-  supabase.auth.getUser().then(async ({ data: { user } }) => {
-    if (!user) { router.push('/'); return }
 
-    console.log('Usuario ID:', user.id)
-
-    const { data: userData, error } = await supabase
-      .from('usuarios')
-      .select('rol')
-      .eq('id', user.id)
-      .single()
-
-    console.log('userData:', userData, 'error:', error)
-
-    if (userData?.rol === 'chofer') {
-      console.log('Es chofer, redirigiendo...')
-      router.push('/ruteo')
-      return
+  const cambiarPassword = async () => {
+    if (nuevaPassword.length < 6) { setToastPass({ msg: 'Mínimo 6 caracteres', tipo: 'err' }); return }
+    setCambiandoPass(true)
+    const { error } = await supabase.auth.updateUser({ password: nuevaPassword })
+    if (error) {
+      setToastPass({ msg: error.message, tipo: 'err' })
+    } else {
+      setToastPass({ msg: 'Contraseña actualizada', tipo: 'ok' })
+      setTimeout(() => { setModalPassword(false); setNuevaPassword(''); setToastPass(null) }, 1500)
     }
+    setCambiandoPass(false)
+  }
 
-    setUsuario(user)
-    setVerificando(false)
-    cargarDatos()
-  })
-}, [])
+  useEffect(() => {
+    supabase.auth.getUser().then(async ({ data: { user } }) => {
+      if (!user) { router.push('/'); return }
+
+      const { data: userData } = await supabase
+        .from('usuarios')
+        .select('rol, nombre')
+        .eq('id', user.id)
+        .single()
+
+      if (userData?.rol === 'chofer') { router.push('/ruteo'); return }
+
+      setUsuario(user)
+      setRolUsuario(userData?.rol ?? '')
+      setNombreUsuario(userData?.nombre ?? user.email?.split('@')[0] ?? 'usuario')
+      setVerificando(false)
+      cargarDatos()
+    })
+  }, [])
  
   const cargarDatos = async () => {
     const hoy = new Date().toISOString().split('T')[0]
@@ -84,11 +98,42 @@ const [verificando, setVerificando] = useState(true)
  
   const hora = new Date().getHours()
   const saludo = hora < 12 ? 'Buenos días' : hora < 18 ? 'Buenas tardes' : 'Buenas noches'
-  const nombre = usuario.email?.split('@')[0] || 'usuario'
+  const cards = TODAS_LAS_CARDS.filter(c => !rolUsuario || c.roles.includes(rolUsuario))
  
   return (
     <div className="min-h-screen bg-gray-50" style={{ fontFamily: 'Barlow, sans-serif' }}>
- 
+
+      {/* Modal cambiar contraseña */}
+      {modalPassword && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(0,0,0,0.5)' }}>
+          <div className="bg-white rounded-2xl w-full max-w-sm p-6 space-y-4">
+            <div className="flex justify-between items-center">
+              <h3 className="font-bold text-base" style={{ color: '#254A96' }}>Cambiar contraseña</h3>
+              <button onClick={() => { setModalPassword(false); setNuevaPassword(''); setToastPass(null) }}
+                className="text-gray-400 hover:text-gray-600 text-xl">✕</button>
+            </div>
+            <div>
+              <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>Nueva contraseña</label>
+              <input type="password" value={nuevaPassword} onChange={e => setNuevaPassword(e.target.value)}
+                className="w-full border rounded-xl px-4 py-2.5 text-sm focus:outline-none"
+                style={{ borderColor: '#e8edf8' }} placeholder="Mínimo 6 caracteres"
+                onKeyDown={e => e.key === 'Enter' && cambiarPassword()} />
+            </div>
+            {toastPass && (
+              <p className="text-xs rounded-lg px-3 py-2 font-medium"
+                style={{ background: toastPass.tipo === 'ok' ? '#d1fae5' : '#fde8e8', color: toastPass.tipo === 'ok' ? '#065f46' : '#E52322' }}>
+                {toastPass.tipo === 'ok' ? '✓' : '✕'} {toastPass.msg}
+              </p>
+            )}
+            <button onClick={cambiarPassword} disabled={cambiandoPass || nuevaPassword.length < 6}
+              className="w-full py-2.5 rounded-xl text-sm font-semibold text-white disabled:opacity-50"
+              style={{ background: '#254A96' }}>
+              {cambiandoPass ? 'Guardando...' : 'Actualizar contraseña'}
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Navbar */}
       <nav className="bg-white border-b sticky top-0 z-40" style={{ borderColor: '#e8edf8' }}>
         <div className="max-w-7xl mx-auto px-4 md:px-6 h-14 flex items-center justify-between">
@@ -99,10 +144,15 @@ const [verificando, setVerificando] = useState(true)
               <span className="text-xs ml-2" style={{ color: '#B9BBB7' }}>Despachos</span>
             </div>
           </div>
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2">
             <span className="text-xs hidden md:block" style={{ color: '#B9BBB7' }}>{usuario.email}</span>
+            <button onClick={() => setModalPassword(true)}
+              className="text-xs px-3 py-1.5 rounded-lg font-medium"
+              style={{ background: '#e8edf8', color: '#254A96' }}>
+              🔑 Cambiar clave
+            </button>
             <button onClick={() => { supabase.auth.signOut(); router.push('/') }}
-              className="text-xs px-3 py-1.5 rounded-lg font-medium transition-colors"
+              className="text-xs px-3 py-1.5 rounded-lg font-medium"
               style={{ background: '#fde8e8', color: '#E52322' }}>
               Salir
             </button>
@@ -114,7 +164,7 @@ const [verificando, setVerificando] = useState(true)
  
         {/* Saludo */}
         <div className="mb-6">
-          <h2 className="text-xl md:text-2xl font-semibold" style={{ color: '#254A96' }}>{saludo}, {nombre} 👋</h2>
+          <h2 className="text-xl md:text-2xl font-semibold" style={{ color: '#254A96' }}>{saludo}, {nombreUsuario} 👋</h2>
           <p className="text-sm mt-0.5" style={{ color: '#B9BBB7' }}>
             {new Date().toLocaleDateString('es-AR', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}
           </p>
@@ -145,7 +195,7 @@ const [verificando, setVerificando] = useState(true)
           <div>
             <p className="text-xs font-semibold uppercase tracking-widest mb-3" style={{ color: '#B9BBB7' }}>Módulos</p>
             <div className="space-y-2">
-              {CARDS.map(card => (
+              {cards.map(card => (
                 <button key={card.href} onClick={() => card.disponible && router.push(card.href)}
                   disabled={!card.disponible}
                   className="w-full bg-white rounded-xl p-4 flex items-center gap-4 shadow-sm text-left transition-all disabled:opacity-50"

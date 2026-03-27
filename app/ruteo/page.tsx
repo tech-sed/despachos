@@ -3,6 +3,7 @@
 import { useEffect, useState, useRef } from 'react'
 import { supabase } from '../supabase'
 import { useRouter } from 'next/navigation'
+import { logAuditoria } from '../lib/auditoria'
 
 interface Pedido {
   id: string
@@ -41,6 +42,7 @@ function hoy() { return new Date().toISOString().split('T')[0] }
 export default function RuteoPage() {
   const router = useRouter()
   const [usuario, setUsuario] = useState<any>(null)
+  const [datosUsuario, setDatosUsuario] = useState<{ nombre: string } | null>(null)
   const [camionSeleccionado, setCamionSeleccionado] = useState<string | null>(null)
   const [camionesDisponibles, setCamionesDisponibles] = useState<CamionDisponible[]>([])
   const [pedidos, setPedidos] = useState<Pedido[]>([])
@@ -73,16 +75,17 @@ export default function RuteoPage() {
         .eq('id', user.id)
         .single()
 
-      if (userData?.rol !== 'chofer') {
+      if (!['chofer', 'gerencia', 'admin_flota', 'ruteador'].includes(userData?.rol)) {
         router.push('/dashboard')
         return
       }
 
-      // Si ya tiene camión guardado, usarlo
+      // Chofer: camión asignado por admin_flota, no puede elegir
+      // Otros roles: pueden seleccionar para monitoreo
       if (userData?.camion_codigo) {
         setCamionSeleccionado(userData.camion_codigo)
       }
-
+      setDatosUsuario({ nombre: userData?.nombre ?? user.email ?? 'Chofer' })
       setCargando(false)
     })
   }, [])
@@ -155,6 +158,31 @@ export default function RuteoPage() {
     }
   }
 
+  const abrirRecorridoCompleto = () => {
+    const paradas = pedidosVuelta
+      .filter(p => p.estado !== 'entregado' && p.latitud && p.longitud)
+      .sort((a, b) => (a.orden_entrega ?? 999) - (b.orden_entrega ?? 999))
+
+    if (paradas.length === 0) return
+
+    const construirUrl = (origin: string) => {
+      const destination = `${paradas[paradas.length - 1].latitud},${paradas[paradas.length - 1].longitud}`
+      const waypoints = paradas.slice(0, -1).map(p => `${p.latitud},${p.longitud}`).join('|')
+      let url = `https://www.google.com/maps/dir/?api=1&origin=${origin}&destination=${destination}&travelmode=driving`
+      if (waypoints) url += `&waypoints=${waypoints}`
+      window.open(url, '_blank')
+    }
+
+    if (navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(
+        pos => construirUrl(`${pos.coords.latitude},${pos.coords.longitude}`),
+        () => construirUrl('') // si deniega permisos, Maps usa ubicación actual automáticamente
+      )
+    } else {
+      construirUrl('')
+    }
+  }
+
   const abrirMaps = (pedido: Pedido) => {
     if (pedido.latitud && pedido.longitud) {
       window.open(`https://www.google.com/maps/dir/?api=1&destination=${pedido.latitud},${pedido.longitud}`, '_blank')
@@ -186,6 +214,16 @@ export default function RuteoPage() {
 
     if (data.success) {
       showToast('Entrega confirmada')
+      if (usuario && datosUsuario) {
+        await logAuditoria(usuario.id, datosUsuario.nombre, 'Confirmó entrega', 'Ruteo', {
+          pedido_id: modalPedido.id,
+          nv: modalPedido.nv,
+          cliente: modalPedido.cliente,
+          camion: camionSeleccionado,
+          con_nota: !!nota,
+          con_foto: !!foto,
+        })
+      }
       setPedidos(prev => prev.map(p =>
         p.id === modalPedido.id ? { ...p, estado: 'entregado' } : p
       ))
@@ -277,7 +315,11 @@ export default function RuteoPage() {
       <nav className="bg-white border-b sticky top-0 z-40" style={{ borderColor: '#e8edf8' }}>
         <div className="max-w-2xl mx-auto px-4 h-14 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="w-8 h-8 rounded-lg flex items-center justify-center text-white font-bold text-sm" style={{ background: '#254A96' }}>C</div>
+            <button onClick={() => router.push('/dashboard')}
+              className="text-xs px-2 py-1.5 rounded-lg font-medium"
+              style={{ background: '#e8edf8', color: '#254A96' }}>
+              ← Volver
+            </button>
             <div>
               <span className="font-semibold text-sm" style={{ color: '#254A96' }}>Mis entregas</span>
               {camionSeleccionado && (
@@ -303,10 +345,12 @@ export default function RuteoPage() {
 
       <main className="max-w-2xl mx-auto px-4 py-4">
 
-        {/* Selector de camión */}
+        {/* Selector de camión — solo para no-choferes (gerencia, admin_flota, ruteador) */}
         {!camionSeleccionado && (
           <div className="bg-white rounded-xl shadow-sm p-6">
-            <h2 className="font-semibold text-base mb-1" style={{ color: '#254A96' }}>¿Qué camión manejás hoy?</h2>
+            <h2 className="font-semibold text-base mb-1" style={{ color: '#254A96' }}>
+              {datosUsuario ? 'No tenés camión asignado para hoy' : '¿Qué camión querés ver?'}
+            </h2>
             <p className="text-xs mb-4" style={{ color: '#B9BBB7' }}>
               {new Date(fecha + 'T00:00:00').toLocaleDateString('es-AR', { weekday: 'long', day: '2-digit', month: 'long' })}
             </p>
@@ -314,6 +358,7 @@ export default function RuteoPage() {
               <div className="text-center py-8" style={{ color: '#B9BBB7' }}>
                 <p className="text-3xl mb-3">🚛</p>
                 <p className="text-sm">No hay camiones con entregas programadas para esta fecha</p>
+                <p className="text-xs mt-2">Si sos chofer, contactá al administrador de flota para que te asigne un camión</p>
               </div>
             ) : (
               <div className="space-y-2">
@@ -385,6 +430,15 @@ export default function RuteoPage() {
                       )
                     })}
                   </div>
+                )}
+
+                {/* Botón recorrido completo */}
+                {pedidosVuelta.filter(p => p.estado !== 'entregado' && p.latitud && p.longitud).length > 0 && (
+                  <button onClick={abrirRecorridoCompleto}
+                    className="w-full flex items-center justify-center gap-2 py-3 rounded-xl text-sm font-semibold mb-4"
+                    style={{ background: '#254A96', color: 'white' }}>
+                    🗺️ Ver recorrido completo en Maps
+                  </button>
                 )}
 
                 {/* Lista de pedidos */}

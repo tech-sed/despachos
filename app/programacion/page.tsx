@@ -201,7 +201,7 @@ function PedidoCard({ pedido, onDragStart, onCancelar, onCambiarVuelta, onReprog
   )
 }
 
-function ColumnaCamion({ columna, sinAsignar = false, onDrop, onDragOver, onDragLeave, onDragStart, isDragOver, onCancelar, onCambiarVuelta, onReprogramar }: {
+function ColumnaCamion({ columna, sinAsignar = false, onDrop, onDragOver, onDragLeave, onDragStart, isDragOver, onCancelar, onCambiarVuelta, onReprogramar, onReprogramarCamion }: {
   columna: ColumnaKanban; sinAsignar?: boolean
   onDrop: (e: React.DragEvent, cod: string | null) => void
   onDragOver: (e: React.DragEvent, cod: string | null) => void
@@ -209,6 +209,7 @@ function ColumnaCamion({ columna, sinAsignar = false, onDrop, onDragOver, onDrag
   onCancelar: (id: string) => void
   onCambiarVuelta: (id: string, vuelta: number) => void
   onReprogramar: (id: string, fecha: string, vuelta: number, motivo: string) => void
+  onReprogramarCamion?: (codigo: string) => void
 }) {
   const { camion, pedidos, pesoTotal } = columna
   const p = sinAsignar ? 0 : pct(pesoTotal, camion.tonelaje_max_kg)
@@ -241,9 +242,17 @@ function ColumnaCamion({ columna, sinAsignar = false, onDrop, onDragOver, onDrag
             <div className="w-full rounded-full h-1.5 mb-1" style={{ background: '#f0f0f0' }}>
               <div className="h-1.5 rounded-full transition-all" style={{ width: `${p}%`, background: colorBarra(p) }} />
             </div>
-            <div className="flex justify-between text-xs" style={{ color: '#B9BBB7' }}>
+            <div className="flex justify-between items-center text-xs" style={{ color: '#B9BBB7' }}>
               <span>{Math.round(pesoTotal)} kg</span>
-              <span style={{ color: p >= 90 ? '#E52322' : '#B9BBB7', fontWeight: p >= 90 ? 600 : 400 }}>{p}% · {camion.tonelaje_max_kg} kg</span>
+              <div className="flex items-center gap-2">
+                <span style={{ color: p >= 90 ? '#E52322' : '#B9BBB7', fontWeight: p >= 90 ? 600 : 400 }}>{p}% · {camion.tonelaje_max_kg} kg</span>
+                {onReprogramarCamion && pedidos.length > 0 && (
+                  <button onClick={() => onReprogramarCamion(camion.codigo)}
+                    title="Reprogramar pedidos de este camión"
+                    className="px-1.5 py-0.5 rounded text-xs font-medium"
+                    style={{ background: '#fef3c7', color: '#b45309' }}>📅</button>
+                )}
+              </div>
             </div>
           </>
         )}
@@ -311,6 +320,7 @@ function ProgramacionInner() {
   const [modalReprogVuelta, setModalReprogVuelta] = useState(false)
   const [reprogVueltaFecha, setReprogVueltaFecha] = useState('')
   const [reprogVueltaNueva, setReprogVueltaNueva] = useState(1)
+  const [camionParaReprog, setCamionParaReprog] = useState<string | null>(null)
 
   const showToast = (msg: string, tipo: 'ok' | 'err' = 'ok') => { setToast({ msg, tipo }); setTimeout(() => setToast(null), 3000) }
 
@@ -430,16 +440,20 @@ function ProgramacionInner() {
   async function handleReprogramarVuelta() {
     if (!reprogVueltaFecha || pedidos.length === 0) return
     setGuardando(true)
+    const aReprogramar = camionParaReprog
+      ? pedidos.filter(p => p.camion_id === camionParaReprog)
+      : pedidos
     try {
-      const nota = `⚡ Reprog. vuelta completa desde ${fecha} V${vueltaActiva}`
-      await Promise.all(pedidos.map(p =>
+      const contexto = camionParaReprog ? `camión ${camionParaReprog}` : `vuelta completa`
+      const nota = `⚡ Reprog. ${contexto} desde ${fecha} V${vueltaActiva}`
+      await Promise.all(aReprogramar.map(p =>
         fetch('/api/pedidos', {
           method: 'PATCH', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ id: p.id, fecha_entrega: reprogVueltaFecha, vuelta: reprogVueltaNueva, camion_id: null, orden_entrega: null, estado: 'pendiente', notas: p.notas ? `${p.notas} | ${nota}` : nota })
         })
       ))
       setModalReprogVuelta(false)
-      showToast(`Vuelta ${vueltaActiva} reprogramada — ${pedidos.length} pedidos movidos`)
+      showToast(`${aReprogramar.length} pedidos reprogramados`)
       cargarDatos()
     } catch (e: any) { showToast(`Error: ${e.message}`, 'err') }
     setGuardando(false)
@@ -470,13 +484,17 @@ function ProgramacionInner() {
         </div>
       )}
 
-      {/* Modal reprogramar vuelta completa */}
+      {/* Modal reprogramar vuelta / camión */}
       {modalReprogVuelta && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
           <div className="bg-white rounded-2xl shadow-xl p-6 w-full max-w-sm" style={{ fontFamily: 'Barlow, sans-serif' }}>
-            <h3 className="font-semibold text-sm mb-1" style={{ color: '#254A96' }}>📅 Reprogramar vuelta completa</h3>
+            <h3 className="font-semibold text-sm mb-1" style={{ color: '#254A96' }}>
+              📅 {camionParaReprog ? `Reprogramar camión ${camionParaReprog}` : 'Reprogramar vuelta completa'}
+            </h3>
             <p className="text-xs mb-4" style={{ color: '#B9BBB7' }}>
-              Se moverán los {pedidos.length} pedidos de V{vueltaActiva} del {fecha} a la nueva fecha y vuelta.
+              {camionParaReprog
+                ? `Se moverán los ${pedidos.filter(p => p.camion_id === camionParaReprog).length} pedidos del camión ${camionParaReprog} (V${vueltaActiva}).`
+                : `Se moverán los ${pedidos.length} pedidos de V${vueltaActiva} del ${fecha}.`}
             </p>
             <div className="space-y-3">
               <div>
@@ -501,7 +519,7 @@ function ProgramacionInner() {
                 style={{ background: '#254A96' }}>
                 {guardando ? 'Reprogramando…' : 'Confirmar'}
               </button>
-              <button onClick={() => setModalReprogVuelta(false)}
+              <button onClick={() => { setModalReprogVuelta(false); setCamionParaReprog(null) }}
                 className="px-4 py-2.5 rounded-xl text-sm font-medium"
                 style={{ background: '#f4f4f3', color: '#666' }}>Cancelar</button>
             </div>
@@ -555,7 +573,7 @@ function ProgramacionInner() {
               disabled={cargando || guardando}
               className="px-3 py-2 text-sm rounded-lg border transition-colors disabled:opacity-40"
               style={{ borderColor: '#e8edf8', color: '#666' }}>Limpiar</button>
-            <button onClick={() => { setModalReprogVuelta(true); setReprogVueltaFecha(''); setReprogVueltaNueva(1) }}
+            <button onClick={() => { setCamionParaReprog(null); setModalReprogVuelta(true); setReprogVueltaFecha(''); setReprogVueltaNueva(1) }}
               disabled={cargando || guardando || pedidos.length === 0}
               className="px-3 py-2 text-sm rounded-lg border transition-colors disabled:opacity-40"
               style={{ borderColor: '#fbbf24', color: '#b45309', background: '#fef3c7' }}>📅 Reprog. vuelta</button>
@@ -611,7 +629,8 @@ function ProgramacionInner() {
                 isDragOver={dragOver === col.camion.codigo}
                 onCancelar={handleCancelar}
                 onCambiarVuelta={handleCambiarVuelta}
-                onReprogramar={handleReprogramar} />
+                onReprogramar={handleReprogramar}
+                onReprogramarCamion={codigo => { setCamionParaReprog(codigo); setModalReprogVuelta(true); setReprogVueltaFecha(''); setReprogVueltaNueva(1) }} />
             ))}
           </div>
         )}

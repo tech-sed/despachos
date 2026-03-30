@@ -6,8 +6,8 @@ import { supabase } from '@/app/supabase'
 
 interface Pedido {
   id: string; nv: string; cliente: string; direccion: string; sucursal: string
-  vuelta: number; estado: string; estado_pago: string; peso_total_kg: number | null
-  notas: string | null; camion_id: string | null
+  fecha_entrega: string; vuelta: number; estado: string; estado_pago: string; peso_total_kg: number | null
+  notas: string | null; camion_id: string | null; orden_entrega: number | null
   latitud: number | null; longitud: number | null
   items?: { nombre: string; cantidad: number; unidad: string }[]
 }
@@ -51,23 +51,109 @@ function sugerirAsignacion(sin: Pedido[], camiones: Camion[], ya: Pedido[]): Rec
   return asigs
 }
 
-function PedidoCard({ pedido, onDragStart }: { pedido: Pedido; onDragStart: (e: React.DragEvent, p: Pedido) => void }) {
+function PedidoCard({ pedido, onDragStart, onCancelar, onCambiarVuelta, onReprogramar }: {
+  pedido: Pedido
+  onDragStart: (e: React.DragEvent, p: Pedido) => void
+  onCancelar: (id: string) => void
+  onCambiarVuelta: (id: string, vuelta: number) => void
+  onReprogramar: (id: string, fecha: string, vuelta: number, motivo: string) => void
+}) {
   const [expandido, setExpandido] = useState(false)
+  const [modo, setModo] = useState<'normal' | 'vuelta' | 'reprog'>('normal')
+  const [reprogFecha, setReprogFecha] = useState('')
+  const [reprogVuelta, setReprogVuelta] = useState(1)
+  const [reprogMotivo, setReprogMotivo] = useState('')
+  const mananaStr = (() => { const d = new Date(); d.setDate(d.getDate() + 1); return d.toISOString().split('T')[0] })()
+  const esReprogramado = pedido.notas?.startsWith('⚡')
   return (
     <div draggable onDragStart={e => onDragStart(e, pedido)}
       className="bg-white rounded-lg p-3 mb-2 cursor-grab active:cursor-grabbing select-none hover:shadow-md transition-shadow"
-      style={{ border: '1px solid #f0f0f0' }}>
+      style={{ border: `1px solid ${esReprogramado ? '#fbbf24' : '#f0f0f0'}` }}>
       <div className="flex items-start justify-between gap-2 mb-1">
         <span className="font-semibold text-xs leading-tight" style={{ color: '#254A96' }}>{pedido.cliente}</span>
-        <span className={`text-xs px-1.5 py-0.5 rounded-full font-medium shrink-0 ${PAGO_COLOR[pedido.estado_pago] ?? 'bg-gray-100 text-gray-600'}`}>
-          {PAGO_LABEL[pedido.estado_pago] ?? pedido.estado_pago}
-        </span>
+        <div className="flex items-center gap-1 shrink-0">
+          <span className={`text-xs px-1.5 py-0.5 rounded-full font-medium ${PAGO_COLOR[pedido.estado_pago] ?? 'bg-gray-100 text-gray-600'}`}>
+            {PAGO_LABEL[pedido.estado_pago] ?? pedido.estado_pago}
+          </span>
+          <button
+            onMouseDown={e => e.stopPropagation()}
+            onClick={e => { e.stopPropagation(); if (confirm(`¿Cancelar pedido de ${pedido.cliente}?`)) onCancelar(pedido.id) }}
+            title="Cancelar pedido"
+            className="w-4 h-4 flex items-center justify-center rounded hover:bg-red-50 transition-colors"
+            style={{ color: '#E52322', fontSize: '10px', lineHeight: 1 }}>
+            ✕
+          </button>
+        </div>
       </div>
       <p className="text-xs mb-1.5 leading-tight" style={{ color: '#B9BBB7' }}>{pedido.direccion}</p>
       <div className="flex justify-between items-center">
         <span className="text-xs" style={{ color: '#B9BBB7' }}>NV {pedido.nv}</span>
         {pedido.peso_total_kg != null && <span className="text-xs font-semibold" style={{ color: '#254A96' }}>{pedido.peso_total_kg} kg</span>}
       </div>
+      {modo === 'reprog' ? (
+        <div className="mt-2 p-2.5 rounded-lg" style={{ background: '#f4f4f3' }}>
+          <p className="text-xs font-medium mb-2" style={{ color: '#254A96' }}>📅 Reprogramar entrega</p>
+          <div className="space-y-1.5">
+            <input type="date" value={reprogFecha} min={mananaStr}
+              onChange={e => setReprogFecha(e.target.value)}
+              onMouseDown={e => e.stopPropagation()}
+              className="w-full text-xs border rounded px-2 py-1.5 focus:outline-none"
+              style={{ borderColor: '#e8edf8' }} />
+            <select value={reprogVuelta} onChange={e => setReprogVuelta(parseInt(e.target.value))}
+              onMouseDown={e => e.stopPropagation()}
+              className="w-full text-xs border rounded px-2 py-1.5 focus:outline-none"
+              style={{ borderColor: '#e8edf8' }}>
+              {[1, 2, 3, 4].map(v => <option key={v} value={v}>Vuelta {v}</option>)}
+            </select>
+            <input type="text" value={reprogMotivo}
+              onChange={e => setReprogMotivo(e.target.value)}
+              onMouseDown={e => e.stopPropagation()}
+              placeholder="Motivo (ej: lluvia, cliente no disponible)"
+              className="w-full text-xs border rounded px-2 py-1.5 focus:outline-none"
+              style={{ borderColor: '#e8edf8' }} />
+          </div>
+          <div className="flex gap-1.5 mt-2">
+            <button disabled={!reprogFecha}
+              onMouseDown={e => e.stopPropagation()}
+              onClick={e => { e.stopPropagation(); onReprogramar(pedido.id, reprogFecha, reprogVuelta, reprogMotivo); setModo('normal') }}
+              className="flex-1 text-xs py-1.5 rounded font-medium text-white disabled:opacity-40"
+              style={{ background: '#254A96' }}>Confirmar</button>
+            <button onMouseDown={e => e.stopPropagation()}
+              onClick={e => { e.stopPropagation(); setModo('normal') }}
+              className="text-xs px-2 py-1.5 rounded"
+              style={{ background: '#e8edf8', color: '#666' }}>×</button>
+          </div>
+        </div>
+      ) : modo === 'vuelta' ? (
+        <div className="mt-2 flex items-center gap-1.5">
+          <select
+            onMouseDown={e => e.stopPropagation()}
+            onChange={e => { onCambiarVuelta(pedido.id, parseInt(e.target.value)); setModo('normal') }}
+            defaultValue=""
+            className="text-xs border rounded px-2 py-1 flex-1 focus:outline-none"
+            style={{ borderColor: '#e8edf8' }}>
+            <option value="" disabled>Mover a vuelta...</option>
+            {[1, 2, 3, 4].filter(v => v !== pedido.vuelta).map(v => (
+              <option key={v} value={v}>Vuelta {v}</option>
+            ))}
+          </select>
+          <button onMouseDown={e => e.stopPropagation()} onClick={e => { e.stopPropagation(); setModo('normal') }}
+            className="text-xs" style={{ color: '#B9BBB7' }}>×</button>
+        </div>
+      ) : (
+        <div className="flex items-center gap-2 mt-1.5">
+          <button onMouseDown={e => e.stopPropagation()} onClick={e => { e.stopPropagation(); setModo('vuelta') }}
+            className="text-xs hover:underline" style={{ color: '#B9BBB7' }}>
+            V{pedido.vuelta} · cambiar
+          </button>
+          <span style={{ color: '#e0e0e0' }}>|</span>
+          <button onMouseDown={e => e.stopPropagation()}
+            onClick={e => { e.stopPropagation(); setModo('reprog'); setReprogFecha(''); setReprogVuelta(1); setReprogMotivo('') }}
+            className="text-xs hover:underline" style={{ color: '#f59e0b' }}>
+            📅 reprogramar
+          </button>
+        </div>
+      )}
       {pedido.items && pedido.items.length > 0 && (
         <div className="mt-1.5">
           <button onMouseDown={e => e.stopPropagation()} onClick={e => { e.stopPropagation(); setExpandido(!expandido) }}
@@ -86,16 +172,19 @@ function PedidoCard({ pedido, onDragStart }: { pedido: Pedido; onDragStart: (e: 
           )}
         </div>
       )}
-      {pedido.notas && <p className="text-xs rounded px-2 py-1 mt-1.5 leading-tight" style={{ background: '#fff8e1', color: '#b45309' }}>{pedido.notas}</p>}
+      {pedido.notas && <p className="text-xs rounded px-2 py-1 mt-1.5 leading-tight" style={{ background: esReprogramado ? '#fef3c7' : '#fff8e1', color: '#b45309' }}>{pedido.notas}</p>}
     </div>
   )
 }
 
-function ColumnaCamion({ columna, sinAsignar = false, onDrop, onDragOver, onDragLeave, onDragStart, isDragOver }: {
+function ColumnaCamion({ columna, sinAsignar = false, onDrop, onDragOver, onDragLeave, onDragStart, isDragOver, onCancelar, onCambiarVuelta, onReprogramar }: {
   columna: ColumnaKanban; sinAsignar?: boolean
   onDrop: (e: React.DragEvent, cod: string | null) => void
   onDragOver: (e: React.DragEvent, cod: string | null) => void
   onDragLeave: () => void; onDragStart: (e: React.DragEvent, p: Pedido) => void; isDragOver: boolean
+  onCancelar: (id: string) => void
+  onCambiarVuelta: (id: string, vuelta: number) => void
+  onReprogramar: (id: string, fecha: string, vuelta: number, motivo: string) => void
 }) {
   const { camion, pedidos, pesoTotal } = columna
   const p = sinAsignar ? 0 : pct(pesoTotal, camion.tonelaje_max_kg)
@@ -138,7 +227,7 @@ function ColumnaCamion({ columna, sinAsignar = false, onDrop, onDragOver, onDrag
       <div className="p-2 flex-1 overflow-y-auto max-h-[420px]">
         {pedidos.length === 0
           ? <div className="text-center py-8 text-xs" style={{ color: '#B9BBB7' }}>{sinAsignar ? 'Todos asignados ✓' : 'Arrastrá pedidos acá'}</div>
-          : pedidos.map(p => <PedidoCard key={p.id} pedido={p} onDragStart={onDragStart} />)}
+          : pedidos.map(p => <PedidoCard key={p.id} pedido={p} onDragStart={onDragStart} onCancelar={onCancelar} onCambiarVuelta={onCambiarVuelta} onReprogramar={onReprogramar} />)}
       </div>
     </div>
   )
@@ -284,6 +373,36 @@ export default function ProgramacionPage() {
     }
   }
 
+  async function handleCancelar(id: string) {
+    const { error } = await supabase.from('pedidos').update({ estado: 'cancelado' }).eq('id', id)
+    if (error) { showToast('Error al cancelar', 'err'); return }
+    const act = pedidos.filter(p => p.id !== id)
+    setPedidos(act); construirColumnas(act, camiones)
+    showToast('Pedido cancelado')
+  }
+
+  async function handleCambiarVuelta(id: string, nuevaVuelta: number) {
+    const { error } = await supabase.from('pedidos').update({ vuelta: nuevaVuelta, camion_id: null, estado: 'pendiente' }).eq('id', id)
+    if (error) { showToast('Error al cambiar vuelta', 'err'); return }
+    const act = pedidos.filter(p => p.id !== id)
+    setPedidos(act); construirColumnas(act, camiones)
+    showToast(`Pedido movido a Vuelta ${nuevaVuelta}`)
+  }
+
+  async function handleReprogramar(id: string, fecha: string, vuelta: number, motivo: string) {
+    const pedido = pedidos.find(p => p.id === id)
+    if (!pedido) return
+    const nota = `⚡ Reprogramado desde ${pedido.fecha_entrega} V${pedido.vuelta}${motivo ? ` — ${motivo}` : ''}`
+    const notaFinal = pedido.notas ? `${pedido.notas} | ${nota}` : nota
+    const { error } = await supabase.from('pedidos').update({
+      fecha_entrega: fecha, vuelta, camion_id: null, orden_entrega: null, estado: 'pendiente', notas: notaFinal
+    }).eq('id', id)
+    if (error) { showToast('Error al reprogramar', 'err'); return }
+    const act = pedidos.filter(p => p.id !== id)
+    setPedidos(act); construirColumnas(act, camiones)
+    showToast(`Pedido de ${pedido.cliente} reprogramado para el ${fecha}`)
+  }
+
   const totalAsig = pedidos.filter(p => p.camion_id).length
   const totalSin = pedidos.length - totalAsig
 
@@ -380,7 +499,10 @@ export default function ProgramacionPage() {
               onDragOver={(e, cod) => { e.preventDefault(); setDragOver(cod ?? 'sin_asignar') }}
               onDragLeave={() => setDragOver(null)}
               onDragStart={(e, p) => { dragPedido.current = p; e.dataTransfer.effectAllowed = 'move' }}
-              isDragOver={dragOver === 'sin_asignar'} />
+              isDragOver={dragOver === 'sin_asignar'}
+              onCancelar={handleCancelar}
+              onCambiarVuelta={handleCambiarVuelta}
+              onReprogramar={handleReprogramar} />
             <div className="w-px shrink-0 self-stretch" style={{ background: '#e8edf8' }} />
             {columnas.map(col => (
               <ColumnaCamion key={col.camion.codigo} columna={col}
@@ -388,7 +510,10 @@ export default function ProgramacionPage() {
                 onDragOver={(e, cod) => { e.preventDefault(); setDragOver(cod ?? 'sin_asignar') }}
                 onDragLeave={() => setDragOver(null)}
                 onDragStart={(e, p) => { dragPedido.current = p; e.dataTransfer.effectAllowed = 'move' }}
-                isDragOver={dragOver === col.camion.codigo} />
+                isDragOver={dragOver === col.camion.codigo}
+                onCancelar={handleCancelar}
+                onCambiarVuelta={handleCambiarVuelta}
+                onReprogramar={handleReprogramar} />
             ))}
           </div>
         )}

@@ -34,6 +34,15 @@ function toast(msg: string, tipo: 'ok' | 'err' = 'ok') {
   setTimeout(() => _setToast?.(null), 3500)
 }
 
+const ESTADO_LABEL: Record<string, string> = {
+  pendiente: 'Pendiente', programado: 'Programado', en_camino: 'En camino',
+  entregado: 'Entregado', cancelado: 'Cancelado',
+}
+const ESTADO_COLOR: Record<string, string> = {
+  pendiente: '#f59e0b', programado: '#254A96', en_camino: '#10b981',
+  entregado: '#B9BBB7', cancelado: '#E52322',
+}
+
 const FORM_INICIAL = {
   nv: '', id_despacho: '', cliente: '', telefono: '',
   direccion: '', sucursal: '', fecha_entrega: '', vuelta: '',
@@ -57,6 +66,12 @@ export default function NuevoDespacho() {
   const [pdfListo, setPdfListo] = useState(false)
   const [toastState, setToastState] = useState<{ msg: string; tipo: 'ok' | 'err' } | null>(null)
   const [form, setForm] = useState(FORM_INICIAL)
+  const [misPedidos, setMisPedidos] = useState<any[]>([])
+  const [cargandoPedidos, setCargandoPedidos] = useState(false)
+  const [pedidoReprog, setPedidoReprog] = useState<any | null>(null)
+  const [reprogFecha, setReprogFecha] = useState('')
+  const [reprogVuelta, setReprogVuelta] = useState(1)
+  const [reprogMotivo, setReprogMotivo] = useState('')
 
   useEffect(() => { _setToast = setToastState; return () => { _setToast = null } }, [])
 
@@ -65,9 +80,37 @@ export default function NuevoDespacho() {
   }, [])
 
   useEffect(() => {
+    cargarMisPedidos()
+  }, [])
+
+  useEffect(() => {
     if (form.sucursal && form.fecha_entrega) verificarCupos()
     else setCuposDisponibles([])
   }, [form.sucursal, form.fecha_entrega, pesoTotal, posicionesTotal])
+
+  async function cargarMisPedidos() {
+    setCargandoPedidos(true)
+    const { data } = await supabase.from('pedidos')
+      .select('id, nv, cliente, direccion, sucursal, fecha_entrega, vuelta, estado, notas')
+      .in('estado', ['pendiente', 'programado', 'en_camino'])
+      .order('fecha_entrega', { ascending: true })
+    setMisPedidos(data ?? [])
+    setCargandoPedidos(false)
+  }
+
+  async function handleReprogramarPedido(id: string, fecha: string, vuelta: number, motivo: string) {
+    const pedido = misPedidos.find(p => p.id === id)
+    if (!pedido) return
+    const nota = `⚡ Reprogramado desde ${pedido.fecha_entrega} V${pedido.vuelta}${motivo ? ` — ${motivo}` : ''}`
+    const notaFinal = pedido.notas ? `${pedido.notas} | ${nota}` : nota
+    const { error } = await supabase.from('pedidos').update({
+      fecha_entrega: fecha, vuelta, camion_id: null, orden_entrega: null, estado: 'pendiente', notas: notaFinal
+    }).eq('id', id)
+    if (error) { toast('Error al reprogramar', 'err'); return }
+    setPedidoReprog(null)
+    await cargarMisPedidos()
+    toast(`Pedido de ${pedido.cliente} reprogramado para el ${fecha}`)
+  }
 
   const verificarCupos = async () => {
     setVerificando(true)
@@ -80,7 +123,7 @@ export default function NuevoDespacho() {
     const codigos = (flotaData ?? []).map((f: any) => f.camion_codigo)
 
     if (codigos.length === 0) {
-      setCuposDisponibles([1, 2, 3, 4])
+      setCuposDisponibles([])
       setVerificando(false)
       return
     }
@@ -95,23 +138,16 @@ export default function NuevoDespacho() {
         .eq('sucursal', form.sucursal).eq('fecha_entrega', form.fecha_entrega)
         .eq('vuelta', vuelta).neq('estado', 'cancelado')
 
-      const pesoAcum: Record<string, number> = {}
-      const posAcum: Record<string, number> = {}
-      camiones.forEach(c => { pesoAcum[c.codigo] = 0; posAcum[c.codigo] = 0 })
-      ;(pedidosVuelta ?? []).forEach((p: any) => {
-        if (p.camion_id) {
-          pesoAcum[p.camion_id] = (pesoAcum[p.camion_id] ?? 0) + (p.peso_total_kg ?? 0)
-          posAcum[p.camion_id] = (posAcum[p.camion_id] ?? 0) + (p.volumen_total_m3 ?? 0)
-        }
-      })
+      const pesoTotalFlota = camiones.reduce((a, c) => a + c.tonelaje_max_kg, 0)
+      const posTotalFlota = camiones.reduce((a, c) => a + c.posiciones_total, 0)
+      const pesoUsado = (pedidosVuelta ?? []).reduce((a: number, p: any) => a + (p.peso_total_kg ?? 0), 0)
+      const posUsadas = (pedidosVuelta ?? []).reduce((a: number, p: any) => a + (p.volumen_total_m3 ?? 0), 0)
 
       const pesoNuevo = pesoTotal > 0 ? pesoTotal : 0
       const posNuevas = posicionesTotal > 0 ? posicionesTotal : 0
-      const hayLugar = camiones.some(c => {
-        if (pesoNuevo === 0 && posNuevas === 0) return true
-        return (c.tonelaje_max_kg - (pesoAcum[c.codigo] ?? 0)) >= pesoNuevo &&
-               (c.posiciones_total - (posAcum[c.codigo] ?? 0)) >= posNuevas
-      })
+      const hayLugar = pesoNuevo === 0 && posNuevas === 0
+        ? true
+        : (pesoTotalFlota - pesoUsado) >= pesoNuevo && (posTotalFlota - posUsadas) >= posNuevas
       if (hayLugar) disponibles.push(vuelta)
     }
 
@@ -279,7 +315,89 @@ export default function NuevoDespacho() {
         </div>
       </nav>
 
+      {/* Modal reprogramar */}
+      {pedidoReprog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
+          <div className="bg-white rounded-2xl shadow-xl p-6 w-full max-w-sm" style={{ fontFamily: 'Barlow, sans-serif' }}>
+            <h3 className="font-semibold text-sm mb-1" style={{ color: '#254A96' }}>📅 Reprogramar entrega</h3>
+            <p className="text-xs mb-4" style={{ color: '#B9BBB7' }}>{pedidoReprog.cliente} · {pedidoReprog.direccion}</p>
+            <div className="space-y-3">
+              <div>
+                <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>Nueva fecha</label>
+                <input type="date" value={reprogFecha}
+                  min={(() => { const d = new Date(); d.setDate(d.getDate() + 1); return d.toISOString().split('T')[0] })()}
+                  onChange={e => setReprogFecha(e.target.value)}
+                  className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none"
+                  style={{ borderColor: '#e8edf8' }} />
+              </div>
+              <div>
+                <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>Vuelta</label>
+                <select value={reprogVuelta} onChange={e => setReprogVuelta(parseInt(e.target.value))}
+                  className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none"
+                  style={{ borderColor: '#e8edf8' }}>
+                  {[1, 2, 3, 4].map(v => <option key={v} value={v}>Vuelta {v}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>Motivo</label>
+                <input type="text" value={reprogMotivo} onChange={e => setReprogMotivo(e.target.value)}
+                  placeholder="Ej: lluvia, cliente no disponible"
+                  className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none"
+                  style={{ borderColor: '#e8edf8' }} />
+              </div>
+            </div>
+            <div className="flex gap-2 mt-5">
+              <button disabled={!reprogFecha}
+                onClick={() => handleReprogramarPedido(pedidoReprog.id, reprogFecha, reprogVuelta, reprogMotivo)}
+                className="flex-1 py-2.5 rounded-xl text-sm font-semibold text-white disabled:opacity-40"
+                style={{ background: '#254A96' }}>Confirmar</button>
+              <button onClick={() => setPedidoReprog(null)}
+                className="px-4 py-2.5 rounded-xl text-sm font-medium"
+                style={{ background: '#f4f4f3', color: '#666' }}>Cancelar</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <main className="max-w-3xl mx-auto px-4 md:px-6 py-6 space-y-4">
+
+        {/* Pedidos activos */}
+        {misPedidos.length > 0 && (
+          <div className="bg-white rounded-xl shadow-sm p-6">
+            <h2 className="font-semibold text-sm mb-1" style={{ color: '#254A96' }}>📋 Pedidos activos</h2>
+            <p className="text-xs mb-4" style={{ color: '#B9BBB7' }}>Podés reprogramar entregas si el cliente no puede recibirlas.</p>
+            <div className="space-y-2">
+              {misPedidos.map(p => (
+                <div key={p.id} className="flex items-center justify-between gap-3 py-2.5 border-b last:border-0"
+                  style={{ borderColor: '#f4f4f3' }}>
+                  <div className="min-w-0">
+                    <p className="font-medium text-sm leading-tight truncate" style={{ color: '#1a1a1a' }}>{p.cliente}</p>
+                    <p className="text-xs mt-0.5" style={{ color: '#B9BBB7' }}>
+                      {p.fecha_entrega} · V{p.vuelta} · {p.sucursal}
+                    </p>
+                    {p.notas?.startsWith('⚡') && (
+                      <p className="text-xs mt-0.5 truncate" style={{ color: '#b45309' }}>{p.notas.split('|')[0].trim()}</p>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <span className="text-xs px-2 py-0.5 rounded-full font-medium text-white"
+                      style={{ background: ESTADO_COLOR[p.estado] ?? '#B9BBB7' }}>
+                      {ESTADO_LABEL[p.estado] ?? p.estado}
+                    </span>
+                    {['pendiente', 'programado'].includes(p.estado) && (
+                      <button
+                        onClick={() => { setPedidoReprog(p); setReprogFecha(''); setReprogVuelta(1); setReprogMotivo('') }}
+                        className="text-xs px-2.5 py-1 rounded-lg font-medium"
+                        style={{ background: '#fef3c7', color: '#b45309' }}>
+                        📅 Reprog.
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* Subir PDF */}
         <div className="bg-white rounded-xl shadow-sm p-6">

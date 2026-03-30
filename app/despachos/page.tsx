@@ -106,9 +106,11 @@ export default function NuevoDespacho() {
 
   async function handleCancelarPedido(id: string, cliente: string) {
     try {
-      await patchPedido(id, { estado: 'cancelado' })
+      const res = await fetch('/api/pedidos', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error ?? 'Error desconocido')
       await cargarMisPedidos()
-      toast(`Pedido de ${cliente} cancelado`)
+      toast(`Pedido de ${cliente} eliminado`)
     } catch (e: any) { toast(`Error: ${e.message}`, 'err') }
   }
 

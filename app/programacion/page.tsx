@@ -395,10 +395,12 @@ export default function ProgramacionPage() {
 
   async function handleCancelar(id: string) {
     try {
-      await patchPedido(id, { estado: 'cancelado' })
+      const res = await fetch('/api/pedidos', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error ?? 'Error desconocido')
       const act = pedidos.filter(p => p.id !== id)
       setPedidos(act); construirColumnas(act, camiones)
-      showToast('Pedido cancelado')
+      showToast('Pedido eliminado')
     } catch (e: any) { showToast(`Error: ${e.message}`, 'err') }
   }
 

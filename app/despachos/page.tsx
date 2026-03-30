@@ -4,11 +4,12 @@ import { useEffect, useState } from 'react'
 import { supabase } from '../supabase'
 import { useRouter } from 'next/navigation'
 
-const VUELTAS = [
-  { vuelta: 1, label: 'Vuelta 1 — 8:00 a 10:00hs' },
-  { vuelta: 2, label: 'Vuelta 2 — 10:00 a 12:00hs' },
-  { vuelta: 3, label: 'Vuelta 3 — 13:00 a 15:00hs' },
-  { vuelta: 4, label: 'Vuelta 4 — 15:00 a 17:00hs' },
+// Franjas horarias para comerciales (se mapean a vueltas internas)
+// Franja 3 "tarde" cubre V3+V4 — el ruteador decide la vuelta exacta
+const FRANJAS = [
+  { vuelta: 1, label: 'Primera hora', horario: '8:00 a 10:00hs' },
+  { vuelta: 2, label: 'Antes del mediodía', horario: '10:00 a 12:00hs' },
+  { vuelta: 3, label: 'Después del mediodía', horario: '13:00 a 17:00hs' },
 ]
 
 function detectarSucursal(sucursalObra: string, deposito: string): string {
@@ -149,19 +150,24 @@ export default function NuevoDespacho() {
       .from('camiones_flota').select('codigo, tonelaje_max_kg, posiciones_total').in('codigo', codigos)
     const camiones = camionesData ?? []
 
-    for (const { vuelta } of VUELTAS) {
-      const { data: pedidosVuelta } = await supabase
-        .from('pedidos').select('camion_id, peso_total_kg, volumen_total_m3')
-        .eq('sucursal', form.sucursal).eq('fecha_entrega', form.fecha_entrega)
-        .eq('vuelta', vuelta).neq('estado', 'cancelado')
+    const pesoTotalFlota = camiones.reduce((a, c) => a + c.tonelaje_max_kg, 0)
+    const posTotalFlota = camiones.reduce((a, c) => a + c.posiciones_total, 0)
+    const pesoNuevo = pesoTotal > 0 ? pesoTotal : 0
+    const posNuevas = posicionesTotal > 0 ? posicionesTotal : 0
 
-      const pesoTotalFlota = camiones.reduce((a, c) => a + c.tonelaje_max_kg, 0)
-      const posTotalFlota = camiones.reduce((a, c) => a + c.posiciones_total, 0)
-      const pesoUsado = (pedidosVuelta ?? []).reduce((a: number, p: any) => a + (p.peso_total_kg ?? 0), 0)
-      const posUsadas = (pedidosVuelta ?? []).reduce((a: number, p: any) => a + (p.volumen_total_m3 ?? 0), 0)
+    for (const { vuelta } of FRANJAS) {
+      // Franja "tarde" (3) cubre V3 y V4 combinadas
+      const vueltas = vuelta === 3 ? [3, 4] : [vuelta]
+      let pesoUsado = 0; let posUsadas = 0
+      for (const v of vueltas) {
+        const { data: pv } = await supabase
+          .from('pedidos').select('peso_total_kg, volumen_total_m3')
+          .eq('sucursal', form.sucursal).eq('fecha_entrega', form.fecha_entrega)
+          .eq('vuelta', v).neq('estado', 'cancelado')
+        pesoUsado += (pv ?? []).reduce((a: number, p: any) => a + (p.peso_total_kg ?? 0), 0)
+        posUsadas += (pv ?? []).reduce((a: number, p: any) => a + (p.volumen_total_m3 ?? 0), 0)
+      }
 
-      const pesoNuevo = pesoTotal > 0 ? pesoTotal : 0
-      const posNuevas = posicionesTotal > 0 ? posicionesTotal : 0
       const hayLugar = pesoNuevo === 0 && posNuevas === 0
         ? true
         : (pesoTotalFlota - pesoUsado) >= pesoNuevo && (posTotalFlota - posUsadas) >= posNuevas
@@ -548,13 +554,13 @@ export default function NuevoDespacho() {
                     className={inputClass} style={inputStyle} />
                 </div>
                 <div>
-                  <label className="block text-xs font-medium mb-1.5" style={{ color: '#254A96' }}>Vuelta</label>
+                  <label className="block text-xs font-medium mb-1.5" style={{ color: '#254A96' }}>Franja horaria</label>
                   <select name="vuelta" value={form.vuelta} onChange={handleChange} required
                     className={inputClass} style={inputStyle} disabled={!form.fecha_entrega}>
                     <option value="">{!form.fecha_entrega ? 'Primero elegí la fecha' : verificando ? 'Verificando...' : 'Seleccionar'}</option>
-                    {VUELTAS.map(({ vuelta, label }) => (
+                    {FRANJAS.map(({ vuelta, label, horario }) => (
                       cuposDisponibles.includes(vuelta)
-                        ? <option key={vuelta} value={vuelta}>{label}</option>
+                        ? <option key={vuelta} value={vuelta}>{label} — {horario}</option>
                         : <option key={vuelta} value={vuelta} disabled>{label} — Sin cupo</option>
                     ))}
                   </select>

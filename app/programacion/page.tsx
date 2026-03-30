@@ -201,7 +201,7 @@ function PedidoCard({ pedido, onDragStart, onCancelar, onCambiarVuelta, onReprog
   )
 }
 
-function ColumnaCamion({ columna, sinAsignar = false, onDrop, onDragOver, onDragLeave, onDragStart, isDragOver, onCancelar, onCambiarVuelta, onReprogramar, onReprogramarCamion }: {
+function ColumnaCamion({ columna, sinAsignar = false, onDrop, onDragOver, onDragLeave, onDragStart, isDragOver, onCancelar, onCambiarVuelta, onReprogramar, onReprogramarCamion, deposito }: {
   columna: ColumnaKanban; sinAsignar?: boolean
   onDrop: (e: React.DragEvent, cod: string | null) => void
   onDragOver: (e: React.DragEvent, cod: string | null) => void
@@ -210,9 +210,14 @@ function ColumnaCamion({ columna, sinAsignar = false, onDrop, onDragOver, onDrag
   onCambiarVuelta: (id: string, vuelta: number) => void
   onReprogramar: (id: string, fecha: string, vuelta: number, motivo: string) => void
   onReprogramarCamion?: (codigo: string) => void
+  deposito?: { lat: number; lng: number }
 }) {
   const { camion, pedidos, pesoTotal } = columna
   const p = sinAsignar ? 0 : pct(pesoTotal, camion.tonelaje_max_kg)
+  const maxDistKm = !sinAsignar && deposito
+    ? Math.max(0, ...pedidos.filter(p => p.latitud && p.longitud).map(p => distanciaKm(deposito.lat, deposito.lng, p.latitud!, p.longitud!)))
+    : 0
+  const maxVueltas = maxDistKm > 0 ? maxVueltasPorDistancia(maxDistKm) : null
   return (
     <div onDrop={e => onDrop(e, sinAsignar ? null : camion.codigo)}
       onDragOver={e => onDragOver(e, sinAsignar ? null : camion.codigo)}
@@ -238,7 +243,15 @@ function ColumnaCamion({ columna, sinAsignar = false, onDrop, onDragOver, onDrag
                 {camion.volcador && <span className="text-xs px-1.5 py-0.5 rounded-full" style={{ background: '#fef3c7', color: '#d97706' }}>Volc.</span>}
               </div>
             </div>
-            <p className="text-xs mb-2" style={{ color: '#B9BBB7' }}>{camion.tipo_unidad}</p>
+            <div className="flex items-center justify-between mb-2">
+              <p className="text-xs" style={{ color: '#B9BBB7' }}>{camion.tipo_unidad}</p>
+              {maxVueltas !== null && (
+                <span className="text-xs px-1.5 py-0.5 rounded font-medium"
+                  style={{ background: maxVueltas <= 2 ? '#fde8e8' : maxVueltas === 3 ? '#fef3c7' : '#d1fae5', color: maxVueltas <= 2 ? '#E52322' : maxVueltas === 3 ? '#b45309' : '#065f46' }}>
+                  máx {maxVueltas}v · {Math.round(maxDistKm)}km
+                </span>
+              )}
+            </div>
             <div className="w-full rounded-full h-1.5 mb-1" style={{ background: '#f0f0f0' }}>
               <div className="h-1.5 rounded-full transition-all" style={{ width: `${p}%`, background: colorBarra(p) }} />
             </div>
@@ -266,11 +279,26 @@ function ColumnaCamion({ columna, sinAsignar = false, onDrop, onDragOver, onDrag
   )
 }
 const DEPOSITOS: Record<string, { lat: number; lng: number }> = {
-  'LP520':    { lat: -34.9205, lng: -57.9536 },
-  'LP139':    { lat: -34.9205, lng: -57.9536 },
-  'Guernica': { lat: -35.0647, lng: -58.3731 },
-  'Cañuelas': { lat: -35.0511, lng: -58.7613 },
-  'Pinamar':  { lat: -37.1097, lng: -56.8621 },
+  'LP520':    { lat: -34.965403, lng: -58.06488 },
+  'LP139':    { lat: -34.914872, lng: -58.023912 },
+  'Guernica': { lat: -34.91118,  lng: -58.39945 },
+  'Cañuelas': { lat: -35.0001,   lng: -58.44506 },
+  'Pinamar':  { lat: -37.207852, lng: -56.972302 },
+}
+
+function distanciaKm(lat1: number, lng1: number, lat2: number, lng2: number): number {
+  const R = 6371
+  const dLat = (lat2 - lat1) * Math.PI / 180
+  const dLng = (lng2 - lng1) * Math.PI / 180
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLng / 2) ** 2
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+}
+
+function maxVueltasPorDistancia(distKm: number): number {
+  if (distKm < 20) return 4
+  if (distKm < 50) return 3
+  if (distKm < 100) return 2
+  return 1
 }
 
 function calcularOrdenRuta(pedidos: Pedido[], sucursal: string): Record<string, number> {
@@ -321,6 +349,7 @@ function ProgramacionInner() {
   const [reprogVueltaFecha, setReprogVueltaFecha] = useState('')
   const [reprogVueltaNueva, setReprogVueltaNueva] = useState(1)
   const [camionParaReprog, setCamionParaReprog] = useState<string | null>(null)
+  const [overflowPedidos, setOverflowPedidos] = useState<Pedido[]>([])
 
   const showToast = (msg: string, tipo: 'ok' | 'err' = 'ok') => { setToast({ msg, tipo }); setTimeout(() => setToast(null), 3000) }
 
@@ -350,6 +379,21 @@ function ProgramacionInner() {
     const asigs = sugerirAsignacion(sin, camiones, pedidos.filter(p => p.camion_id))
     const act = pedidos.map(p => ({ ...p, camion_id: p.id in asigs ? asigs[p.id] : p.camion_id }))
     setPedidos(act); construirColumnas(act, camiones)
+    // Detectar overflow (no entraron en ningún camión)
+    const overflow = act.filter(p => asigs[p.id] === null)
+    setOverflowPedidos(vueltaActiva < 4 ? overflow : [])
+  }
+
+  async function handleMoverOverflow() {
+    const nextVuelta = vueltaActiva + 1
+    try {
+      await Promise.all(overflowPedidos.map(p =>
+        patchPedido(p.id, { vuelta: nextVuelta, camion_id: null, orden_entrega: null, estado: 'pendiente' })
+      ))
+      showToast(`${overflowPedidos.length} pedidos movidos a V${nextVuelta}`)
+      setOverflowPedidos([])
+      cargarDatos()
+    } catch (e: any) { showToast(`Error: ${e.message}`, 'err') }
   }
 
   function handleDrop(e: React.DragEvent, cod: string | null) {
@@ -591,6 +635,33 @@ function ProgramacionInner() {
 
       {/* Kanban */}
       <div className="p-4 md:p-6 max-w-screen-2xl mx-auto">
+        {/* Banner overflow */}
+        {overflowPedidos.length > 0 && (
+          <div className="mb-4 rounded-xl p-4 flex items-center justify-between gap-4 flex-wrap"
+            style={{ background: '#fef3c7', border: '1px solid #fbbf24' }}>
+            <div>
+              <p className="text-sm font-semibold" style={{ color: '#b45309' }}>
+                {overflowPedidos.length} pedido{overflowPedidos.length > 1 ? 's' : ''} no entran en los camiones de V{vueltaActiva}
+              </p>
+              <p className="text-xs mt-0.5" style={{ color: '#92400e' }}>
+                ¿Moverlos a Vuelta {vueltaActiva + 1} para programar ahí?
+              </p>
+            </div>
+            <div className="flex gap-2">
+              <button onClick={handleMoverOverflow}
+                className="text-xs px-3 py-1.5 rounded-lg font-semibold text-white"
+                style={{ background: '#b45309' }}>
+                Mover a V{vueltaActiva + 1}
+              </button>
+              <button onClick={() => setOverflowPedidos([])}
+                className="text-xs px-3 py-1.5 rounded-lg font-medium"
+                style={{ background: 'white', color: '#b45309', border: '1px solid #fbbf24' }}>
+                Dejar sin asignar
+              </button>
+            </div>
+          </div>
+        )}
+
         {cargando ? (
           <div className="flex justify-center py-24">
             <div className="w-6 h-6 border-2 border-t-transparent rounded-full animate-spin" style={{ borderColor: '#254A96', borderTopColor: 'transparent' }} />
@@ -630,7 +701,8 @@ function ProgramacionInner() {
                 onCancelar={handleCancelar}
                 onCambiarVuelta={handleCambiarVuelta}
                 onReprogramar={handleReprogramar}
-                onReprogramarCamion={codigo => { setCamionParaReprog(codigo); setModalReprogVuelta(true); setReprogVueltaFecha(''); setReprogVueltaNueva(1) }} />
+                onReprogramarCamion={codigo => { setCamionParaReprog(codigo); setModalReprogVuelta(true); setReprogVueltaFecha(''); setReprogVueltaNueva(1) }}
+                deposito={DEPOSITOS[sucursal]} />
             ))}
           </div>
         )}

@@ -39,11 +39,11 @@ export default function BorradoMasivoPage() {
   const [filtroTexto, setFiltroTexto] = useState('')
 
   useEffect(() => {
-    supabase.auth.getUser().then(({ data }) => {
-      if (!data.user) { router.push('/login'); return }
-      supabase.from('perfiles').select('rol').eq('id', data.user.id).single().then(({ data: p }) => {
-        if (p?.rol !== 'gerencia') { router.push('/'); return }
-        setUser(data.user)
+    supabase.auth.getUser().then(({ data: { user } }) => {
+      if (!user) { router.push('/'); return }
+      supabase.from('usuarios').select('rol').eq('id', user.id).single().then(({ data: u }) => {
+        if (u?.rol !== 'gerencia') { router.push('/'); return }
+        setUser(user)
       })
     })
   }, [])

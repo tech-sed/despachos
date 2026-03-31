@@ -113,8 +113,8 @@ function PedidoCard({ pedido, onDragStart, onCancelar, onCambiarVuelta, onReprog
           {pedido.peso_total_kg == null && (
             <button onMouseDown={e => e.stopPropagation()}
               onClick={e => { e.stopPropagation(); setEditPeso(0); setEditPos(0); setModo('editar_peso') }}
-              className="text-xs hover:underline" style={{ color: '#d1d5db' }} title="Ingresar peso y posiciones">
-              sin peso ✎
+              className="text-xs hover:underline" style={{ color: '#f59e0b' }} title="Ingresar peso y posiciones">
+              ⚠ sin peso ✎
             </button>
           )}
         </div>
@@ -414,14 +414,30 @@ function ProgramacionInner() {
   async function cargarDatos() {
     setCargando(true); setConfirmado(false)
     const { data: pd } = await supabase.from('pedidos')
-      .select('*, prioridad, barrio_cerrado, items:pedido_items(nombre, cantidad, unidad)')
+      .select('*, prioridad, barrio_cerrado')
       .eq('fecha_entrega', fecha).eq('sucursal', sucursal).eq('vuelta', vueltaActiva)
       .in('estado', ['pendiente', 'programado']).order('cliente')
+    const pedidosBase = pd ?? []
+    // Fetch items separately to avoid FK dependency
+    let todosConItems: Pedido[] = pedidosBase
+    if (pedidosBase.length > 0) {
+      const ids = pedidosBase.map((p: any) => p.id)
+      const { data: itemsData } = await supabase.from('pedido_items')
+        .select('pedido_id, nombre, cantidad, unidad').in('pedido_id', ids)
+      if (itemsData && itemsData.length > 0) {
+        const itemsMap: Record<string, { nombre: string; cantidad: number; unidad: string }[]> = {}
+        for (const it of itemsData) {
+          if (!itemsMap[it.pedido_id]) itemsMap[it.pedido_id] = []
+          itemsMap[it.pedido_id].push({ nombre: it.nombre, cantidad: it.cantidad, unidad: it.unidad })
+        }
+        todosConItems = pedidosBase.map((p: any) => ({ ...p, items: itemsMap[p.id] ?? [] }))
+      }
+    }
     const { data: fd } = await supabase.from('flota_dia').select('camion_codigo').eq('fecha', fecha).eq('sucursal', sucursal).eq('activo', true)
     const codigos = (fd ?? []).map((f: any) => f.camion_codigo)
     const { data: cd } = codigos.length > 0 ? await supabase.from('camiones_flota').select('*').in('codigo', codigos).eq('activo', true) : { data: [] }
-    const todos = pd ?? []; const cams = cd ?? []
-    setPedidos(todos); setCamiones(cams); construirColumnas(todos, cams); setCargando(false)
+    const cams = cd ?? []
+    setPedidos(todosConItems); setCamiones(cams); construirColumnas(todosConItems, cams); setCargando(false)
   }
 
   function construirColumnas(todos: Pedido[], cams: Camion[]) {

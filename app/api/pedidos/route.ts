@@ -24,6 +24,61 @@ export async function PATCH(req: NextRequest) {
   }
 }
 
+// POST - insertar uno o varios pedidos (bulk)
+export async function POST(req: NextRequest) {
+  try {
+    const body = await req.json()
+    const { pedidos } = body
+    if (!Array.isArray(pedidos) || pedidos.length === 0) {
+      return NextResponse.json({ error: 'Se requiere un array de pedidos' }, { status: 400 })
+    }
+
+    const admin = getAdmin()
+    const resultados: any[] = []
+    const errores: any[] = []
+
+    for (const pedido of pedidos) {
+      const { items, ...pedidoData } = pedido
+
+      // Skip duplicates
+      const { data: existente } = await admin.from('pedidos')
+        .select('id').eq('id_despacho', pedidoData.id_despacho).maybeSingle()
+      if (existente) {
+        errores.push({ id_despacho: pedidoData.id_despacho, error: 'Ya existe' })
+        continue
+      }
+
+      const { data, error } = await admin.from('pedidos').insert(pedidoData).select('id').single()
+      if (error) {
+        errores.push({ id_despacho: pedidoData.id_despacho, error: error.message })
+        continue
+      }
+
+      if (items?.length > 0 && data) {
+        await admin.from('pedido_items').insert(
+          items.map((item: any) => ({
+            pedido_id: data.id,
+            nombre: item.descripcion,
+            cantidad: item.cantidad,
+            unidad: 'u',
+          }))
+        )
+      }
+
+      resultados.push({ id_despacho: pedidoData.id_despacho, id: data.id })
+    }
+
+    return NextResponse.json({
+      success: true,
+      insertados: resultados.length,
+      errores,
+      resultados,
+    })
+  } catch (e: any) {
+    return NextResponse.json({ error: e.message }, { status: 500 })
+  }
+}
+
 // DELETE - eliminar un pedido
 export async function DELETE(req: NextRequest) {
   try {

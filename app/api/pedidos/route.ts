@@ -10,12 +10,22 @@ function getAdmin() {
 }
 
 // PATCH - actualizar campos de un pedido (reprogramar, cambiar vuelta, etc.)
+// Con _bulk_camion=true: actualiza todos los pedidos de un camión en una fecha
 export async function PATCH(req: NextRequest) {
   try {
     const body = await req.json()
-    const { id, ...updates } = body
-    if (!id) return NextResponse.json({ error: 'Falta el id del pedido' }, { status: 400 })
+    const { id, _bulk_camion, camion_id, fecha_entrega, ...updates } = body
 
+    if (_bulk_camion) {
+      // Actualizar todos los pedidos programados de un camión en una fecha
+      if (!camion_id || !fecha_entrega) return NextResponse.json({ error: 'Falta camion_id o fecha_entrega' }, { status: 400 })
+      const { error } = await getAdmin().from('pedidos').update(updates)
+        .eq('camion_id', camion_id).eq('fecha_entrega', fecha_entrega).eq('estado', 'programado')
+      if (error) return NextResponse.json({ error: error.message }, { status: 400 })
+      return NextResponse.json({ success: true })
+    }
+
+    if (!id) return NextResponse.json({ error: 'Falta el id del pedido' }, { status: 400 })
     const { error } = await getAdmin().from('pedidos').update(updates).eq('id', id)
     if (error) return NextResponse.json({ error: error.message }, { status: 400 })
     return NextResponse.json({ success: true })

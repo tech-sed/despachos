@@ -156,8 +156,17 @@ export default function RuteoPage() {
     const { error } = await supabase.from('flota_dia')
       .update({ hora_inicio: ahora })
       .eq('fecha', fecha).eq('camion_codigo', camionSeleccionado)
-    if (!error) { setHoraInicio(ahora); showToast('Ruta iniciada') }
-    else showToast('Error al iniciar ruta', 'err')
+    if (!error) {
+      // Marcar todos los pedidos de este camión como "en_camino"
+      await fetch('/api/pedidos', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ camion_id: camionSeleccionado, fecha_entrega: fecha, estado: 'en_camino', _bulk_camion: true }),
+      })
+      setPedidos(prev => prev.map(p => p.estado === 'programado' ? { ...p, estado: 'en_camino' } : p))
+      setHoraInicio(ahora)
+      showToast('Ruta iniciada')
+    } else showToast('Error al iniciar ruta', 'err')
     setGuardandoRuta(false)
   }
 

@@ -418,20 +418,22 @@ function ProgramacionInner() {
       .eq('fecha_entrega', fecha).eq('sucursal', sucursal).eq('vuelta', vueltaActiva)
       .in('estado', ['pendiente', 'programado']).order('cliente')
     const pedidosBase = pd ?? []
-    // Fetch items separately to avoid FK dependency
+    // Fetch items via API (admin key, bypasses RLS)
     let todosConItems: Pedido[] = pedidosBase
     if (pedidosBase.length > 0) {
-      const ids = pedidosBase.map((p: any) => p.id)
-      const { data: itemsData } = await supabase.from('pedido_items')
-        .select('pedido_id, nombre, cantidad, unidad').in('pedido_id', ids)
-      if (itemsData && itemsData.length > 0) {
-        const itemsMap: Record<string, { nombre: string; cantidad: number; unidad: string }[]> = {}
-        for (const it of itemsData) {
-          if (!itemsMap[it.pedido_id]) itemsMap[it.pedido_id] = []
-          itemsMap[it.pedido_id].push({ nombre: it.nombre, cantidad: it.cantidad, unidad: it.unidad })
+      const ids = pedidosBase.map((p: any) => p.id).join(',')
+      try {
+        const res = await fetch(`/api/pedido-items?ids=${ids}`)
+        const json = await res.json()
+        if (json.items && json.items.length > 0) {
+          const itemsMap: Record<string, { nombre: string; cantidad: number; unidad: string }[]> = {}
+          for (const it of json.items) {
+            if (!itemsMap[it.pedido_id]) itemsMap[it.pedido_id] = []
+            itemsMap[it.pedido_id].push({ nombre: it.nombre, cantidad: it.cantidad, unidad: it.unidad })
+          }
+          todosConItems = pedidosBase.map((p: any) => ({ ...p, items: itemsMap[p.id] ?? [] }))
         }
-        todosConItems = pedidosBase.map((p: any) => ({ ...p, items: itemsMap[p.id] ?? [] }))
-      }
+      } catch { /* si falla, mostrar pedidos sin items */ }
     }
     const { data: fd } = await supabase.from('flota_dia').select('camion_codigo').eq('fecha', fecha).eq('sucursal', sucursal).eq('activo', true)
     const codigos = (fd ?? []).map((f: any) => f.camion_codigo)

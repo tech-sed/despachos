@@ -10,6 +10,7 @@ interface Pedido {
   volumen_total_m3: number | null
   notas: string | null; camion_id: string | null; orden_entrega: number | null
   latitud: number | null; longitud: number | null; barrio_cerrado?: boolean; prioridad?: boolean
+  requiere_volcador?: boolean
   items?: { nombre: string; cantidad: number; unidad: string }[]
 }
 interface Camion {
@@ -39,32 +40,75 @@ function pesoColumna(ps: Pedido[]) { return ps.reduce((a, p) => a + (p.peso_tota
 function pct(peso: number, max: number) { return max === 0 ? 0 : Math.min(100, Math.round(peso / max * 100)) }
 function colorBarra(p: number) { return p >= 90 ? '#E52322' : p >= 70 ? '#f59e0b' : '#10b981' }
 
-function sugerirAsignacion(sin: Pedido[], camiones: Camion[], ya: Pedido[]): Record<string, string | null> {
+function sugerirAsignacion(sin: Pedido[], camiones: Camion[], ya: Pedido[], sucursal: string): Record<string, string | null> {
+  const deposito = DEPOSITOS[sucursal] ?? { lat: -34.9205, lng: -57.9536 }
   const acum: Record<string, number> = {}
   camiones.forEach(c => { acum[c.codigo] = ya.filter(p => p.camion_id === c.codigo).reduce((a, p) => a + (p.peso_total_kg ?? 0), 0) })
   const asigs: Record<string, string | null> = {}
-  // Prioridades primero, luego por peso descendente
+
+  // Ordenar: prioridades primero, luego por distancia al depósito (cercanos primero → se agrupan geográficamente)
   const ordenados = [...sin].sort((a, b) => {
     if (a.prioridad && !b.prioridad) return -1
     if (!a.prioridad && b.prioridad) return 1
-    return (b.peso_total_kg ?? 0) - (a.peso_total_kg ?? 0)
+    const dA = a.latitud && a.longitud ? distanciaKm(deposito.lat, deposito.lng, a.latitud, a.longitud) : 9999
+    const dB = b.latitud && b.longitud ? distanciaKm(deposito.lat, deposito.lng, b.latitud, b.longitud) : 9999
+    return dA - dB
   })
+
   for (const p of ordenados) {
     const peso = p.peso_total_kg ?? 0
-    const c = camiones.filter(c => c.tonelaje_max_kg - acum[c.codigo] >= peso)
-      .sort((a, b) => (a.tonelaje_max_kg - acum[a.codigo]) - (b.tonelaje_max_kg - acum[b.codigo]))[0]
-    if (c) { asigs[p.id] = c.codigo; acum[c.codigo] += peso } else asigs[p.id] = null
+    const esVolcador = p.requiere_volcador === true
+
+    // Filtrar por capacidad y tipo de camión requerido
+    const elegibles = camiones.filter(c => {
+      if (acum[c.codigo] + peso > c.tonelaje_max_kg) return false
+      if (esVolcador && !c.volcador) return false
+      return true
+    })
+
+    if (elegibles.length === 0) { asigs[p.id] = null; continue }
+
+    // Afinidad geográfica: preferir el camión cuyo centroide de pedidos esté más cerca
+    let mejor: Camion | null = null
+    let mejorScore = Infinity
+
+    for (const c of elegibles) {
+      const yaAsignados = [
+        ...ya.filter(pp => pp.camion_id === c.codigo),
+        ...Object.entries(asigs).filter(([, cod]) => cod === c.codigo).map(([id]) => sin.find(pp => pp.id === id)).filter(Boolean) as Pedido[],
+      ].filter(pp => pp.latitud && pp.longitud)
+
+      let score: number
+      if (p.latitud && p.longitud && yaAsignados.length > 0) {
+        // Distancia al centroide de los pedidos ya asignados al camión
+        const avgLat = yaAsignados.reduce((s, pp) => s + pp.latitud!, 0) / yaAsignados.length
+        const avgLng = yaAsignados.reduce((s, pp) => s + pp.longitud!, 0) / yaAsignados.length
+        score = distanciaKm(p.latitud, p.longitud, avgLat, avgLng)
+      } else if (p.latitud && p.longitud) {
+        // Camión sin pedidos aún: distancia al depósito (penalty leve para que los con pedidos tengan prioridad)
+        score = distanciaKm(deposito.lat, deposito.lng, p.latitud, p.longitud) + 500
+      } else {
+        // Sin coordenadas: best-fit por capacidad restante
+        score = c.tonelaje_max_kg - acum[c.codigo]
+      }
+
+      if (score < mejorScore) { mejorScore = score; mejor = c }
+    }
+
+    if (mejor) { asigs[p.id] = mejor.codigo; acum[mejor.codigo] += peso }
+    else asigs[p.id] = null
   }
   return asigs
 }
 
-function PedidoCard({ pedido, onDragStart, onCancelar, onCambiarVuelta, onReprogramar, onEditarPeso }: {
+function PedidoCard({ pedido, onDragStart, onCancelar, onCambiarVuelta, onReprogramar, onEditarPeso, onToggleVolcador }: {
   pedido: Pedido
   onDragStart: (e: React.DragEvent, p: Pedido) => void
   onCancelar: (id: string) => void
   onCambiarVuelta: (id: string, vuelta: number) => void
   onReprogramar: (id: string, fecha: string, vuelta: number, motivo: string) => void
   onEditarPeso: (id: string, peso: number, posiciones: number) => void
+  onToggleVolcador: (id: string, valor: boolean) => void
 }) {
   const [expandido, setExpandido] = useState(false)
   const [modo, setModo] = useState<'normal' | 'vuelta' | 'reprog' | 'cancelar' | 'editar_peso'>('normal')
@@ -250,13 +294,22 @@ function PedidoCard({ pedido, onDragStart, onCancelar, onCambiarVuelta, onReprog
       <div className="flex gap-1 flex-wrap mt-1.5">
         {pedido.prioridad && <span className="text-xs px-1.5 py-0.5 rounded font-medium" style={{ background: '#fef3c7', color: '#b45309' }}>⭐ Prioridad</span>}
         {pedido.barrio_cerrado && <span className="text-xs px-1.5 py-0.5 rounded font-medium" style={{ background: '#e8edf8', color: '#254A96' }}>🔒 Barrio cerrado</span>}
+        <button onMouseDown={e => e.stopPropagation()}
+          onClick={e => { e.stopPropagation(); onToggleVolcador(pedido.id, !pedido.requiere_volcador) }}
+          className="text-xs px-1.5 py-0.5 rounded font-medium transition-colors"
+          style={pedido.requiere_volcador
+            ? { background: '#fde8e8', color: '#E52322' }
+            : { background: '#f4f4f3', color: '#B9BBB7' }}
+          title={pedido.requiere_volcador ? 'Requiere volcador (click para quitar)' : 'Marcar como requiere volcador'}>
+          🚛 {pedido.requiere_volcador ? 'Volcador' : 'volcador?'}
+        </button>
       </div>
       {pedido.notas && <p className="text-xs rounded px-2 py-1 mt-1.5 leading-tight" style={{ background: esReprogramado ? '#fef3c7' : '#fff8e1', color: '#b45309' }}>{pedido.notas}</p>}
     </div>
   )
 }
 
-function ColumnaCamion({ columna, sinAsignar = false, onDrop, onDragOver, onDragLeave, onDragStart, isDragOver, onCancelar, onCambiarVuelta, onReprogramar, onReprogramarCamion, onEditarPeso, deposito }: {
+function ColumnaCamion({ columna, sinAsignar = false, onDrop, onDragOver, onDragLeave, onDragStart, isDragOver, onCancelar, onCambiarVuelta, onReprogramar, onReprogramarCamion, onEditarPeso, onToggleVolcador, deposito }: {
   columna: ColumnaKanban; sinAsignar?: boolean
   onDrop: (e: React.DragEvent, cod: string | null) => void
   onDragOver: (e: React.DragEvent, cod: string | null) => void
@@ -266,6 +319,7 @@ function ColumnaCamion({ columna, sinAsignar = false, onDrop, onDragOver, onDrag
   onReprogramar: (id: string, fecha: string, vuelta: number, motivo: string) => void
   onReprogramarCamion?: (codigo: string) => void
   onEditarPeso: (id: string, peso: number, posiciones: number) => void
+  onToggleVolcador: (id: string, valor: boolean) => void
   deposito?: { lat: number; lng: number }
 }) {
   const { camion, pedidos, pesoTotal } = columna
@@ -329,7 +383,7 @@ function ColumnaCamion({ columna, sinAsignar = false, onDrop, onDragOver, onDrag
       <div className="p-2 flex-1 overflow-y-auto max-h-[420px]">
         {pedidos.length === 0
           ? <div className="text-center py-8 text-xs" style={{ color: '#B9BBB7' }}>{sinAsignar ? 'Todos asignados ✓' : 'Arrastrá pedidos acá'}</div>
-          : pedidos.map(p => <PedidoCard key={p.id} pedido={p} onDragStart={onDragStart} onCancelar={onCancelar} onCambiarVuelta={onCambiarVuelta} onReprogramar={onReprogramar} onEditarPeso={onEditarPeso} />)}
+          : pedidos.map(p => <PedidoCard key={p.id} pedido={p} onDragStart={onDragStart} onCancelar={onCancelar} onCambiarVuelta={onCambiarVuelta} onReprogramar={onReprogramar} onEditarPeso={onEditarPeso} onToggleVolcador={onToggleVolcador} />)}
       </div>
     </div>
   )
@@ -450,7 +504,7 @@ function ProgramacionInner() {
   function handleSugerir() {
     const sin = pedidos.filter(p => !p.camion_id)
     if (!sin.length) return
-    const asigs = sugerirAsignacion(sin, camiones, pedidos.filter(p => p.camion_id))
+    const asigs = sugerirAsignacion(sin, camiones, pedidos.filter(p => p.camion_id), sucursal)
     const act = pedidos.map(p => ({ ...p, camion_id: p.id in asigs ? asigs[p.id] : p.camion_id }))
     setPedidos(act); construirColumnas(act, camiones)
     // Detectar overflow (no entraron en ningún camión)
@@ -542,6 +596,14 @@ function ProgramacionInner() {
     const res = await fetch('/api/pedidos', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, ...updates }) })
     const data = await res.json()
     if (!res.ok) throw new Error(data.error ?? 'Error desconocido')
+  }
+
+  async function handleToggleVolcador(id: string, valor: boolean) {
+    try {
+      await patchPedido(id, { requiere_volcador: valor })
+      const act = pedidos.map(p => p.id === id ? { ...p, requiere_volcador: valor } : p)
+      setPedidos(act); construirColumnas(act, camiones)
+    } catch { showToast('Error al actualizar tipo de camión', 'err') }
   }
 
   async function handleCancelar(id: string) {
@@ -773,7 +835,8 @@ function ProgramacionInner() {
               onCancelar={handleCancelar}
               onCambiarVuelta={handleCambiarVuelta}
               onReprogramar={handleReprogramar}
-              onEditarPeso={handleEditarPeso} />
+              onEditarPeso={handleEditarPeso}
+              onToggleVolcador={handleToggleVolcador} />
             <div className="w-px shrink-0 self-stretch" style={{ background: '#e8edf8' }} />
             {columnas.map(col => (
               <ColumnaCamion key={col.camion.codigo} columna={col}
@@ -786,6 +849,7 @@ function ProgramacionInner() {
                 onCambiarVuelta={handleCambiarVuelta}
                 onReprogramar={handleReprogramar}
                 onEditarPeso={handleEditarPeso}
+                onToggleVolcador={handleToggleVolcador}
                 onReprogramarCamion={codigo => { setCamionParaReprog(codigo); setModalReprogVuelta(true); setReprogVueltaFecha(''); setReprogVueltaNueva(1) }}
                 deposito={DEPOSITOS[sucursal]} />
             ))}

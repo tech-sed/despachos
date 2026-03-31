@@ -36,6 +36,8 @@ export async function POST(req: NextRequest) {
     const admin = getAdmin()
     const resultados: any[] = []
     const errores: any[] = []
+    let items_ok = 0
+    let items_error_msg = ''
 
     for (const pedido of pedidos) {
       const { items, ...pedidoData } = pedido
@@ -58,14 +60,16 @@ export async function POST(req: NextRequest) {
         const { error: itemsError } = await admin.from('pedido_items').insert(
           items.map((item: any) => ({
             pedido_id: data.id,
-            codigo_material: null,
             nombre: item.descripcion ?? item.nombre ?? '',
             cantidad: item.cantidad ?? 1,
             unidad: item.unidad ?? 'u',
           }))
         )
         if (itemsError) {
+          items_error_msg = itemsError.message
           errores.push({ id_despacho: pedidoData.id_despacho, error: `items: ${itemsError.message}` })
+        } else {
+          items_ok++
         }
       }
 
@@ -75,6 +79,8 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({
       success: true,
       insertados: resultados.length,
+      items_ok,
+      items_error_msg: items_error_msg || null,
       errores,
       resultados,
     })

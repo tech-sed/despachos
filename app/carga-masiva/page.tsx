@@ -65,7 +65,7 @@ export default function CargaMasiva() {
   const [solicitudes, setSolicitudes] = useState<SolicitudEdit[]>([])
   const [fechaEntrega, setFechaEntrega] = useState('')
   const [error, setError] = useState('')
-  const [resultado, setResultado] = useState<{ insertados: number; errores: any[] } | null>(null)
+  const [resultado, setResultado] = useState<{ insertados: number; items_ok: number; items_error_msg: string | null; errores: any[] } | null>(null)
   const [expandido, setExpandido] = useState<string | null>(null)
 
   useEffect(() => {
@@ -196,7 +196,7 @@ export default function CargaMasiva() {
       const data = await res.json()
       if (!data.success) throw new Error(data.error || 'Error al cargar')
 
-      setResultado({ insertados: data.insertados, errores: data.errores })
+      setResultado({ insertados: data.insertados, items_ok: data.items_ok ?? 0, items_error_msg: data.items_error_msg ?? null, errores: data.errores })
       const insertadosIds = new Set(data.resultados.map((r: any) => String(r.id_despacho)))
       setSolicitudes(prev => prev.map(s => ({
         ...s,
@@ -339,14 +339,28 @@ export default function CargaMasiva() {
 
           {/* Result banner */}
           {resultado && (
-            <div style={{
-              background: resultado.insertados > 0 ? '#f0fdf4' : '#fef2f2',
-              border: `1px solid ${resultado.insertados > 0 ? '#86efac' : '#fecaca'}`,
-              borderRadius: 8, padding: '12px 16px', marginBottom: 16,
-              color: resultado.insertados > 0 ? '#166534' : '#991b1b', fontSize: 13,
-            }}>
-              {resultado.insertados > 0 && `✅ ${resultado.insertados} solicitudes cargadas correctamente. `}
-              {resultado.errores.length > 0 && `⚠️ ${resultado.errores.length} errores: ${resultado.errores.map(e => `#${e.id_despacho} (${e.error})`).join(', ')}`}
+            <div style={{ marginBottom: 16 }}>
+              <div style={{
+                background: resultado.insertados > 0 ? '#f0fdf4' : '#fef2f2',
+                border: `1px solid ${resultado.insertados > 0 ? '#86efac' : '#fecaca'}`,
+                borderRadius: 8, padding: '12px 16px',
+                color: resultado.insertados > 0 ? '#166534' : '#991b1b', fontSize: 13,
+              }}>
+                {resultado.insertados > 0 && `✅ ${resultado.insertados} solicitudes cargadas. `}
+                {resultado.items_ok > 0 && <span style={{ color: '#166534' }}>📦 {resultado.items_ok} con productos cargados. </span>}
+                {resultado.items_ok === 0 && resultado.insertados > 0 && <span style={{ color: '#b45309', fontWeight: 600 }}>⚠️ PRODUCTOS NO INSERTADOS{resultado.items_error_msg ? `: ${resultado.items_error_msg}` : ''} </span>}
+              </div>
+              {resultado.errores.filter(e => !e.error.startsWith('Ya existe')).length > 0 && (
+                <div style={{
+                  background: '#fef3c7', border: '1px solid #fcd34d',
+                  borderRadius: 8, padding: '10px 16px', marginTop: 8,
+                  color: '#92400e', fontSize: 12,
+                }}>
+                  ⚠️ {resultado.errores.filter(e => !e.error.startsWith('Ya existe')).length} errores:&nbsp;
+                  {resultado.errores.filter(e => !e.error.startsWith('Ya existe')).slice(0, 3).map(e => `#${e.id_despacho}: ${e.error}`).join(' · ')}
+                  {resultado.errores.filter(e => !e.error.startsWith('Ya existe')).length > 3 && ` · ...`}
+                </div>
+              )}
             </div>
           )}
 

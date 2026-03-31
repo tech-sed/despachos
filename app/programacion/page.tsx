@@ -7,6 +7,7 @@ import { supabase } from '@/app/supabase'
 interface Pedido {
   id: string; nv: string; cliente: string; direccion: string; sucursal: string
   fecha_entrega: string; vuelta: number; estado: string; estado_pago: string; peso_total_kg: number | null
+  volumen_total_m3: number | null
   notas: string | null; camion_id: string | null; orden_entrega: number | null
   latitud: number | null; longitud: number | null; barrio_cerrado?: boolean; prioridad?: boolean
   items?: { nombre: string; cantidad: number; unidad: string }[]
@@ -57,15 +58,18 @@ function sugerirAsignacion(sin: Pedido[], camiones: Camion[], ya: Pedido[]): Rec
   return asigs
 }
 
-function PedidoCard({ pedido, onDragStart, onCancelar, onCambiarVuelta, onReprogramar }: {
+function PedidoCard({ pedido, onDragStart, onCancelar, onCambiarVuelta, onReprogramar, onEditarPeso }: {
   pedido: Pedido
   onDragStart: (e: React.DragEvent, p: Pedido) => void
   onCancelar: (id: string) => void
   onCambiarVuelta: (id: string, vuelta: number) => void
   onReprogramar: (id: string, fecha: string, vuelta: number, motivo: string) => void
+  onEditarPeso: (id: string, peso: number, posiciones: number) => void
 }) {
   const [expandido, setExpandido] = useState(false)
-  const [modo, setModo] = useState<'normal' | 'vuelta' | 'reprog' | 'cancelar'>('normal')
+  const [modo, setModo] = useState<'normal' | 'vuelta' | 'reprog' | 'cancelar' | 'editar_peso'>('normal')
+  const [editPeso, setEditPeso] = useState(0)
+  const [editPos, setEditPos] = useState(0)
   const [reprogFecha, setReprogFecha] = useState('')
   const [reprogVuelta, setReprogVuelta] = useState(1)
   const [reprogMotivo, setReprogMotivo] = useState('')
@@ -94,7 +98,26 @@ function PedidoCard({ pedido, onDragStart, onCancelar, onCambiarVuelta, onReprog
       <p className="text-xs mb-1.5 leading-tight" style={{ color: '#B9BBB7' }}>{pedido.direccion}</p>
       <div className="flex justify-between items-center">
         <span className="text-xs" style={{ color: '#B9BBB7' }}>NV {pedido.nv}</span>
-        {pedido.peso_total_kg != null && <span className="text-xs font-semibold" style={{ color: '#254A96' }}>{pedido.peso_total_kg} kg</span>}
+        <div className="flex items-center gap-1.5">
+          {pedido.volumen_total_m3 != null && pedido.volumen_total_m3 > 0 && (
+            <span className="text-xs" style={{ color: '#B9BBB7' }}>{pedido.volumen_total_m3} pos.</span>
+          )}
+          {pedido.peso_total_kg != null && (
+            <button onMouseDown={e => e.stopPropagation()}
+              onClick={e => { e.stopPropagation(); setEditPeso(pedido.peso_total_kg ?? 0); setEditPos(pedido.volumen_total_m3 ?? 0); setModo('editar_peso') }}
+              className="text-xs font-semibold hover:underline"
+              style={{ color: '#254A96' }} title="Editar peso y posiciones">
+              {pedido.peso_total_kg} kg ✎
+            </button>
+          )}
+          {pedido.peso_total_kg == null && (
+            <button onMouseDown={e => e.stopPropagation()}
+              onClick={e => { e.stopPropagation(); setEditPeso(0); setEditPos(0); setModo('editar_peso') }}
+              className="text-xs hover:underline" style={{ color: '#d1d5db' }} title="Ingresar peso y posiciones">
+              sin peso ✎
+            </button>
+          )}
+        </div>
       </div>
       {modo === 'cancelar' ? (
         <div className="mt-2 p-2.5 rounded-lg" style={{ background: '#fde8e8' }}>
@@ -160,6 +183,38 @@ function PedidoCard({ pedido, onDragStart, onCancelar, onCambiarVuelta, onReprog
           <button onMouseDown={e => e.stopPropagation()} onClick={e => { e.stopPropagation(); setModo('normal') }}
             className="text-xs" style={{ color: '#B9BBB7' }}>×</button>
         </div>
+      ) : modo === 'editar_peso' ? (
+        <div className="mt-2 p-2.5 rounded-lg" style={{ background: '#f4f4f3' }}>
+          <p className="text-xs font-medium mb-2" style={{ color: '#254A96' }}>✎ Editar peso y posiciones</p>
+          <div className="grid grid-cols-2 gap-1.5">
+            <div>
+              <label className="text-xs mb-0.5 block" style={{ color: '#666' }}>Peso (kg)</label>
+              <input type="number" min="0" value={editPeso}
+                onChange={e => setEditPeso(parseFloat(e.target.value) || 0)}
+                onMouseDown={e => e.stopPropagation()}
+                className="w-full text-xs border rounded px-2 py-1.5 focus:outline-none"
+                style={{ borderColor: '#e8edf8' }} />
+            </div>
+            <div>
+              <label className="text-xs mb-0.5 block" style={{ color: '#666' }}>Posiciones</label>
+              <input type="number" min="0" step="0.5" value={editPos}
+                onChange={e => setEditPos(parseFloat(e.target.value) || 0)}
+                onMouseDown={e => e.stopPropagation()}
+                className="w-full text-xs border rounded px-2 py-1.5 focus:outline-none"
+                style={{ borderColor: '#e8edf8' }} />
+            </div>
+          </div>
+          <div className="flex gap-1.5 mt-2">
+            <button onMouseDown={e => e.stopPropagation()}
+              onClick={e => { e.stopPropagation(); onEditarPeso(pedido.id, editPeso, editPos); setModo('normal') }}
+              className="flex-1 text-xs py-1.5 rounded font-medium text-white"
+              style={{ background: '#254A96' }}>Guardar</button>
+            <button onMouseDown={e => e.stopPropagation()}
+              onClick={e => { e.stopPropagation(); setModo('normal') }}
+              className="text-xs px-2 py-1.5 rounded"
+              style={{ background: '#e8edf8', color: '#666' }}>×</button>
+          </div>
+        </div>
       ) : (
         <div className="flex items-center gap-2 mt-1.5">
           <button onMouseDown={e => e.stopPropagation()} onClick={e => { e.stopPropagation(); setModo('vuelta') }}
@@ -201,7 +256,7 @@ function PedidoCard({ pedido, onDragStart, onCancelar, onCambiarVuelta, onReprog
   )
 }
 
-function ColumnaCamion({ columna, sinAsignar = false, onDrop, onDragOver, onDragLeave, onDragStart, isDragOver, onCancelar, onCambiarVuelta, onReprogramar, onReprogramarCamion, deposito }: {
+function ColumnaCamion({ columna, sinAsignar = false, onDrop, onDragOver, onDragLeave, onDragStart, isDragOver, onCancelar, onCambiarVuelta, onReprogramar, onReprogramarCamion, onEditarPeso, deposito }: {
   columna: ColumnaKanban; sinAsignar?: boolean
   onDrop: (e: React.DragEvent, cod: string | null) => void
   onDragOver: (e: React.DragEvent, cod: string | null) => void
@@ -210,6 +265,7 @@ function ColumnaCamion({ columna, sinAsignar = false, onDrop, onDragOver, onDrag
   onCambiarVuelta: (id: string, vuelta: number) => void
   onReprogramar: (id: string, fecha: string, vuelta: number, motivo: string) => void
   onReprogramarCamion?: (codigo: string) => void
+  onEditarPeso: (id: string, peso: number, posiciones: number) => void
   deposito?: { lat: number; lng: number }
 }) {
   const { camion, pedidos, pesoTotal } = columna
@@ -273,7 +329,7 @@ function ColumnaCamion({ columna, sinAsignar = false, onDrop, onDragOver, onDrag
       <div className="p-2 flex-1 overflow-y-auto max-h-[420px]">
         {pedidos.length === 0
           ? <div className="text-center py-8 text-xs" style={{ color: '#B9BBB7' }}>{sinAsignar ? 'Todos asignados ✓' : 'Arrastrá pedidos acá'}</div>
-          : pedidos.map(p => <PedidoCard key={p.id} pedido={p} onDragStart={onDragStart} onCancelar={onCancelar} onCambiarVuelta={onCambiarVuelta} onReprogramar={onReprogramar} />)}
+          : pedidos.map(p => <PedidoCard key={p.id} pedido={p} onDragStart={onDragStart} onCancelar={onCancelar} onCambiarVuelta={onCambiarVuelta} onReprogramar={onReprogramar} onEditarPeso={onEditarPeso} />)}
       </div>
     </div>
   )
@@ -453,6 +509,15 @@ function ProgramacionInner() {
     } finally {
       setGuardando(false)
     }
+  }
+
+  async function handleEditarPeso(id: string, peso: number, posiciones: number) {
+    try {
+      await patchPedido(id, { peso_total_kg: peso, volumen_total_m3: posiciones })
+      const act = pedidos.map(p => p.id === id ? { ...p, peso_total_kg: peso, volumen_total_m3: posiciones } : p)
+      setPedidos(act); construirColumnas(act, camiones)
+      showToast('Peso y posiciones actualizados')
+    } catch { showToast('Error al actualizar', 'err') }
   }
 
   async function patchPedido(id: string, updates: Record<string, any>) {
@@ -689,7 +754,8 @@ function ProgramacionInner() {
               isDragOver={dragOver === 'sin_asignar'}
               onCancelar={handleCancelar}
               onCambiarVuelta={handleCambiarVuelta}
-              onReprogramar={handleReprogramar} />
+              onReprogramar={handleReprogramar}
+              onEditarPeso={handleEditarPeso} />
             <div className="w-px shrink-0 self-stretch" style={{ background: '#e8edf8' }} />
             {columnas.map(col => (
               <ColumnaCamion key={col.camion.codigo} columna={col}
@@ -701,6 +767,7 @@ function ProgramacionInner() {
                 onCancelar={handleCancelar}
                 onCambiarVuelta={handleCambiarVuelta}
                 onReprogramar={handleReprogramar}
+                onEditarPeso={handleEditarPeso}
                 onReprogramarCamion={codigo => { setCamionParaReprog(codigo); setModalReprogVuelta(true); setReprogVueltaFecha(''); setReprogVueltaNueva(1) }}
                 deposito={DEPOSITOS[sucursal]} />
             ))}

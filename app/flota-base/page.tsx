@@ -346,7 +346,7 @@ export default function FlotaBasePage() {
                               )}
                             </div>
                             <div className="flex items-center gap-3 text-xs mt-0.5" style={{ color: '#B9BBB7' }}>
-                              <span>📦 {c.posiciones_total} pos.</span>
+                              <span>📦 {(c.pos_caja || 0) + (c.pos_acoplado || 0)} pos.</span>
                               <span>⚖️ {(c.tonelaje_max_kg / 1000).toFixed(1)}tn</span>
                               {c.grua_hidraulica && <span>🏗️ Grúa</span>}
                               {c.volcador && <span>🔄 Volc.</span>}

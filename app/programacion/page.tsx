@@ -65,11 +65,19 @@ function sugerirAsignacion(sin: Pedido[], camiones: Camion[], ya: Pedido[], sucu
     const pos = p.volumen_total_m3 ?? 0
     const esVolcador = p.requiere_volcador === true
 
+    // ¿El pedido necesita grúa? (tiene items que no son hierro/malla/vigueta/pretensado)
+    const HIERRO_KEYWORDS = ['hierro', 'barra', 'varilla', 'malla', 'vigueta', 'alambre', 'pretensado', 'armadura']
+    const itemsDelPedido = p.items ?? []
+    const soloHierro = itemsDelPedido.length > 0 &&
+      itemsDelPedido.every(it => HIERRO_KEYWORDS.some(kw => it.nombre.toLowerCase().includes(kw)))
+    const requiereGrua = !esVolcador && !soloHierro
+
     // Filtrar por capacidad de peso Y posiciones, y tipo de camión requerido
     const elegibles = camiones.filter(c => {
       if (acum[c.codigo] + peso > c.tonelaje_max_kg) return false
       if (c.posiciones_total > 0 && pos > 0 && acumPos[c.codigo] + pos > c.posiciones_total) return false
       if (esVolcador && !c.volcador) return false
+      if (requiereGrua && !c.grua_hidraulica) return false
       return true
     })
 

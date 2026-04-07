@@ -17,6 +17,8 @@ interface Camion {
   codigo: string
   sucursal: string
   tipo_unidad: string
+  pos_caja: number
+  pos_acoplado: number
   posiciones_total: number
   tonelaje_max_kg: number
   grua_hidraulica: boolean
@@ -36,7 +38,7 @@ export default function FlotaBasePage() {
   const [mostrarNuevo, setMostrarNuevo] = useState(false)
   const [nuevoCamion, setNuevoCamion] = useState({
     codigo: '', tipo_unidad: 'Camión', sucursal: 'LP520',
-    posiciones_total: 10, tonelaje_max_kg: 5000,
+    pos_caja: 10, pos_acoplado: 0, posiciones_total: 10, tonelaje_max_kg: 5000,
     grua_hidraulica: false, volcador: false, activo: true,
     chofer_id_default: '',
   })
@@ -60,7 +62,7 @@ export default function FlotaBasePage() {
       supabase.from('camiones_flota').select('*').order('sucursal').order('codigo'),
       supabase.from('usuarios').select('id, nombre').eq('rol', 'chofer').order('nombre'),
     ])
-    setCamiones((cam ?? []).map(c => ({ ...c, chofer_id_default: c.chofer_id_default ?? '' })))
+    setCamiones((cam ?? []).map(c => ({ ...c, pos_caja: c.pos_caja ?? 0, pos_acoplado: c.pos_acoplado ?? 0, chofer_id_default: c.chofer_id_default ?? '' })))
     setChoferes(chof ?? [])
     setLoading(false)
   }
@@ -71,9 +73,12 @@ export default function FlotaBasePage() {
 
   const guardarCamion = async (c: Camion) => {
     setGuardando(true)
+    const posTotal = (c.pos_caja || 0) + (c.pos_acoplado || 0)
     const { error } = await supabase.from('camiones_flota').update({
       sucursal: c.sucursal,
-      posiciones_total: c.posiciones_total,
+      pos_caja: c.pos_caja,
+      pos_acoplado: c.pos_acoplado,
+      posiciones_total: posTotal,
       tonelaje_max_kg: c.tonelaje_max_kg,
       grua_hidraulica: c.grua_hidraulica,
       volcador: c.volcador,
@@ -98,9 +103,11 @@ export default function FlotaBasePage() {
     const ya = camiones.find(c => c.codigo.toLowerCase() === nuevoCamion.codigo.trim().toLowerCase())
     if (ya) { showToast('Ya existe un camión con ese código', 'err'); return }
     setGuardando(true)
+    const posTotal = (nuevoCamion.pos_caja || 0) + (nuevoCamion.pos_acoplado || 0)
     const { error } = await supabase.from('camiones_flota').insert({
       ...nuevoCamion,
       codigo: nuevoCamion.codigo.trim().toUpperCase(),
+      posiciones_total: posTotal,
       chofer_id_default: nuevoCamion.chofer_id_default || null,
     })
     if (error) {
@@ -108,7 +115,7 @@ export default function FlotaBasePage() {
     } else {
       showToast(`Camión ${nuevoCamion.codigo.toUpperCase()} creado`)
       setMostrarNuevo(false)
-      setNuevoCamion({ codigo: '', tipo_unidad: 'Camión', sucursal: 'LP520', posiciones_total: 10, tonelaje_max_kg: 5000, grua_hidraulica: false, volcador: false, activo: true, chofer_id_default: '' })
+      setNuevoCamion({ codigo: '', tipo_unidad: 'Camión', sucursal: 'LP520', pos_caja: 10, pos_acoplado: 0, posiciones_total: 10, tonelaje_max_kg: 5000, grua_hidraulica: false, volcador: false, activo: true, chofer_id_default: '' })
       cargar()
     }
     setGuardando(false)
@@ -207,14 +214,25 @@ export default function FlotaBasePage() {
 
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-xs font-semibold mb-1" style={{ color: '#254A96' }}>Posiciones totales</label>
+                  <label className="block text-xs font-semibold mb-1" style={{ color: '#254A96' }}>Pos. Caja</label>
                   <input
-                    type="number" min="1" max="100"
-                    value={nuevoCamion.posiciones_total}
-                    onChange={e => setNuevoCamion(p => ({ ...p, posiciones_total: parseInt(e.target.value) || 0 }))}
+                    type="number" min="0" max="100"
+                    value={nuevoCamion.pos_caja}
+                    onChange={e => setNuevoCamion(p => ({ ...p, pos_caja: parseInt(e.target.value) || 0 }))}
                     className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none"
                     style={{ borderColor: '#e8edf8' }}
                   />
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold mb-1" style={{ color: '#254A96' }}>Pos. Acoplado</label>
+                  <input
+                    type="number" min="0" max="100"
+                    value={nuevoCamion.pos_acoplado}
+                    onChange={e => setNuevoCamion(p => ({ ...p, pos_acoplado: parseInt(e.target.value) || 0 }))}
+                    className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none"
+                    style={{ borderColor: '#e8edf8' }}
+                  />
+                  <p className="text-xs mt-0.5" style={{ color: '#B9BBB7' }}>Total: {(nuevoCamion.pos_caja || 0) + (nuevoCamion.pos_acoplado || 0)} pos.</p>
                 </div>
                 <div>
                   <label className="block text-xs font-semibold mb-1" style={{ color: '#254A96' }}>Tonelaje máx (kg)</label>
@@ -368,15 +386,30 @@ export default function FlotaBasePage() {
                         <div className="grid grid-cols-2 gap-4">
                             <div>
                               <label className="block text-xs font-semibold mb-1.5" style={{ color: '#254A96' }}>
-                                Posiciones totales
+                                Pos. Caja
                               </label>
                               <input
-                                type="number" min="1" max="50"
-                                value={c.posiciones_total}
-                                onChange={e => actualizar(c.codigo, 'posiciones_total', parseInt(e.target.value) || 0)}
+                                type="number" min="0" max="50"
+                                value={c.pos_caja}
+                                onChange={e => actualizar(c.codigo, 'pos_caja', parseInt(e.target.value) || 0)}
                                 className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none"
                                 style={{ borderColor: '#e8edf8' }}
                               />
+                            </div>
+                            <div>
+                              <label className="block text-xs font-semibold mb-1.5" style={{ color: '#254A96' }}>
+                                Pos. Acoplado
+                              </label>
+                              <input
+                                type="number" min="0" max="50"
+                                value={c.pos_acoplado}
+                                onChange={e => actualizar(c.codigo, 'pos_acoplado', parseInt(e.target.value) || 0)}
+                                className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none"
+                                style={{ borderColor: '#e8edf8' }}
+                              />
+                              <p className="text-xs mt-1" style={{ color: '#B9BBB7' }}>
+                                Total: {(c.pos_caja || 0) + (c.pos_acoplado || 0)} pos.
+                              </p>
                             </div>
                             <div>
                               <label className="block text-xs font-semibold mb-1.5" style={{ color: '#254A96' }}>
@@ -397,7 +430,7 @@ export default function FlotaBasePage() {
 
                           <div>
                             <label className="block text-xs font-semibold mb-1.5" style={{ color: '#254A96' }}>
-                              Chofer habitual (se pre-carga en flota del día)
+                              Chofer habitual
                             </label>
                             <select
                               value={c.chofer_id_default}

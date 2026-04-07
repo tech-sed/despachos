@@ -154,6 +154,7 @@ export default function RuteoPage() {
     if (!camionSeleccionado || !vueltaActiva) return
     setGuardandoRuta(true)
     const ahora = new Date().toISOString()
+
     // Solo guardar hora_inicio en flota_dia la primera vez (primera vuelta del día)
     if (!horaInicio) {
       await supabase.from('flota_dia')
@@ -161,18 +162,27 @@ export default function RuteoPage() {
         .eq('fecha', fecha).eq('camion_codigo', camionSeleccionado)
       setHoraInicio(ahora)
     }
-    const res = await fetch('/api/pedidos', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ camion_id: camionSeleccionado, fecha_entrega: fecha, estado: 'en_camino', vuelta: vueltaActiva, _bulk_camion: true }),
-    })
-    const data = await res.json()
-    if (!data.error) {
+
+    // Actualizar SOLO los pedidos de esta vuelta por ID — no bulk filter
+    const aIniciar = pedidos.filter(p => p.vuelta === vueltaActiva && p.estado === 'programado')
+    const errores = await Promise.all(
+      aIniciar.map(p =>
+        fetch('/api/pedidos', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: p.id, estado: 'en_camino' }),
+        }).then(r => r.json())
+      )
+    )
+    const hayError = errores.some(r => r.error)
+    if (!hayError) {
       setPedidos(prev => prev.map(p =>
-        p.estado === 'programado' && p.vuelta === vueltaActiva ? { ...p, estado: 'en_camino' } : p
+        p.vuelta === vueltaActiva && p.estado === 'programado' ? { ...p, estado: 'en_camino' } : p
       ))
       showToast('Ruta iniciada')
-    } else showToast('Error al iniciar ruta', 'err')
+    } else {
+      showToast('Error al iniciar ruta', 'err')
+    }
     setGuardandoRuta(false)
   }
 

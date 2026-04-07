@@ -45,6 +45,10 @@ interface Item {
   nombre: string; cantidad: number; unidad: string; tipo_carga?: string
 }
 
+interface Foto {
+  url: string; label: string | null; publicUrl: string
+}
+
 interface EditState {
   id: string; sucursal: string; peso: string; posiciones: string
 }
@@ -55,12 +59,15 @@ export default function PedidosPage() {
   const [cargando, setCargando] = useState(false)
   const [total, setTotal] = useState(0)
 
-  // Categorías y items por pedido
+  // Categorías, items y fotos por pedido
   const [categoriasMap, setCategoriasMap] = useState<Record<string, string[]>>({})
   const [itemsMap, setItemsMap] = useState<Record<string, Item[]>>({})
+  const [fotosMap, setFotosMap] = useState<Record<string, Foto[]>>({})
 
   // Fila expandida
   const [expandidoId, setExpandidoId] = useState<string | null>(null)
+  // Lightbox
+  const [lightbox, setLightbox] = useState<string | null>(null)
 
   // Filtros
   const [filtroFecha, setFiltroFecha] = useState('')
@@ -120,35 +127,42 @@ export default function PedidosPage() {
   }
 
   async function cargarDetalle(ids: string[]) {
-    const [{ data: rawItems }, { data: mats }] = await Promise.all([
+    const [{ data: rawItems }, { data: mats }, { data: rawFotos }] = await Promise.all([
       supabase.from('pedido_items').select('pedido_id, nombre, cantidad, unidad').in('pedido_id', ids),
       supabase.from('materiales').select('nombre, tipo_carga'),
+      supabase.from('pedido_fotos').select('pedido_id, url, label').in('pedido_id', ids).order('created_at'),
     ])
-    if (!rawItems || !mats) return
 
+    // Items + categorías
     const newItemsMap: Record<string, Item[]> = {}
     const newCatMap: Record<string, Set<string>> = {}
 
-    for (const item of rawItems) {
+    for (const item of rawItems ?? []) {
       const nItem = normalizar(item.nombre)
-      const mat = mats.find((m: any) => {
+      const mat = (mats ?? []).find((m: any) => {
         const nMat = normalizar(m.nombre)
         return nMat === nItem || nMat.includes(nItem) || nItem.includes(nMat)
       })
       const tipo = mat?.tipo_carga ?? 'otros'
-
       if (!newItemsMap[item.pedido_id]) newItemsMap[item.pedido_id] = []
       newItemsMap[item.pedido_id].push({ nombre: item.nombre, cantidad: item.cantidad, unidad: item.unidad, tipo_carga: tipo })
-
       if (!newCatMap[item.pedido_id]) newCatMap[item.pedido_id] = new Set()
       newCatMap[item.pedido_id].add(tipo)
     }
-
     const newCatResult: Record<string, string[]> = {}
     for (const [k, v] of Object.entries(newCatMap)) newCatResult[k] = Array.from(v)
 
+    // Fotos — obtener URL pública de cada una
+    const newFotosMap: Record<string, Foto[]> = {}
+    for (const f of rawFotos ?? []) {
+      const { data: pub } = supabase.storage.from('solicitudes-despacho').getPublicUrl(f.url)
+      if (!newFotosMap[f.pedido_id]) newFotosMap[f.pedido_id] = []
+      newFotosMap[f.pedido_id].push({ url: f.url, label: f.label, publicUrl: pub.publicUrl })
+    }
+
     setItemsMap(newItemsMap)
     setCategoriasMap(newCatResult)
+    setFotosMap(newFotosMap)
   }
 
   function toggleExpandir(id: string) {
@@ -202,6 +216,16 @@ export default function PedidosPage() {
         <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 px-5 py-3 rounded-xl shadow-lg text-sm font-medium text-white flex items-center gap-2"
           style={{ background: toast.tipo === 'ok' ? '#254A96' : '#E52322' }}>
           {toast.tipo === 'ok' ? '✓' : '✕'} {toast.msg}
+        </div>
+      )}
+
+      {/* Lightbox */}
+      {lightbox && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/90 p-4"
+          onClick={() => setLightbox(null)}>
+          <img src={lightbox} alt="Foto" className="max-w-full max-h-full rounded-xl object-contain" />
+          <button className="absolute top-4 right-4 w-9 h-9 rounded-full flex items-center justify-center text-white text-lg"
+            style={{ background: 'rgba(255,255,255,0.2)' }}>✕</button>
         </div>
       )}
 
@@ -400,53 +424,85 @@ export default function PedidosPage() {
                       </tr>
 
                       {/* Fila de detalle expandible */}
-                      {expandido && (
-                        <tr key={`${p.id}-detalle`} style={{ borderBottom: borderColor }}>
-                          <td colSpan={COLS} className="px-8 pb-4 pt-1" style={{ background: '#f8faff' }}>
-                            <div className="rounded-xl border overflow-hidden" style={{ borderColor: '#e8edf8' }}>
-                              {/* Cabecera detalle */}
-                              <div className="px-4 py-2 flex flex-wrap gap-4 text-xs font-medium border-b" style={{ background: '#e8edf8', borderColor: '#dde4f4', color: '#254A96' }}>
-                                <span>📍 {p.direccion}</span>
-                                {p.notas && <span>📝 {p.notas}</span>}
-                                {p.camion_id && <span>🚛 {p.camion_id}</span>}
-                              </div>
-                              {/* Items */}
-                              {!items || items.length === 0 ? (
-                                <p className="px-4 py-3 text-xs" style={{ color: '#B9BBB7' }}>Sin productos registrados</p>
-                              ) : (
-                                <table className="w-full text-xs">
-                                  <thead>
-                                    <tr style={{ background: '#f4f4f3', borderBottom: '1px solid #e8edf8' }}>
-                                      <th className="text-left px-4 py-2 font-semibold" style={{ color: '#254A96' }}>Producto</th>
-                                      <th className="text-right px-4 py-2 font-semibold" style={{ color: '#254A96' }}>Cantidad</th>
-                                      <th className="text-left px-4 py-2 font-semibold" style={{ color: '#254A96' }}>Unidad</th>
-                                      <th className="text-left px-4 py-2 font-semibold" style={{ color: '#254A96' }}>Categoría</th>
-                                    </tr>
-                                  </thead>
-                                  <tbody>
-                                    {items.map((it, j) => {
-                                      const c = TIPO_COLOR[it.tipo_carga ?? 'otros'] ?? TIPO_COLOR.otros
-                                      return (
-                                        <tr key={j} style={{ borderBottom: j < items.length - 1 ? '1px solid #f4f4f3' : 'none' }}>
-                                          <td className="px-4 py-2" style={{ color: '#1a1a1a' }}>{it.nombre}</td>
-                                          <td className="px-4 py-2 text-right font-medium" style={{ color: '#254A96' }}>{it.cantidad.toLocaleString('es-AR')}</td>
-                                          <td className="px-4 py-2" style={{ color: '#666' }}>{it.unidad}</td>
-                                          <td className="px-4 py-2">
-                                            <span className="px-1.5 py-0.5 rounded font-medium"
-                                              style={{ background: c.bg, color: c.text }}>
-                                              {TIPO_LABEL[it.tipo_carga ?? 'otros'] ?? it.tipo_carga}
+                      {expandido && (() => {
+                        const fotos = fotosMap[p.id]
+                        return (
+                          <tr key={`${p.id}-detalle`} style={{ borderBottom: borderColor }}>
+                            <td colSpan={COLS} className="px-8 pb-4 pt-1" style={{ background: '#f8faff' }}>
+                              <div className="rounded-xl border overflow-hidden" style={{ borderColor: '#e8edf8' }}>
+
+                                {/* Cabecera detalle */}
+                                <div className="px-4 py-2 flex flex-wrap gap-4 text-xs font-medium border-b" style={{ background: '#e8edf8', borderColor: '#dde4f4', color: '#254A96' }}>
+                                  <span>📍 {p.direccion}</span>
+                                  {p.notas && <span>📝 {p.notas}</span>}
+                                  {p.camion_id && <span>🚛 {p.camion_id}</span>}
+                                </div>
+
+                                {/* Items */}
+                                {!items || items.length === 0 ? (
+                                  <p className="px-4 py-3 text-xs" style={{ color: '#B9BBB7' }}>Sin productos registrados</p>
+                                ) : (
+                                  <table className="w-full text-xs">
+                                    <thead>
+                                      <tr style={{ background: '#f4f4f3', borderBottom: '1px solid #e8edf8' }}>
+                                        <th className="text-left px-4 py-2 font-semibold" style={{ color: '#254A96' }}>Producto</th>
+                                        <th className="text-right px-4 py-2 font-semibold" style={{ color: '#254A96' }}>Cantidad</th>
+                                        <th className="text-left px-4 py-2 font-semibold" style={{ color: '#254A96' }}>Unidad</th>
+                                        <th className="text-left px-4 py-2 font-semibold" style={{ color: '#254A96' }}>Categoría</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {items.map((it, j) => {
+                                        const c = TIPO_COLOR[it.tipo_carga ?? 'otros'] ?? TIPO_COLOR.otros
+                                        return (
+                                          <tr key={j} style={{ borderBottom: j < items.length - 1 ? '1px solid #f4f4f3' : 'none' }}>
+                                            <td className="px-4 py-2" style={{ color: '#1a1a1a' }}>{it.nombre}</td>
+                                            <td className="px-4 py-2 text-right font-medium" style={{ color: '#254A96' }}>{it.cantidad.toLocaleString('es-AR')}</td>
+                                            <td className="px-4 py-2" style={{ color: '#666' }}>{it.unidad}</td>
+                                            <td className="px-4 py-2">
+                                              <span className="px-1.5 py-0.5 rounded font-medium"
+                                                style={{ background: c.bg, color: c.text }}>
+                                                {TIPO_LABEL[it.tipo_carga ?? 'otros'] ?? it.tipo_carga}
+                                              </span>
+                                            </td>
+                                          </tr>
+                                        )
+                                      })}
+                                    </tbody>
+                                  </table>
+                                )}
+
+                                {/* Fotos de entrega */}
+                                {fotos && fotos.length > 0 && (
+                                  <div className="px-4 py-3 border-t" style={{ borderColor: '#e8edf8' }}>
+                                    <p className="text-xs font-semibold mb-2" style={{ color: '#254A96' }}>
+                                      📷 Fotos de entrega ({fotos.length})
+                                    </p>
+                                    <div className="flex flex-wrap gap-3">
+                                      {fotos.map((f, fi) => (
+                                        <div key={fi} className="flex flex-col items-center gap-1">
+                                          <button onClick={() => setLightbox(f.publicUrl)}
+                                            className="relative rounded-xl overflow-hidden hover:opacity-90 transition-opacity"
+                                            style={{ width: 96, height: 96 }}>
+                                            <img src={f.publicUrl} alt={f.label ?? 'Foto'} className="w-full h-full object-cover" />
+                                          </button>
+                                          {f.label && (
+                                            <span className="text-xs px-1.5 py-0.5 rounded font-medium text-center"
+                                              style={{ background: '#e8edf8', color: '#254A96', maxWidth: 96 }}>
+                                              {f.label}
                                             </span>
-                                          </td>
-                                        </tr>
-                                      )
-                                    })}
-                                  </tbody>
-                                </table>
-                              )}
-                            </div>
-                          </td>
-                        </tr>
-                      )}
+                                          )}
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </div>
+                                )}
+
+                              </div>
+                            </td>
+                          </tr>
+                        )
+                      })()}
                     </>
                   )
                 })}

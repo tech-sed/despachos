@@ -59,10 +59,11 @@ export default function RuteoPage() {
   // Modal de confirmación
   const [modalPedido, setModalPedido] = useState<Pedido | null>(null)
   const [nota, setNota] = useState('')
-  const [foto, setFoto] = useState<File | null>(null)
-  const [fotoPreview, setFotoPreview] = useState<string | null>(null)
+  const [fotos, setFotos] = useState<{ file: File; preview: string; label: string }[]>([])
   const [confirmando, setConfirmando] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
+
+  const LABELS_FOTO = ['Remito', 'Material en puerta', 'Daño / Roto', 'Otro']
 
   const showToast = (msg: string, tipo: 'ok' | 'err' = 'ok') => {
     setToast({ msg, tipo }); setTimeout(() => setToast(null), 3000)
@@ -264,13 +265,24 @@ export default function RuteoPage() {
   }
 
   const handleFoto = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (!file) return
-    setFoto(file)
-    const reader = new FileReader()
-    reader.onload = () => setFotoPreview(reader.result as string)
-    reader.readAsDataURL(file)
+    const files = Array.from(e.target.files ?? [])
+    if (!files.length) return
+    files.forEach(file => {
+      const reader = new FileReader()
+      reader.onload = () => setFotos(prev => [
+        ...prev,
+        { file, preview: reader.result as string, label: 'Remito' }
+      ])
+      reader.readAsDataURL(file)
+    })
+    // Reset input para permitir seleccionar la misma foto de nuevo
+    if (fileRef.current) fileRef.current.value = ''
   }
+
+  const eliminarFoto = (idx: number) => setFotos(prev => prev.filter((_, i) => i !== idx))
+
+  const cambiarLabel = (idx: number, label: string) =>
+    setFotos(prev => prev.map((f, i) => i === idx ? { ...f, label } : f))
 
   const confirmarEntrega = async () => {
     if (!modalPedido) return
@@ -279,7 +291,10 @@ export default function RuteoPage() {
     const formData = new FormData()
     formData.append('pedido_id', modalPedido.id)
     if (nota) formData.append('nota', nota)
-    if (foto) formData.append('foto', foto)
+    fotos.forEach((f, i) => {
+      formData.append(`foto_${i}`, f.file)
+      formData.append(`label_${i}`, f.label)
+    })
 
     const res = await fetch('/api/confirmar-entrega', { method: 'POST', body: formData })
     const data = await res.json()
@@ -293,7 +308,7 @@ export default function RuteoPage() {
           cliente: modalPedido.cliente,
           camion: camionSeleccionado,
           con_nota: !!nota,
-          con_foto: !!foto,
+          cant_fotos: fotos.length,
         })
       }
       setPedidos(prev => prev.map(p =>
@@ -301,8 +316,7 @@ export default function RuteoPage() {
       ))
       setModalPedido(null)
       setNota('')
-      setFoto(null)
-      setFotoPreview(null)
+      setFotos([])
     } else {
       showToast(`Error: ${data.error ?? 'No se pudo confirmar'}`, 'err')
     }
@@ -341,7 +355,7 @@ export default function RuteoPage() {
                 <h3 className="font-bold text-base" style={{ color: '#254A96' }}>Confirmar entrega</h3>
                 <p className="text-sm mt-0.5" style={{ color: '#B9BBB7' }}>{modalPedido.cliente}</p>
               </div>
-              <button onClick={() => { setModalPedido(null); setNota(''); setFoto(null); setFotoPreview(null) }}
+              <button onClick={() => { setModalPedido(null); setNota(''); setFotos([]) }}
                 className="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
             </div>
             <div className="rounded-xl p-3 text-sm" style={{ background: '#f4f4f3' }}>
@@ -355,24 +369,43 @@ export default function RuteoPage() {
                 placeholder="Ej: Dejé en portería, firmó el encargado..." />
             </div>
             <div>
-              <label className="block text-xs font-medium mb-1.5" style={{ color: '#254A96' }}>Foto de entrega (opcional)</label>
-              {fotoPreview ? (
-                <div className="relative">
-                  <img src={fotoPreview} alt="Foto" className="w-full h-40 object-cover rounded-xl" />
-                  <button onClick={() => { setFoto(null); setFotoPreview(null) }}
-                    className="absolute top-2 right-2 w-7 h-7 rounded-full flex items-center justify-center text-white text-xs"
-                    style={{ background: '#E52322' }}>✕</button>
+              <label className="block text-xs font-medium mb-1.5" style={{ color: '#254A96' }}>
+                Fotos de entrega (opcional)
+              </label>
+
+              {/* Fotos ya agregadas */}
+              {fotos.length > 0 && (
+                <div className="space-y-2 mb-2">
+                  {fotos.map((f, idx) => (
+                    <div key={idx} className="flex gap-2 items-start rounded-xl p-2" style={{ background: '#f8faff', border: '1px solid #e8edf8' }}>
+                      <img src={f.preview} alt="" className="w-16 h-16 object-cover rounded-lg flex-shrink-0" />
+                      <div className="flex-1 min-w-0">
+                        <select value={f.label} onChange={e => cambiarLabel(idx, e.target.value)}
+                          className="w-full border rounded-lg px-2 py-1.5 text-xs focus:outline-none mb-1"
+                          style={{ borderColor: '#e8edf8' }}>
+                          {LABELS_FOTO.map(l => <option key={l} value={l}>{l}</option>)}
+                        </select>
+                        <p className="text-xs truncate" style={{ color: '#B9BBB7' }}>{f.file.name}</p>
+                      </div>
+                      <button onClick={() => eliminarFoto(idx)}
+                        className="w-6 h-6 flex-shrink-0 rounded-full flex items-center justify-center text-white text-xs mt-1"
+                        style={{ background: '#E52322' }}>✕</button>
+                    </div>
+                  ))}
                 </div>
-              ) : (
-                <button onClick={() => fileRef.current?.click()}
-                  className="w-full border-2 border-dashed rounded-xl py-6 text-center"
-                  style={{ borderColor: '#e8edf8' }}>
-                  <p className="text-2xl mb-1">📷</p>
-                  <p className="text-sm" style={{ color: '#B9BBB7' }}>Tocar para sacar foto</p>
-                </button>
               )}
+
+              {/* Botón agregar foto */}
+              <button onClick={() => fileRef.current?.click()}
+                className="w-full border-2 border-dashed rounded-xl py-4 text-center"
+                style={{ borderColor: '#e8edf8' }}>
+                <p className="text-xl mb-0.5">📷</p>
+                <p className="text-xs" style={{ color: '#B9BBB7' }}>
+                  {fotos.length === 0 ? 'Tocar para sacar foto' : '+ Agregar otra foto'}
+                </p>
+              </button>
               <input ref={fileRef} type="file" accept="image/*" capture="environment"
-                onChange={handleFoto} className="hidden" />
+                multiple onChange={handleFoto} className="hidden" />
             </div>
             <button onClick={confirmarEntrega} disabled={confirmando}
               className="w-full py-3 rounded-xl text-sm font-semibold text-white disabled:opacity-50"

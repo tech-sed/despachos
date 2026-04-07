@@ -101,11 +101,18 @@ export default function CargaMasiva() {
       const existentesSet = new Set((existentes ?? []).map((e: any) => String(e.id_despacho)))
       const materiales = todosMateriales ?? []
 
-      // Función de matching igual a la del formulario individual
+      // Normaliza: minúsculas, sin tildes, espacios colapsados, sin espacio antes de unidades
+      const normalizar = (s: string) =>
+        s.toLowerCase()
+          .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // quitar tildes
+          .replace(/\s*x\s*/g, 'x')           // "X 25" → "x25", "4.0 x" → "4.0x"
+          .replace(/(\d)\s*(mt|kg|cm|mm|m)\b/g, '$1$2') // "4.0 MT" → "4.0mt"
+          .replace(/\s+/g, ' ').trim()
+
       const matchMaterial = (descripcion: string) => {
-        const nombre = descripcion.toLowerCase().replace(/\s+/g, ' ').trim()
+        const nombre = normalizar(descripcion)
         return materiales.find((m: any) => {
-          const n = m.nombre.toLowerCase().replace(/\s+/g, ' ').trim()
+          const n = normalizar(m.nombre)
           return n === nombre || n.includes(nombre) || nombre.includes(n)
         })
       }

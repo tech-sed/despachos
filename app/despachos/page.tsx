@@ -209,10 +209,17 @@ export default function NuevoDespacho() {
     .from('materiales')
     .select('*')
 
+  const normalizar = (s: string) =>
+    s.toLowerCase()
+      .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+      .replace(/\s*x\s*/g, 'x')
+      .replace(/(\d)\s*(mt|kg|cm|mm|m)\b/g, '$1$2')
+      .replace(/\s+/g, ' ').trim()
+
   const productosConDatos = datos.productos.map((p: any) => {
-    const nombrePDF = p.descripcion.toLowerCase().replace(/\s+/g, ' ').trim()
+    const nombrePDF = normalizar(p.descripcion)
     const material = todosMateriales?.find((m: any) => {
-      const nombreTabla = m.nombre.toLowerCase().replace(/\s+/g, ' ').trim()
+      const nombreTabla = normalizar(m.nombre)
       return nombreTabla === nombrePDF ||
              nombreTabla.includes(nombrePDF) ||
              nombrePDF.includes(nombreTabla)

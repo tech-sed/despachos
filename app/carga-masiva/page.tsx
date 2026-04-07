@@ -96,7 +96,7 @@ export default function CargaMasiva() {
       // Traer existentes y materiales en paralelo
       const [{ data: existentes }, { data: todosMateriales }] = await Promise.all([
         supabase.from('pedidos').select('id_despacho').in('id_despacho', ids),
-        supabase.from('materiales').select('nombre, cant_x_unid_log, posiciones_x_unid_log, peso_kg_x_posicion'),
+        supabase.from('materiales').select('nombre, cant_x_unid_log, posiciones_x_unid_log, peso_kg_x_posicion, unidad_base'),
       ])
       const existentesSet = new Set((existentes ?? []).map((e: any) => String(e.id_despacho)))
       const materiales = todosMateriales ?? []
@@ -117,18 +117,25 @@ export default function CargaMasiva() {
         })
       }
 
+      const MAX_BOLSAS_POR_PALLET = 60
       const calcularTotales = (productos: { descripcion: string; cantidad: number }[]) => {
-        let peso = 0, posiciones = 0
+        let peso = 0, posiciones = 0, totalBolsas = 0
         let requiere_volcador = false
         for (const p of productos) {
           if (p.descripcion.toLowerCase().includes('granel')) requiere_volcador = true
           const mat = matchMaterial(p.descripcion)
           if (mat) {
-            const unidades = Math.ceil(p.cantidad / mat.cant_x_unid_log)
-            posiciones += unidades * mat.posiciones_x_unid_log
-            peso += unidades * mat.peso_kg_x_posicion
+            const pesoUnitario = mat.cant_x_unid_log > 0 ? mat.peso_kg_x_posicion / mat.cant_x_unid_log : 0
+            peso += p.cantidad * pesoUnitario
+            if (mat.unidad_base === 'bolsa') {
+              totalBolsas += p.cantidad
+            } else {
+              const unidades = Math.ceil(p.cantidad / mat.cant_x_unid_log)
+              posiciones += unidades * mat.posiciones_x_unid_log
+            }
           }
         }
+        posiciones += Math.ceil(totalBolsas / MAX_BOLSAS_POR_PALLET)
         return { peso, posiciones, requiere_volcador }
       }
 

@@ -216,6 +216,7 @@ export default function NuevoDespacho() {
       .replace(/(\d)\s*(mt|kg|cm|mm|m)\b/g, '$1$2')
       .replace(/\s+/g, ' ').trim()
 
+  const MAX_BOLSAS_POR_PALLET = 60
   const productosConDatos = datos.productos.map((p: any) => {
     const nombrePDF = normalizar(p.descripcion)
     const material = todosMateriales?.find((m: any) => {
@@ -224,13 +225,21 @@ export default function NuevoDespacho() {
              nombreTabla.includes(nombrePDF) ||
              nombrePDF.includes(nombreTabla)
     })
+    const pesoUnitario = material && material.cant_x_unid_log > 0
+      ? material.peso_kg_x_posicion / material.cant_x_unid_log : 0
     return { ...p, material,
-      posiciones: material ? Math.ceil(p.cantidad / material.cant_x_unid_log) * material.posiciones_x_unid_log : 0,
-      peso: material ? Math.ceil(p.cantidad / material.cant_x_unid_log) * material.peso_kg_x_posicion : 0,
+      posiciones: material && material.unidad_base !== 'bolsa'
+        ? Math.ceil(p.cantidad / material.cant_x_unid_log) * material.posiciones_x_unid_log : 0,
+      peso: material ? p.cantidad * pesoUnitario : 0,
     }
   })
+  const totalBolsas = productosConDatos.reduce((acc: number, p: any) =>
+    acc + (p.material?.unidad_base === 'bolsa' ? p.cantidad : 0), 0)
   setProductosNV(productosConDatos)
-  setPosicionesTotal(productosConDatos.reduce((acc: number, p: any) => acc + p.posiciones, 0))
+  setPosicionesTotal(
+    productosConDatos.reduce((acc: number, p: any) => acc + p.posiciones, 0) +
+    Math.ceil(totalBolsas / MAX_BOLSAS_POR_PALLET)
+  )
   setPesoTotal(productosConDatos.reduce((acc: number, p: any) => acc + p.peso, 0))
 }
       setPdfListo(true)

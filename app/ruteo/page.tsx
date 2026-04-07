@@ -151,23 +151,26 @@ export default function RuteoPage() {
   }
 
   const iniciarRuta = async () => {
-    if (!camionSeleccionado || horaInicio) return
+    if (!camionSeleccionado || !vueltaActiva) return
     setGuardandoRuta(true)
     const ahora = new Date().toISOString()
-    const { error } = await supabase.from('flota_dia')
-      .update({ hora_inicio: ahora })
-      .eq('fecha', fecha).eq('camion_codigo', camionSeleccionado)
-    if (!error) {
-      // Marcar solo los pedidos de esta vuelta como "en_camino"
-      await fetch('/api/pedidos', {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ camion_id: camionSeleccionado, fecha_entrega: fecha, estado: 'en_camino', vuelta: vueltaActiva, _bulk_camion: true }),
-      })
+    // Solo guardar hora_inicio en flota_dia la primera vez (primera vuelta del día)
+    if (!horaInicio) {
+      await supabase.from('flota_dia')
+        .update({ hora_inicio: ahora })
+        .eq('fecha', fecha).eq('camion_codigo', camionSeleccionado)
+      setHoraInicio(ahora)
+    }
+    const res = await fetch('/api/pedidos', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ camion_id: camionSeleccionado, fecha_entrega: fecha, estado: 'en_camino', vuelta: vueltaActiva, _bulk_camion: true }),
+    })
+    const data = await res.json()
+    if (!data.error) {
       setPedidos(prev => prev.map(p =>
         p.estado === 'programado' && p.vuelta === vueltaActiva ? { ...p, estado: 'en_camino' } : p
       ))
-      setHoraInicio(ahora)
       showToast('Ruta iniciada')
     } else showToast('Error al iniciar ruta', 'err')
     setGuardandoRuta(false)
@@ -355,6 +358,8 @@ export default function RuteoPage() {
   const vueltas = [...new Set(pedidos.map(p => p.vuelta))].sort()
   const entregadosVuelta = pedidosVuelta.filter(p => p.estado === 'entregado').length
   const totalVuelta = pedidosVuelta.length
+  // Vuelta iniciada = al menos un pedido ya no está en "programado"
+  const vueltaIniciada = pedidosVuelta.length > 0 && pedidosVuelta.some(p => p.estado !== 'programado')
 
   if (cargando) return (
     <div className="min-h-screen flex items-center justify-center bg-gray-50">
@@ -563,11 +568,11 @@ export default function RuteoPage() {
                       <span className="font-semibold text-sm" style={{ color: '#254A96' }}>Estado de ruta</span>
                       {kmRuta && <span className="text-xs px-2 py-1 rounded-full" style={{ background: '#e8edf8', color: '#254A96' }}>🗺️ {kmRuta} km planificados</span>}
                     </div>
-                    {!horaInicio ? (
+                    {!vueltaIniciada ? (
                       <button onClick={iniciarRuta} disabled={guardandoRuta}
                         className="w-full py-3 rounded-xl text-sm font-semibold text-white disabled:opacity-50"
                         style={{ background: '#10b981' }}>
-                        {guardandoRuta ? 'Guardando...' : '▶ Iniciar ruta'}
+                        {guardandoRuta ? 'Guardando...' : `▶ Iniciar V${vueltaActiva}`}
                       </button>
                     ) : (
                       <div className="space-y-3">

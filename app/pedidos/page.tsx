@@ -17,17 +17,24 @@ const ESTADO_LABEL: Record<string, string> = {
 }
 
 const TIPO_COLOR: Record<string, { bg: string; text: string }> = {
-  hierro:  { bg: '#e8edf8', text: '#254A96' },
-  chapa:   { bg: '#dbeafe', text: '#1d4ed8' },
-  bolsa:   { bg: '#fef9c3', text: '#854d0e' },
-  granel:  { bg: '#fce7f3', text: '#9d174d' },
-  paleta:  { bg: '#d1fae5', text: '#065f46' },
-  otros:   { bg: '#f4f4f3', text: '#555' },
+  hierro:   { bg: '#e8edf8', text: '#254A96' },
+  chapa:    { bg: '#dbeafe', text: '#1d4ed8' },
+  bolsa:    { bg: '#fef9c3', text: '#854d0e' },
+  granel:   { bg: '#fce7f3', text: '#9d174d' },
+  paleta:   { bg: '#d1fae5', text: '#065f46' },
+  volumen:  { bg: '#ede9fe', text: '#5b21b6' },
+  mamposteria: { bg: '#fde68a', text: '#92400e' },
+  ceramica: { bg: '#ffedd5', text: '#9a3412' },
+  otros:    { bg: '#f4f4f3', text: '#555' },
 }
 const TIPO_LABEL: Record<string, string> = {
   hierro: 'Hierro', chapa: 'Chapa', bolsa: 'Bolsa', granel: 'Granel',
-  paleta: 'Paleta', otros: 'Otros',
+  paleta: 'Paleta', volumen: 'Volumen', mamposteria: 'Mampostería',
+  ceramica: 'Cerámica', otros: 'Otros',
 }
+// Devuelve el color para cualquier tipo, incluso los no mapeados
+function tipoColor(t: string) { return TIPO_COLOR[t] ?? { bg: '#f4f4f3', text: '#555' } }
+function tipoLabel(t: string) { return TIPO_LABEL[t] ?? t }
 
 const normalizar = (s: string) =>
   s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
@@ -403,11 +410,11 @@ export default function PedidosPage() {
                               : cats.length === 0
                                 ? <span className="text-xs" style={{ color: '#ccc' }}>sin items</span>
                                 : cats.map(t => {
-                                    const c = TIPO_COLOR[t] ?? TIPO_COLOR.otros
+                                    const c = tipoColor(t)
                                     return (
                                       <span key={t} className="text-xs px-1.5 py-0.5 rounded font-medium"
                                         style={{ background: c.bg, color: c.text }}>
-                                        {TIPO_LABEL[t] ?? t}
+                                        {tipoLabel(t)}
                                       </span>
                                     )
                                   })
@@ -453,7 +460,7 @@ export default function PedidosPage() {
                                     </thead>
                                     <tbody>
                                       {items.map((it, j) => {
-                                        const c = TIPO_COLOR[it.tipo_carga ?? 'otros'] ?? TIPO_COLOR.otros
+                                        const c = tipoColor(it.tipo_carga ?? 'otros')
                                         return (
                                           <tr key={j} style={{ borderBottom: j < items.length - 1 ? '1px solid #f4f4f3' : 'none' }}>
                                             <td className="px-4 py-2" style={{ color: '#1a1a1a' }}>{it.nombre}</td>
@@ -462,7 +469,7 @@ export default function PedidosPage() {
                                             <td className="px-4 py-2">
                                               <span className="px-1.5 py-0.5 rounded font-medium"
                                                 style={{ background: c.bg, color: c.text }}>
-                                                {TIPO_LABEL[it.tipo_carga ?? 'otros'] ?? it.tipo_carga}
+                                                {tipoLabel(it.tipo_carga ?? 'otros')}
                                               </span>
                                             </td>
                                           </tr>

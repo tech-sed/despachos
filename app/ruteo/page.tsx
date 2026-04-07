@@ -53,6 +53,7 @@ export default function RuteoPage() {
   const [toast, setToast] = useState<{ msg: string; tipo: 'ok' | 'err' } | null>(null)
   const [horaInicio, setHoraInicio] = useState<string | null>(null)
   const [horaFin, setHoraFin] = useState<string | null>(null)
+  const [vueltasIniciadas, setVueltasIniciadas] = useState<Set<number>>(new Set())
   const [kmRuta, setKmRuta] = useState<number | null>(null)
   const [guardandoRuta, setGuardandoRuta] = useState(false)
 
@@ -179,6 +180,7 @@ export default function RuteoPage() {
       setPedidos(prev => prev.map(p =>
         p.vuelta === vueltaActiva && p.estado === 'programado' ? { ...p, estado: 'en_camino' } : p
       ))
+      setVueltasIniciadas(prev => new Set([...prev, vueltaActiva!]))
       showToast('Ruta iniciada')
     } else {
       showToast('Error al iniciar ruta', 'err')
@@ -231,6 +233,14 @@ export default function RuteoPage() {
 
     const todosPedidos = data ?? []
     setPedidos(todosPedidos)
+
+    // Marcar vueltas que ya tienen actividad (en_camino o entregado)
+    const iniciadas = new Set(
+      todosPedidos
+        .filter(p => p.estado === 'en_camino' || p.estado === 'entregado')
+        .map(p => p.vuelta as number)
+    )
+    setVueltasIniciadas(iniciadas)
 
     const vueltas = [...new Set(todosPedidos.map(p => p.vuelta))].sort()
     const vueltaPendiente = vueltas.find(v =>
@@ -369,7 +379,7 @@ export default function RuteoPage() {
   const entregadosVuelta = pedidosVuelta.filter(p => p.estado === 'entregado').length
   const totalVuelta = pedidosVuelta.length
   // Vuelta iniciada = al menos un pedido ya no está en "programado"
-  const vueltaIniciada = pedidosVuelta.length > 0 && pedidosVuelta.some(p => p.estado !== 'programado')
+  const vueltaIniciada = vueltaActiva != null && vueltasIniciadas.has(vueltaActiva)
 
   if (cargando) return (
     <div className="min-h-screen flex items-center justify-center bg-gray-50">

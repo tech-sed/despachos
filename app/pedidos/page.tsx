@@ -158,9 +158,12 @@ export default function PedidosPage() {
       if (!newItemsMap[item.pedido_id]) newItemsMap[item.pedido_id] = []
       newItemsMap[item.pedido_id].push({ nombre: item.nombre, cantidad: item.cantidad, unidad: item.unidad, tipo_carga: tipo, categoria: categoria ?? undefined, subcategoria: subcategoria ?? undefined })
       if (!newCatMap[item.pedido_id]) newCatMap[item.pedido_id] = new Map()
-      const catKey = `${tipo}|${categoria ?? ''}`
-      if (!newCatMap[item.pedido_id].has(catKey)) {
-        newCatMap[item.pedido_id].set(catKey, { label: categoria ?? tipoLabel(tipo), tipo })
+      // No mostrar badge para categoría Logística
+      if (categoria !== 'Logística') {
+        const catKey = `${tipo}|${categoria ?? ''}`
+        if (!newCatMap[item.pedido_id].has(catKey)) {
+          newCatMap[item.pedido_id].set(catKey, { label: categoria ?? tipoLabel(tipo), tipo })
+        }
       }
     }
     const newCatResult: Record<string, { label: string; tipo: string }[]> = {}
@@ -475,15 +478,20 @@ export default function PedidosPage() {
                                             <td className="px-4 py-2 text-right font-medium" style={{ color: '#254A96' }}>{it.cantidad.toLocaleString('es-AR')}</td>
                                             <td className="px-4 py-2" style={{ color: '#666' }}>{it.unidad}</td>
                                             <td className="px-4 py-2">
-                                              <div>
-                                                <span className="px-1.5 py-0.5 rounded font-medium"
-                                                  style={{ background: c.bg, color: c.text }}>
-                                                  {it.categoria ?? tipoLabel(it.tipo_carga ?? 'otros')}
-                                                </span>
-                                                {it.subcategoria && (
-                                                  <div className="text-xs mt-0.5" style={{ color: '#888' }}>{it.subcategoria}</div>
-                                                )}
-                                              </div>
+                                              {it.categoria === 'Logística'
+                                                ? <span style={{ color: '#ccc' }}>—</span>
+                                                : (
+                                                  <div>
+                                                    <span className="px-1.5 py-0.5 rounded font-medium"
+                                                      style={{ background: c.bg, color: c.text }}>
+                                                      {it.categoria ?? tipoLabel(it.tipo_carga ?? 'otros')}
+                                                    </span>
+                                                    {it.subcategoria && (
+                                                      <div className="text-xs mt-0.5" style={{ color: '#888' }}>{it.subcategoria}</div>
+                                                    )}
+                                                  </div>
+                                                )
+                                              }
                                             </td>
                                           </tr>
                                         )

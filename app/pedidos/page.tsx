@@ -49,7 +49,8 @@ interface Pedido {
 }
 
 interface Item {
-  nombre: string; cantidad: number; unidad: string; tipo_carga?: string
+  nombre: string; cantidad: number; unidad: string
+  tipo_carga?: string; categoria?: string; subcategoria?: string
 }
 
 interface Foto {
@@ -67,7 +68,7 @@ export default function PedidosPage() {
   const [total, setTotal] = useState(0)
 
   // Categorías, items y fotos por pedido
-  const [categoriasMap, setCategoriasMap] = useState<Record<string, string[]>>({})
+  const [categoriasMap, setCategoriasMap] = useState<Record<string, { label: string; tipo: string }[]>>({})
   const [itemsMap, setItemsMap] = useState<Record<string, Item[]>>({})
   const [fotosMap, setFotosMap] = useState<Record<string, Foto[]>>({})
 
@@ -136,13 +137,14 @@ export default function PedidosPage() {
   async function cargarDetalle(ids: string[]) {
     const [{ data: rawItems }, { data: mats }, { data: rawFotos }] = await Promise.all([
       supabase.from('pedido_items').select('pedido_id, nombre, cantidad, unidad').in('pedido_id', ids),
-      supabase.from('materiales').select('nombre, tipo_carga'),
+      supabase.from('materiales').select('nombre, tipo_carga, categoria, subcategoria'),
       supabase.from('pedido_fotos').select('pedido_id, url, label').in('pedido_id', ids).order('created_at'),
     ])
 
     // Items + categorías
     const newItemsMap: Record<string, Item[]> = {}
-    const newCatMap: Record<string, Set<string>> = {}
+    // catKey = "tipo_carga|categoria" para deduplicar manteniendo ambos datos
+    const newCatMap: Record<string, Map<string, { label: string; tipo: string }>> = {}
 
     for (const item of rawItems ?? []) {
       const nItem = normalizar(item.nombre)
@@ -151,13 +153,18 @@ export default function PedidosPage() {
         return nMat === nItem || nMat.includes(nItem) || nItem.includes(nMat)
       })
       const tipo = mat?.tipo_carga ?? 'otros'
+      const categoria = mat?.categoria ?? null
+      const subcategoria = mat?.subcategoria ?? null
       if (!newItemsMap[item.pedido_id]) newItemsMap[item.pedido_id] = []
-      newItemsMap[item.pedido_id].push({ nombre: item.nombre, cantidad: item.cantidad, unidad: item.unidad, tipo_carga: tipo })
-      if (!newCatMap[item.pedido_id]) newCatMap[item.pedido_id] = new Set()
-      newCatMap[item.pedido_id].add(tipo)
+      newItemsMap[item.pedido_id].push({ nombre: item.nombre, cantidad: item.cantidad, unidad: item.unidad, tipo_carga: tipo, categoria: categoria ?? undefined, subcategoria: subcategoria ?? undefined })
+      if (!newCatMap[item.pedido_id]) newCatMap[item.pedido_id] = new Map()
+      const catKey = `${tipo}|${categoria ?? ''}`
+      if (!newCatMap[item.pedido_id].has(catKey)) {
+        newCatMap[item.pedido_id].set(catKey, { label: categoria ?? tipoLabel(tipo), tipo })
+      }
     }
-    const newCatResult: Record<string, string[]> = {}
-    for (const [k, v] of Object.entries(newCatMap)) newCatResult[k] = Array.from(v)
+    const newCatResult: Record<string, { label: string; tipo: string }[]> = {}
+    for (const [k, v] of Object.entries(newCatMap)) newCatResult[k] = Array.from(v.values())
 
     // Fotos — obtener URL pública de cada una
     const newFotosMap: Record<string, Foto[]> = {}
@@ -412,12 +419,12 @@ export default function PedidosPage() {
                                 ? <span className="text-xs animate-pulse" style={{ color: '#ddd' }}>·</span>
                                 : cats.length === 0
                                   ? <span className="text-xs" style={{ color: '#ccc' }}>sin items</span>
-                                  : cats.map(t => {
-                                      const c = tipoColor(t)
+                                  : cats.map(c => {
+                                      const col = tipoColor(c.tipo)
                                       return (
-                                        <span key={t} className="text-xs px-1.5 py-0.5 rounded font-medium"
-                                          style={{ background: c.bg, color: c.text }}>
-                                          {tipoLabel(t)}
+                                        <span key={`${c.tipo}|${c.label}`} className="text-xs px-1.5 py-0.5 rounded font-medium"
+                                          style={{ background: col.bg, color: col.text }}>
+                                          {c.label}
                                         </span>
                                       )
                                     })
@@ -484,10 +491,15 @@ export default function PedidosPage() {
                                             <td className="px-4 py-2 text-right font-medium" style={{ color: '#254A96' }}>{it.cantidad.toLocaleString('es-AR')}</td>
                                             <td className="px-4 py-2" style={{ color: '#666' }}>{it.unidad}</td>
                                             <td className="px-4 py-2">
-                                              <span className="px-1.5 py-0.5 rounded font-medium"
-                                                style={{ background: c.bg, color: c.text }}>
-                                                {tipoLabel(it.tipo_carga ?? 'otros')}
-                                              </span>
+                                              <div>
+                                                <span className="px-1.5 py-0.5 rounded font-medium"
+                                                  style={{ background: c.bg, color: c.text }}>
+                                                  {it.categoria ?? tipoLabel(it.tipo_carga ?? 'otros')}
+                                                </span>
+                                                {it.subcategoria && (
+                                                  <div className="text-xs mt-0.5" style={{ color: '#888' }}>{it.subcategoria}</div>
+                                                )}
+                                              </div>
                                             </td>
                                           </tr>
                                         )

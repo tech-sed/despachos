@@ -50,7 +50,7 @@ interface Pedido {
 
 interface Item {
   nombre: string; cantidad: number; unidad: string
-  tipo_carga?: string; categoria?: string; subcategoria?: string
+  tipo_carga?: string; categoria?: string; subcategoria?: string; material_id?: number
 }
 
 interface Foto {
@@ -137,7 +137,7 @@ export default function PedidosPage() {
   async function cargarDetalle(ids: string[]) {
     const [{ data: rawItems }, { data: mats }, { data: rawFotos }] = await Promise.all([
       supabase.from('pedido_items').select('pedido_id, nombre, cantidad, unidad').in('pedido_id', ids),
-      supabase.from('materiales').select('nombre, tipo_carga, categoria, subcategoria'),
+      supabase.from('materiales').select('id, nombre, tipo_carga, categoria, subcategoria'),
       supabase.from('pedido_fotos').select('pedido_id, url, label').in('pedido_id', ids).order('created_at'),
     ])
 
@@ -156,7 +156,7 @@ export default function PedidosPage() {
       const categoria = mat?.categoria ?? null
       const subcategoria = mat?.subcategoria ?? null
       if (!newItemsMap[item.pedido_id]) newItemsMap[item.pedido_id] = []
-      newItemsMap[item.pedido_id].push({ nombre: item.nombre, cantidad: item.cantidad, unidad: item.unidad, tipo_carga: tipo, categoria: categoria ?? undefined, subcategoria: subcategoria ?? undefined })
+      newItemsMap[item.pedido_id].push({ nombre: item.nombre, cantidad: item.cantidad, unidad: item.unidad, tipo_carga: tipo, categoria: categoria ?? undefined, subcategoria: subcategoria ?? undefined, material_id: mat?.id ?? undefined })
       if (!newCatMap[item.pedido_id]) newCatMap[item.pedido_id] = new Map()
       // No mostrar badge para categoría Logística
       if (categoria !== 'Logística') {
@@ -463,6 +463,7 @@ export default function PedidosPage() {
                                   <table className="w-full text-xs">
                                     <thead>
                                       <tr style={{ background: '#f4f4f3', borderBottom: '1px solid #e8edf8' }}>
+                                        <th className="text-left px-4 py-2 font-semibold" style={{ color: '#254A96' }}>ID</th>
                                         <th className="text-left px-4 py-2 font-semibold" style={{ color: '#254A96' }}>Producto</th>
                                         <th className="text-right px-4 py-2 font-semibold" style={{ color: '#254A96' }}>Cantidad</th>
                                         <th className="text-left px-4 py-2 font-semibold" style={{ color: '#254A96' }}>Unidad</th>
@@ -474,6 +475,7 @@ export default function PedidosPage() {
                                         const c = tipoColor(it.tipo_carga ?? 'otros')
                                         return (
                                           <tr key={j} style={{ borderBottom: j < items.length - 1 ? '1px solid #f4f4f3' : 'none' }}>
+                                            <td className="px-4 py-2 font-mono text-xs whitespace-nowrap" style={{ color: it.material_id ? '#B9BBB7' : '#f87171' }}>{it.material_id ?? '—'}</td>
                                             <td className="px-4 py-2" style={{ color: '#1a1a1a' }}>{it.nombre}</td>
                                             <td className="px-4 py-2 text-right font-medium" style={{ color: '#254A96' }}>{it.cantidad.toLocaleString('es-AR')}</td>
                                             <td className="px-4 py-2" style={{ color: '#666' }}>{it.unidad}</td>

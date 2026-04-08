@@ -186,6 +186,7 @@ function VistaLista({ onEditar, onVolver, showToast }: {
               style={{ color: '#254A96', background: '#e8edf8' }}>
               ← Volver
             </button>
+            <img src="/logo.png" alt="Construyo al Costo" className="h-7 w-auto rounded-lg hidden sm:block" />
             <div className="hidden sm:block">
               <span className="font-semibold text-sm" style={{ color: '#254A96' }}>Flota del día</span>
               <span className="text-xs ml-2" style={{ color: '#B9BBB7' }}>Flotas configuradas</span>
@@ -456,6 +457,7 @@ function VistaEditar({ fecha, onVolver, showToast }: {
               style={{ color: '#254A96', background: '#e8edf8' }}>
               ← Flotas
             </button>
+            <img src="/logo.png" alt="Construyo al Costo" className="h-7 w-auto rounded-lg hidden sm:block" />
             <div>
               <span className="font-semibold text-sm capitalize" style={{ color: '#254A96' }}>
                 {formatFecha(fecha)}

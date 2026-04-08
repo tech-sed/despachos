@@ -101,6 +101,7 @@ export default function FinDelDiaPage() {
             className="flex items-center gap-1.5 text-sm font-medium px-3 py-1.5 rounded-lg shrink-0"
             style={{ color: '#254A96', background: '#e8edf8' }}>← Volver</button>
           <div className="w-px h-5 bg-gray-200" />
+          <img src="/logo.png" alt="Construyo al Costo" className="h-7 w-auto rounded-lg hidden sm:block" />
           <span className="font-semibold text-sm" style={{ color: '#254A96' }}>Fin del día — Pedidos no entregados</span>
         </div>
       </nav>

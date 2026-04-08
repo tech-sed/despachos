@@ -291,6 +291,7 @@ export default function PedidosPage() {
               style={{ background: '#e8edf8', color: '#254A96' }}>
               ← Volver
             </button>
+            <img src="/logo.png" alt="Construyo al Costo" className="h-7 w-auto rounded-lg hidden sm:block" />
             <div>
               <span className="font-bold text-sm" style={{ color: '#254A96' }}>Pedidos</span>
               {total > 0 && <span className="text-xs ml-2" style={{ color: '#B9BBB7' }}>{total} resultado{total !== 1 ? 's' : ''}</span>}

@@ -150,6 +150,7 @@ export default function ConfirmacionesPage() {
               className="text-xs px-2 py-1.5 rounded-lg font-medium shrink-0"
               style={{ background: '#e8edf8', color: '#254A96' }}>← Volver</button>
             <div className="w-px h-5 bg-gray-200 hidden sm:block" />
+            <img src="/logo.png" alt="Construyo al Costo" className="h-7 w-auto rounded-lg hidden sm:block" />
             <div>
               <span className="font-semibold text-sm" style={{ color: '#254A96' }}>Confirmaciones</span>
               <span className="text-xs ml-2 hidden sm:inline" style={{ color: '#B9BBB7' }}>{nombreUsuario}</span>

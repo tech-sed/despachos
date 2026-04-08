@@ -480,6 +480,7 @@ export default function RuteoPage() {
                 ← Volver
               </button>
             )}
+            <img src="/logo.png" alt="Construyo al Costo" className="h-7 w-auto rounded-lg hidden sm:block" />
             <div>
               <span className="font-semibold text-sm" style={{ color: '#254A96' }}>
                 {datosUsuario?.rol === 'chofer' ? 'Mis entregas' : 'Ruteo'}

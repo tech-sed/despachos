@@ -147,6 +147,7 @@ export default function FlotaBasePage() {
               style={{ color: '#254A96', background: '#e8edf8' }}>
               ← Volver
             </button>
+            <img src="/logo.png" alt="Construyo al Costo" className="h-7 w-auto rounded-lg hidden sm:block" />
             <div>
               <span className="font-semibold text-sm" style={{ color: '#254A96' }}>Flota base</span>
               <span className="text-xs ml-2 hidden sm:inline" style={{ color: '#B9BBB7' }}>

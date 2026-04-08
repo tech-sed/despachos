@@ -262,11 +262,7 @@ export default function Dashboard() {
       <nav className="bg-white border-b sticky top-0 z-40" style={{ borderColor: '#e8edf8' }}>
         <div className="max-w-7xl mx-auto px-4 md:px-6 h-14 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="w-8 h-8 rounded-lg flex items-center justify-center text-white font-bold text-sm shrink-0" style={{ background: '#254A96' }}>C</div>
-            <div className="hidden sm:block">
-              <span className="font-semibold text-sm" style={{ color: '#254A96' }}>Construyo al Costo</span>
-              <span className="text-xs ml-2" style={{ color: '#B9BBB7' }}>Despachos</span>
-            </div>
+            <img src="/logo.png" alt="Construyo al Costo" className="h-8 w-auto rounded-lg" />
           </div>
           <div className="flex items-center gap-2">
             <span className="text-xs hidden md:block" style={{ color: '#B9BBB7' }}>{usuario.email}</span>

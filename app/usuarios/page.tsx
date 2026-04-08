@@ -230,6 +230,7 @@ export default function UsuariosPage() {
               style={{ background: '#e8edf8', color: '#254A96' }}>
               ← Volver
             </button>
+            <img src="/logo.png" alt="Construyo al Costo" className="h-7 w-auto rounded-lg hidden sm:block" />
             <div>
               <span className="font-bold text-sm" style={{ color: '#254A96' }}>Gestión de Usuarios</span>
               <span className="text-xs ml-2" style={{ color: '#B9BBB7' }}>{usuarios.length} usuarios</span>

@@ -824,6 +824,7 @@ function ProgramacionInner() {
             <div className="flex items-center gap-3">
               <button onClick={() => router.push('/dashboard')} className="flex items-center gap-1.5 text-sm font-medium px-3 py-1.5 rounded-lg shrink-0"
                 style={{ color: '#254A96', background: '#e8edf8' }}>← Volver</button>
+              <img src="/logo.png" alt="Construyo al Costo" className="h-7 w-auto rounded-lg hidden sm:block" />
               <div className="hidden sm:block">
                 <span className="font-semibold text-sm" style={{ color: '#254A96' }}>Programación</span>
                 <span className="text-xs ml-2" style={{ color: '#B9BBB7' }}>Asignación de pedidos a camiones</span>

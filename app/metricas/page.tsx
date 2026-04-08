@@ -223,6 +223,7 @@ export default function MetricasPage() {
               style={{ color: '#254A96', background: '#e8edf8' }}>
               ← Volver
             </button>
+            <img src="/logo.png" alt="Construyo al Costo" className="h-7 w-auto rounded-lg hidden sm:block" />
             <span className="font-semibold text-sm" style={{ color: '#254A96' }}>Métricas de flota</span>
           </div>
           <div className="flex items-center gap-2">

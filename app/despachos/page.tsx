@@ -352,6 +352,7 @@ export default function NuevoDespacho() {
             ← Volver
           </button>
           <div className="w-px h-5 bg-gray-200" />
+          <img src="/logo.png" alt="Construyo al Costo" className="h-7 w-auto rounded-lg hidden sm:block" />
           <span className="font-semibold text-sm" style={{ color: '#254A96' }}>Nueva Solicitud de Despacho</span>
         </div>
       </nav>

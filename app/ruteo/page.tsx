@@ -394,14 +394,15 @@ export default function RuteoPage() {
 
     const fechaStr = new Date(fecha + 'T12:00:00').toLocaleDateString('es-AR', { weekday: 'long', day: '2-digit', month: 'long', year: 'numeric' })
 
-    // Cada pedido = su propio <tbody> con page-break-inside:avoid
-    const tbodysPorPedido = pedidosVuelta.map((p, idx) => {
+    // Cada pedido = su propia <table> con page-break-inside:avoid
+    const tablasPorPedido = pedidosVuelta.map((p, idx) => {
       const items = p.items ?? []
       const num = p.orden_entrega ?? idx + 1
       const header = `<td rowspan="${Math.max(items.length,1)}" style="vertical-align:top;font-weight:bold;width:24px">${num}</td><td rowspan="${Math.max(items.length,1)}" style="vertical-align:top;width:38%"><strong>${p.cliente}</strong><br><small style="color:#666">NV ${p.nv}</small><br><small style="color:#888">${p.direccion}</small></td>`
-      if (items.length === 0) return `<tbody style="page-break-inside:avoid"><tr>${header}<td colspan="3" style="color:#999">Sin items</td></tr></tbody>`
-      const filas = items.map((item, i) => `<tr>${i === 0 ? header : ''}<td>${item.nombre}</td><td style="text-align:right;font-weight:bold;color:#254A96">${item.cantidad.toLocaleString('es-AR')}</td><td>${item.unidad}</td></tr>`).join('')
-      return `<tbody style="page-break-inside:avoid">${filas}</tbody>`
+      const filas = items.length === 0
+        ? `<tr>${header}<td colspan="3" style="color:#999">Sin items</td></tr>`
+        : items.map((item, i) => `<tr>${i === 0 ? header : ''}<td>${item.nombre}</td><td style="text-align:right;font-weight:bold;color:#254A96">${item.cantidad.toLocaleString('es-AR')}</td><td>${item.unidad}</td></tr>`).join('')
+      return `<table class="pedido"><thead><tr><th style="width:24px">#</th><th style="width:38%">Cliente / NV / Dirección</th><th>Material</th><th style="text-align:right">Cant.</th><th>U.</th></tr></thead><tbody>${filas}</tbody></table>`
     }).join('')
 
     win.document.write(`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8">
@@ -410,24 +411,23 @@ export default function RuteoPage() {
         body{font-family:Arial,sans-serif;font-size:12px;color:#111;margin:24px}
         h1{font-size:15px;margin:0 0 2px 0;color:#254A96}
         .meta{font-size:11px;color:#666;margin-bottom:14px}
-        h2{font-size:12px;margin:14px 0 5px;color:#254A96;border-bottom:1px solid #ccc;padding-bottom:3px;text-transform:uppercase;letter-spacing:.5px}
-        table{width:100%;border-collapse:collapse;margin-bottom:14px;font-size:11px}
+        h2{font-size:12px;margin:14px 0 8px;color:#254A96;border-bottom:1px solid #ccc;padding-bottom:3px;text-transform:uppercase;letter-spacing:.5px}
+        table.pedido{width:100%;border-collapse:collapse;margin-bottom:20px;font-size:11px;page-break-inside:avoid}
         thead{display:table-header-group}
         th{background:#254A96;color:#fff;padding:5px 7px;text-align:left}
         td{padding:4px 7px;border-bottom:1px solid #eee}
-        tbody tr:last-child td{border-bottom:2px solid #ccc}
+        table.totales{width:100%;border-collapse:collapse;font-size:11px}
         .qty{text-align:right;font-weight:bold;color:#254A96}
-        @media print{@page{margin:15mm}}
+        @media print{@page{margin:15mm}table.pedido{page-break-inside:avoid}}
       </style></head><body>
       <h1>🚛 ${camionSeleccionado} — Vuelta ${vueltaActiva} · ${VUELTA_LABEL[vueltaActiva!] ?? ''}</h1>
       <p class="meta">${fechaStr} · ${pedidosVuelta.length} entregas</p>
 
       <h2>Detalle por entrega</h2>
-      <table><thead><tr><th>#</th><th>Cliente / NV / Dirección</th><th>Material</th><th style="text-align:right">Cant.</th><th>U.</th></tr></thead>
-      ${tbodysPorPedido}</table>
+      ${tablasPorPedido}
 
       <h2 style="page-break-before:always">Materiales a preparar (total vuelta)</h2>
-      <table><thead><tr><th>Material</th><th style="text-align:right">Cantidad</th><th>Unidad</th></tr></thead><tbody>
+      <table class="totales"><thead><tr><th>Material</th><th style="text-align:right">Cantidad</th><th>Unidad</th></tr></thead><tbody>
         ${Object.values(totales).sort((a, b) => a.nombre.localeCompare(b.nombre)).map(t =>
           `<tr><td>${t.nombre}</td><td class="qty">${t.cantidad.toLocaleString('es-AR')}</td><td>${t.unidad}</td></tr>`
         ).join('')}

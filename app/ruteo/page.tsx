@@ -57,6 +57,10 @@ export default function RuteoPage() {
   const [kmRuta, setKmRuta] = useState<number | null>(null)
   const [guardandoRuta, setGuardandoRuta] = useState(false)
 
+  // Soporte técnico
+  const [modalSoporte, setModalSoporte] = useState(false)
+  const [contactosSoporte, setContactosSoporte] = useState<{ id: number; nombre: string; telefono: string; sucursal: string }[]>([])
+
   // Modal de confirmación
   const [modalPedido, setModalPedido] = useState<Pedido | null>(null)
   const [nota, setNota] = useState('')
@@ -112,8 +116,20 @@ export default function RuteoPage() {
   }, [fecha])
 
   useEffect(() => {
-    if (camionSeleccionado) { cargarPedidos(); cargarInfoRuta() }
+    if (camionSeleccionado) { cargarPedidos(); cargarInfoRuta(); cargarSoporte() }
   }, [camionSeleccionado, fecha])
+
+  const cargarSoporte = async () => {
+    if (!camionSeleccionado) return
+    // Buscar la sucursal del camión seleccionado
+    const { data: camionData } = await supabase
+      .from('camiones_flota').select('sucursal').eq('codigo', camionSeleccionado).single()
+    const suc = camionData?.sucursal
+    if (!suc) return
+    const res = await fetch(`/api/soporte-contactos?sucursal=${encodeURIComponent(suc)}`)
+    const data = await res.json()
+    setContactosSoporte(data.contactos ?? [])
+  }
 
   const cargarCamionesDisponibles = async () => {
     // Traer camiones que tienen pedidos programados para esta fecha
@@ -465,6 +481,49 @@ export default function RuteoPage() {
       )}
 
       {/* Modal confirmar entrega */}
+      {/* Botón flotante soporte — solo cuando hay camión seleccionado y hay contactos */}
+      {camionSeleccionado && contactosSoporte.length > 0 && (
+        <button onClick={() => setModalSoporte(true)}
+          className="fixed bottom-6 right-6 z-40 w-14 h-14 rounded-full shadow-lg flex items-center justify-center text-2xl"
+          style={{ background: '#25D366' }}
+          title="Contactar soporte">
+          🛟
+        </button>
+      )}
+
+      {/* Modal soporte */}
+      {modalSoporte && (
+        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-4"
+          style={{ background: 'rgba(0,0,0,0.5)' }}>
+          <div className="bg-white rounded-2xl w-full max-w-sm p-6 space-y-4">
+            <div className="flex justify-between items-center">
+              <h3 className="font-bold text-base" style={{ color: '#254A96' }}>🛟 Soporte técnico</h3>
+              <button onClick={() => setModalSoporte(false)} className="text-gray-400 hover:text-gray-600 text-xl">✕</button>
+            </div>
+            <p className="text-xs" style={{ color: '#B9BBB7' }}>Contactos disponibles para tu sucursal</p>
+            <div className="space-y-3">
+              {contactosSoporte.map(c => (
+                <div key={c.id} className="rounded-xl p-4 space-y-2" style={{ background: '#f8faff', border: '1px solid #e8edf8' }}>
+                  <p className="font-semibold text-sm" style={{ color: '#1a1a1a' }}>{c.nombre}</p>
+                  <div className="flex gap-2">
+                    <a href={`https://wa.me/${c.telefono}`} target="_blank" rel="noopener noreferrer"
+                      className="flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-semibold text-white"
+                      style={{ background: '#25D366' }}>
+                      💬 WhatsApp
+                    </a>
+                    <a href={`tel:+${c.telefono}`}
+                      className="flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-semibold text-white"
+                      style={{ background: '#254A96' }}>
+                      📞 Llamar
+                    </a>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
       {modalPedido && (
         <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-4"
           style={{ background: 'rgba(0,0,0,0.5)' }}>

@@ -17,6 +17,14 @@ interface Usuario {
 
 const SUCURSALES = ['LP139', 'LP520', 'Guernica', 'Cañuelas', 'Pinamar']
 
+interface SoporteContacto {
+  id: number
+  nombre: string
+  telefono: string
+  sucursal: string
+  activo: boolean
+}
+
 export default function UsuariosPage() {
   const router = useRouter()
   const [usuarios, setUsuarios] = useState<Usuario[]>([])
@@ -25,6 +33,12 @@ export default function UsuariosPage() {
   const [form, setForm] = useState({ nombre: '', email: '', password: '', rol: 'comercial', sucursal: '' })
   const [guardando, setGuardando] = useState(false)
   const [toast, setToast] = useState<{ msg: string; tipo: 'ok' | 'err' } | null>(null)
+
+  // Soporte técnico
+  const [contactosSoporte, setContactosSoporte] = useState<SoporteContacto[]>([])
+  const [formSoporte, setFormSoporte] = useState({ nombre: '', telefono: '', sucursal: 'LP520' })
+  const [guardandoSoporte, setGuardandoSoporte] = useState(false)
+  const [editSoporte, setEditSoporte] = useState<SoporteContacto | null>(null)
 
   const showToast = (msg: string, tipo: 'ok' | 'err' = 'ok') => {
     setToast({ msg, tipo }); setTimeout(() => setToast(null), 3500)
@@ -36,8 +50,47 @@ export default function UsuariosPage() {
       const { data } = await supabase.from('usuarios').select('rol').eq('id', user.id).single()
       if (data?.rol !== 'gerencia') { router.push('/dashboard'); return }
       cargarUsuarios()
+      cargarSoporte()
     })
   }, [])
+
+  const cargarSoporte = async () => {
+    const res = await fetch('/api/soporte-contactos')
+    const data = await res.json()
+    setContactosSoporte(data.contactos ?? [])
+  }
+
+  const guardarSoporte = async () => {
+    if (!formSoporte.nombre.trim() || !formSoporte.telefono.trim()) return
+    setGuardandoSoporte(true)
+    try {
+      if (editSoporte) {
+        await fetch('/api/soporte-contactos', { method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: editSoporte.id, ...formSoporte }) })
+        showToast('Contacto actualizado')
+      } else {
+        await fetch('/api/soporte-contactos', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(formSoporte) })
+        showToast('Contacto agregado')
+      }
+      setFormSoporte({ nombre: '', telefono: '', sucursal: 'LP520' })
+      setEditSoporte(null)
+      cargarSoporte()
+    } catch { showToast('Error al guardar', 'err') }
+    setGuardandoSoporte(false)
+  }
+
+  const eliminarSoporte = async (id: number) => {
+    await fetch('/api/soporte-contactos', { method: 'DELETE', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id }) })
+    cargarSoporte()
+  }
+
+  const toggleActivoSoporte = async (c: SoporteContacto) => {
+    await fetch('/api/soporte-contactos', { method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: c.id, activo: !c.activo }) })
+    cargarSoporte()
+  }
 
   const cargarUsuarios = async () => {
     setCargando(true)
@@ -303,6 +356,87 @@ export default function UsuariosPage() {
               <p className="text-sm">No hay usuarios cargados</p>
             </div>
           )}
+        </div>
+
+        {/* Soporte técnico */}
+        <div className="bg-white rounded-2xl shadow-sm overflow-hidden mt-8">
+          <div className="px-6 py-4 border-b flex items-center justify-between" style={{ borderColor: '#e8edf8' }}>
+            <div>
+              <h2 className="font-bold text-sm" style={{ color: '#254A96' }}>🛟 Soporte técnico por sucursal</h2>
+              <p className="text-xs mt-0.5" style={{ color: '#B9BBB7' }}>Los choferes ven estos contactos en el módulo de ruteo</p>
+            </div>
+          </div>
+
+          {/* Lista de contactos agrupados por sucursal */}
+          {SUCURSALES.map(suc => {
+            const contactosSuc = contactosSoporte.filter(c => c.sucursal === suc)
+            if (contactosSuc.length === 0) return null
+            return (
+              <div key={suc} className="px-6 py-3 border-b" style={{ borderColor: '#f4f4f3' }}>
+                <p className="text-xs font-semibold mb-2 uppercase tracking-wider" style={{ color: '#B9BBB7' }}>{suc}</p>
+                <div className="space-y-2">
+                  {contactosSuc.map(c => (
+                    <div key={c.id} className="flex items-center gap-3 rounded-xl px-3 py-2"
+                      style={{ background: c.activo ? '#f8faff' : '#f4f4f3', border: '1px solid #e8edf8', opacity: c.activo ? 1 : 0.5 }}>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-medium" style={{ color: '#1a1a1a' }}>{c.nombre}</p>
+                        <p className="text-xs" style={{ color: '#254A96' }}>+{c.telefono}</p>
+                      </div>
+                      <button onClick={() => toggleActivoSoporte(c)}
+                        className="text-xs px-2 py-1 rounded-lg"
+                        style={{ background: c.activo ? '#d1fae5' : '#f4f4f3', color: c.activo ? '#065f46' : '#B9BBB7' }}>
+                        {c.activo ? 'Activo' : 'Inactivo'}
+                      </button>
+                      <button onClick={() => { setEditSoporte(c); setFormSoporte({ nombre: c.nombre, telefono: c.telefono, sucursal: c.sucursal }) }}
+                        className="text-xs px-2 py-1 rounded-lg" style={{ background: '#e8edf8', color: '#254A96' }}>
+                        Editar
+                      </button>
+                      <button onClick={() => eliminarSoporte(c.id)}
+                        className="text-xs px-2 py-1 rounded-lg" style={{ background: '#fde8e8', color: '#E52322' }}>
+                        ✕
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )
+          })}
+
+          {/* Formulario agregar / editar */}
+          <div className="px-6 py-4">
+            <p className="text-xs font-semibold mb-3" style={{ color: '#254A96' }}>
+              {editSoporte ? '✎ Editar contacto' : '+ Agregar contacto'}
+            </p>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-3">
+              <input type="text" placeholder="Nombre (ej: Juan Soporte)"
+                value={formSoporte.nombre} onChange={e => setFormSoporte(f => ({ ...f, nombre: e.target.value }))}
+                className="border rounded-xl px-3 py-2 text-sm focus:outline-none"
+                style={{ borderColor: '#e8edf8' }} />
+              <input type="tel" placeholder="Teléfono (ej: 5491155554444)"
+                value={formSoporte.telefono} onChange={e => setFormSoporte(f => ({ ...f, telefono: e.target.value }))}
+                className="border rounded-xl px-3 py-2 text-sm focus:outline-none"
+                style={{ borderColor: '#e8edf8' }} />
+              <select value={formSoporte.sucursal} onChange={e => setFormSoporte(f => ({ ...f, sucursal: e.target.value }))}
+                className="border rounded-xl px-3 py-2 text-sm focus:outline-none"
+                style={{ borderColor: '#e8edf8' }}>
+                {SUCURSALES.map(s => <option key={s} value={s}>{s}</option>)}
+              </select>
+            </div>
+            <div className="flex gap-2">
+              <button onClick={guardarSoporte} disabled={guardandoSoporte || !formSoporte.nombre || !formSoporte.telefono}
+                className="px-4 py-2 rounded-xl text-sm font-semibold text-white disabled:opacity-50"
+                style={{ background: '#254A96' }}>
+                {guardandoSoporte ? 'Guardando...' : editSoporte ? 'Actualizar' : 'Agregar'}
+              </button>
+              {editSoporte && (
+                <button onClick={() => { setEditSoporte(null); setFormSoporte({ nombre: '', telefono: '', sucursal: 'LP520' }) }}
+                  className="px-4 py-2 rounded-xl text-sm font-medium"
+                  style={{ background: '#f4f4f3', color: '#666' }}>
+                  Cancelar
+                </button>
+              )}
+            </div>
+          </div>
         </div>
       </main>
     </div>

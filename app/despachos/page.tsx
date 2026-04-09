@@ -168,10 +168,14 @@ export default function NuevoDespacho() {
         posUsadas += (pv ?? []).reduce((a: number, p: any) => a + (p.volumen_total_m3 ?? 0), 0)
       }
 
-      const hayLugar = pesoNuevo === 0 && posNuevas === 0
+      const LIMITE = 0.85
+      const pesoPct = pesoTotalFlota > 0 ? pesoUsado / pesoTotalFlota : 0
+      const posPct = posTotalFlota > 0 ? posUsadas / posTotalFlota : 0
+      const ocupacionOk = pesoPct < LIMITE && posPct < LIMITE
+      const capeOk = pesoNuevo === 0 && posNuevas === 0
         ? true
         : (pesoTotalFlota - pesoUsado) >= pesoNuevo && (posTotalFlota - posUsadas) >= posNuevas
-      if (hayLugar) disponibles.push(vuelta)
+      if (ocupacionOk && capeOk) disponibles.push(vuelta)
     }
 
     setCuposDisponibles(disponibles)

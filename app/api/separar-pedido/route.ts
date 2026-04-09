@@ -13,30 +13,25 @@ function esGranel(nombre: string): boolean {
   return nombre.toLowerCase().includes('granel')
 }
 
-const MAX_BOLSAS_POR_PALLET = 60
-
 async function calcularPesoItems(admin: ReturnType<typeof getAdmin>, items: { nombre: string; cantidad: number }[]) {
   const { data: mats } = await admin.from('materiales').select('nombre, cant_x_unid_log, posiciones_x_unid_log, peso_kg_x_posicion, unidad_base')
   if (!mats) return { peso: 0, posiciones: 0 }
-  let peso = 0, posiciones = 0, totalBolsas = 0
+  let peso = 0, posiciones = 0
   for (const item of items) {
     const n = item.nombre.toLowerCase().replace(/\s+/g, ' ').trim()
-    const mat = mats.find((m: any) => {
+    // Preferir el match más específico (nombre más largo)
+    const candidatos = mats.filter((m: any) => {
       const mn = m.nombre.toLowerCase().replace(/\s+/g, ' ').trim()
       return mn === n || mn.includes(n) || n.includes(mn)
-    })
-    if (mat) {
-      const pesoUnitario = mat.cant_x_unid_log > 0 ? mat.peso_kg_x_posicion / mat.cant_x_unid_log : 0
+    }).sort((a: any, b: any) => b.nombre.length - a.nombre.length)
+    const mat = candidatos[0]
+    if (mat && mat.cant_x_unid_log > 0) {
+      const pesoUnitario = mat.peso_kg_x_posicion / mat.cant_x_unid_log
       peso += item.cantidad * pesoUnitario
-      if (mat.unidad_base === 'bolsa') {
-        totalBolsas += item.cantidad
-      } else {
-        const unidades = Math.ceil(item.cantidad / mat.cant_x_unid_log)
-        posiciones += unidades * mat.posiciones_x_unid_log
-      }
+      const unidades = Math.ceil(item.cantidad / mat.cant_x_unid_log)
+      posiciones += unidades * mat.posiciones_x_unid_log
     }
   }
-  posiciones += Math.ceil(totalBolsas / MAX_BOLSAS_POR_PALLET)
   return { peso, posiciones }
 }
 

@@ -534,8 +534,10 @@ export default function NuevoDespacho() {
                 </div>
               </div>
               <div>
-                <p className="text-xs mb-1" style={{ color: '#B9BBB7' }}>Dirección de entrega</p>
-                <p className="font-medium text-sm" style={{ color: '#1a1a1a' }}>{form.direccion || '—'}</p>
+                <label className="block text-xs mb-1" style={{ color: '#B9BBB7' }}>Dirección de entrega</label>
+                <input type="text" name="direccion" value={form.direccion} onChange={handleChange}
+                  placeholder="Dirección de entrega"
+                  className={inputClass} style={{ ...inputStyle, background: 'white' }} />
               </div>
               {form.latitud && form.longitud && (
                 <div>

@@ -426,7 +426,7 @@ export default function RuteoPage() {
       <table><thead><tr><th>#</th><th>Cliente / NV / Dirección</th><th>Material</th><th style="text-align:right">Cant.</th><th>U.</th></tr></thead>
       ${tbodysPorPedido}</table>
 
-      <h2>Materiales a preparar (total vuelta)</h2>
+      <h2 style="page-break-before:always">Materiales a preparar (total vuelta)</h2>
       <table><thead><tr><th>Material</th><th style="text-align:right">Cantidad</th><th>Unidad</th></tr></thead><tbody>
         ${Object.values(totales).sort((a, b) => a.nombre.localeCompare(b.nombre)).map(t =>
           `<tr><td>${t.nombre}</td><td class="qty">${t.cantidad.toLocaleString('es-AR')}</td><td>${t.unidad}</td></tr>`

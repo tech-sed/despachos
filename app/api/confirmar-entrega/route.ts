@@ -12,6 +12,8 @@ export async function POST(request: NextRequest) {
     const formData = await request.formData()
     const pedidoId = formData.get('pedido_id') as string
     const nota = formData.get('nota') as string
+    const estado = (formData.get('estado') as string) || 'entregado'
+    const motivoRechazo = formData.get('motivo_rechazo') as string | null
 
     if (!pedidoId) {
       return NextResponse.json({ error: 'Falta pedido_id' }, { status: 400 })
@@ -43,8 +45,9 @@ export async function POST(request: NextRequest) {
     }
 
     // Actualizar estado del pedido
-    const updates: Record<string, any> = { estado: 'entregado' }
+    const updates: Record<string, any> = { estado }
     if (nota) updates.notas = nota
+    if (estado === 'rechazado' && motivoRechazo) updates.motivo_rechazo = motivoRechazo
 
     const { data: updated, error } = await supabase
       .from('pedidos')

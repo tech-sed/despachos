@@ -62,6 +62,8 @@ export default function RuteoPage() {
   const [nota, setNota] = useState('')
   const [fotos, setFotos] = useState<{ file: File; preview: string; label: string }[]>([])
   const [confirmando, setConfirmando] = useState(false)
+  const [accionModal, setAccionModal] = useState<'entregar' | 'rechazar'>('entregar')
+  const [motivoRechazo, setMotivoRechazo] = useState('')
   const fileRef = useRef<HTMLInputElement>(null)
 
   const LABELS_FOTO = ['Remito', 'Material en puerta', 'Daño / Roto', 'Otro']
@@ -119,7 +121,7 @@ export default function RuteoPage() {
       .from('pedidos')
       .select('camion_id')
       .eq('fecha_entrega', fecha)
-      .in('estado', ['programado', 'en_camino', 'entregado'])
+      .in('estado', ['programado', 'en_camino', 'entregado', 'rechazado'])
       .not('camion_id', 'is', null)
 
     const codigos = [...new Set((pedidosData ?? []).map((p: any) => p.camion_id))]
@@ -227,7 +229,7 @@ export default function RuteoPage() {
       .select('*, items:pedido_items(nombre, cantidad, unidad)')
       .eq('fecha_entrega', fecha)
       .eq('camion_id', camionSeleccionado)
-      .in('estado', ['programado', 'en_camino', 'entregado'])
+      .in('estado', ['programado', 'en_camino', 'entregado', 'rechazado'])
       .order('vuelta')
       .order('orden_entrega', { ascending: true, nullsFirst: false })
 
@@ -237,14 +239,14 @@ export default function RuteoPage() {
     // Marcar vueltas que ya tienen actividad (en_camino o entregado)
     const iniciadas = new Set(
       todosPedidos
-        .filter(p => p.estado === 'en_camino' || p.estado === 'entregado')
+        .filter(p => p.estado === 'en_camino' || p.estado === 'entregado' || p.estado === 'rechazado')
         .map(p => p.vuelta as number)
     )
     setVueltasIniciadas(iniciadas)
 
     const vueltas = [...new Set(todosPedidos.map(p => p.vuelta))].sort()
     const vueltaPendiente = vueltas.find(v =>
-      todosPedidos.some(p => p.vuelta === v && p.estado !== 'entregado')
+      todosPedidos.some(p => p.vuelta === v && p.estado !== 'entregado' && p.estado !== 'rechazado')
     )
     setVueltaActiva(vueltaPendiente ?? vueltas[0] ?? null)
     setCargandoPedidos(false)
@@ -258,7 +260,7 @@ export default function RuteoPage() {
 
   const abrirRecorridoCompleto = () => {
     const paradas = pedidosVuelta
-      .filter(p => p.estado !== 'entregado' && p.latitud && p.longitud)
+      .filter(p => p.estado !== 'entregado' && p.estado !== 'rechazado' && p.latitud && p.longitud)
       .sort((a, b) => (a.orden_entrega ?? 999) - (b.orden_entrega ?? 999))
 
     if (paradas.length === 0) return
@@ -328,16 +330,24 @@ export default function RuteoPage() {
       img.src = url
     })
 
-  const confirmarEntrega = async () => {
+  const cerrarModal = () => {
+    setModalPedido(null); setNota(''); setFotos([])
+    setAccionModal('entregar'); setMotivoRechazo('')
+  }
+
+  const confirmarEntrega = async (accion: 'entregar' | 'rechazar') => {
     if (!modalPedido) return
+    if (fotos.length === 0) { showToast('Necesitás al menos una foto', 'err'); return }
+    if (accion === 'rechazar' && !motivoRechazo.trim()) { showToast('Ingresá el motivo del rechazo', 'err'); return }
     setConfirmando(true)
 
     try {
       const formData = new FormData()
       formData.append('pedido_id', modalPedido.id)
+      formData.append('estado', accion === 'rechazar' ? 'rechazado' : 'entregado')
       if (nota) formData.append('nota', nota)
+      if (accion === 'rechazar') formData.append('motivo_rechazo', motivoRechazo.trim())
 
-      // Comprimir cada foto antes de subir
       for (let i = 0; i < fotos.length; i++) {
         const blob = await comprimirFoto(fotos[i].file)
         formData.append(`foto_${i}`, blob, `foto_${i}.jpg`)
@@ -348,35 +358,33 @@ export default function RuteoPage() {
       const data = await res.json()
 
       if (data.success) {
-        showToast('Entrega confirmada')
+        const nuevoEstado = accion === 'rechazar' ? 'rechazado' : 'entregado'
+        showToast(accion === 'rechazar' ? 'Entrega rechazada' : 'Entrega confirmada')
         if (usuario && datosUsuario) {
-          await logAuditoria(usuario.id, datosUsuario.nombre, 'Confirmó entrega', 'Ruteo', {
-            pedido_id: modalPedido.id,
-            nv: modalPedido.nv,
-            cliente: modalPedido.cliente,
-            camion: camionSeleccionado,
-            con_nota: !!nota,
-            cant_fotos: fotos.length,
-          })
+          await logAuditoria(usuario.id, datosUsuario.nombre,
+            accion === 'rechazar' ? 'Rechazó entrega' : 'Confirmó entrega', 'Ruteo', {
+              pedido_id: modalPedido.id, nv: modalPedido.nv, cliente: modalPedido.cliente,
+              camion: camionSeleccionado, con_nota: !!nota, cant_fotos: fotos.length,
+              ...(accion === 'rechazar' ? { motivo: motivoRechazo } : {}),
+            })
         }
         setPedidos(prev => prev.map(p =>
-          p.id === modalPedido.id ? { ...p, estado: 'entregado' } : p
+          p.id === modalPedido.id ? { ...p, estado: nuevoEstado } : p
         ))
-        setModalPedido(null)
-        setNota('')
-        setFotos([])
+        cerrarModal()
       } else {
-        showToast(`Error: ${data.error ?? 'No se pudo confirmar'}`, 'err')
+        showToast(`Error: ${data.error ?? 'No se pudo guardar'}`, 'err')
       }
     } catch (e: any) {
-      showToast(`Error: ${e.message ?? 'No se pudo confirmar'}`, 'err')
+      showToast(`Error: ${e.message ?? 'No se pudo guardar'}`, 'err')
     }
     setConfirmando(false)
   }
 
   const pedidosVuelta = pedidos.filter(p => p.vuelta === vueltaActiva)
   const vueltas = [...new Set(pedidos.map(p => p.vuelta))].sort()
-  const entregadosVuelta = pedidosVuelta.filter(p => p.estado === 'entregado').length
+  const finalizadosVuelta = pedidosVuelta.filter(p => p.estado === 'entregado' || p.estado === 'rechazado').length
+  const entregadosVuelta = finalizadosVuelta
   const totalVuelta = pedidosVuelta.length
 
   const imprimirVuelta = () => {
@@ -463,28 +471,30 @@ export default function RuteoPage() {
           <div className="bg-white rounded-2xl w-full max-w-md p-6 space-y-4">
             <div className="flex justify-between items-start">
               <div>
-                <h3 className="font-bold text-base" style={{ color: '#254A96' }}>Confirmar entrega</h3>
+                <h3 className="font-bold text-base" style={{ color: '#254A96' }}>Registrar entrega</h3>
                 <p className="text-sm mt-0.5" style={{ color: '#B9BBB7' }}>{modalPedido.cliente}</p>
               </div>
-              <button onClick={() => { setModalPedido(null); setNota(''); setFotos([]) }}
-                className="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
+              <button onClick={cerrarModal} className="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
             </div>
             <div className="rounded-xl p-3 text-sm" style={{ background: '#f4f4f3' }}>
               <p className="font-medium" style={{ color: '#1a1a1a' }}>{modalPedido.direccion}</p>
             </div>
+
+            {/* Nota */}
             <div>
-              <label className="block text-xs font-medium mb-1.5" style={{ color: '#254A96' }}>Nota de entrega (opcional)</label>
+              <label className="block text-xs font-medium mb-1.5" style={{ color: '#254A96' }}>Nota (opcional)</label>
               <textarea value={nota} onChange={e => setNota(e.target.value)} rows={2}
                 className="w-full border rounded-xl px-4 py-2.5 text-sm focus:outline-none"
                 style={{ borderColor: '#e8edf8' }}
                 placeholder="Ej: Dejé en portería, firmó el encargado..." />
             </div>
+
+            {/* Fotos — obligatorias */}
             <div>
               <label className="block text-xs font-medium mb-1.5" style={{ color: '#254A96' }}>
-                Fotos de entrega (opcional)
+                Foto <span style={{ color: '#E52322' }}>*</span>
+                <span className="font-normal ml-1" style={{ color: '#B9BBB7' }}>(obligatoria)</span>
               </label>
-
-              {/* Fotos ya agregadas */}
               {fotos.length > 0 && (
                 <div className="space-y-2 mb-2">
                   {fotos.map((f, idx) => (
@@ -505,24 +515,48 @@ export default function RuteoPage() {
                   ))}
                 </div>
               )}
-
-              {/* Botón agregar foto */}
               <button onClick={() => fileRef.current?.click()}
                 className="w-full border-2 border-dashed rounded-xl py-4 text-center"
-                style={{ borderColor: '#e8edf8' }}>
+                style={{ borderColor: fotos.length === 0 ? '#fca5a5' : '#e8edf8' }}>
                 <p className="text-xl mb-0.5">📷</p>
-                <p className="text-xs" style={{ color: '#B9BBB7' }}>
-                  {fotos.length === 0 ? 'Tocar para sacar foto' : '+ Agregar otra foto'}
+                <p className="text-xs" style={{ color: fotos.length === 0 ? '#E52322' : '#B9BBB7' }}>
+                  {fotos.length === 0 ? 'Tocar para sacar foto (requerido)' : '+ Agregar otra foto'}
                 </p>
               </button>
               <input ref={fileRef} type="file" accept="image/*" capture="environment"
                 multiple onChange={handleFoto} className="hidden" />
             </div>
-            <button onClick={confirmarEntrega} disabled={confirmando}
-              className="w-full py-3 rounded-xl text-sm font-semibold text-white disabled:opacity-50"
-              style={{ background: '#254A96' }}>
-              {confirmando ? 'Confirmando...' : '✓ Confirmar entrega'}
-            </button>
+
+            {/* Motivo de rechazo — solo visible si se elige rechazar */}
+            {accionModal === 'rechazar' && (
+              <div>
+                <label className="block text-xs font-medium mb-1.5" style={{ color: '#E52322' }}>
+                  Motivo del rechazo <span style={{ color: '#E52322' }}>*</span>
+                </label>
+                <textarea value={motivoRechazo} onChange={e => setMotivoRechazo(e.target.value)} rows={2}
+                  className="w-full border rounded-xl px-4 py-2.5 text-sm focus:outline-none"
+                  style={{ borderColor: '#fca5a5' }}
+                  placeholder="Ej: Cliente no estaba, no aceptó el pedido, dirección incorrecta..." />
+              </div>
+            )}
+
+            {/* Botones acción */}
+            <div className="flex gap-2">
+              <button
+                onClick={() => { setAccionModal('entregar'); confirmarEntrega('entregar') }}
+                disabled={confirmando}
+                className="flex-1 py-3 rounded-xl text-sm font-semibold text-white disabled:opacity-50"
+                style={{ background: '#254A96' }}>
+                {confirmando && accionModal === 'entregar' ? 'Guardando...' : '✓ Entregado'}
+              </button>
+              <button
+                onClick={() => accionModal === 'rechazar' ? confirmarEntrega('rechazar') : setAccionModal('rechazar')}
+                disabled={confirmando}
+                className="flex-1 py-3 rounded-xl text-sm font-semibold text-white disabled:opacity-50"
+                style={{ background: accionModal === 'rechazar' ? '#E52322' : '#f4f4f3', color: accionModal === 'rechazar' ? 'white' : '#E52322' }}>
+                {confirmando && accionModal === 'rechazar' ? 'Guardando...' : accionModal === 'rechazar' ? '✕ Confirmar rechazo' : '✕ Rechazado'}
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -709,7 +743,7 @@ export default function RuteoPage() {
                 {vueltas.length > 1 && (
                   <div className="flex gap-2 mb-4 overflow-x-auto pb-1">
                     {vueltas.map(v => {
-                      const entregados = pedidos.filter(p => p.vuelta === v && p.estado === 'entregado').length
+                      const entregados = pedidos.filter(p => p.vuelta === v && (p.estado === 'entregado' || p.estado === 'rechazado')).length
                       const total = pedidos.filter(p => p.vuelta === v).length
                       return (
                         <button key={v} onClick={() => setVueltaActiva(v)}
@@ -732,7 +766,7 @@ export default function RuteoPage() {
                 )}
 
                 {/* Botón recorrido completo */}
-                {pedidosVuelta.filter(p => p.estado !== 'entregado' && p.latitud && p.longitud).length > 0 && (
+                {pedidosVuelta.filter(p => p.estado !== 'entregado' && p.estado !== 'rechazado' && p.latitud && p.longitud).length > 0 && (
                   <button onClick={abrirRecorridoCompleto}
                     className="w-full flex items-center justify-center gap-2 py-3 rounded-xl text-sm font-semibold mb-4"
                     style={{ background: '#254A96', color: 'white' }}>
@@ -750,16 +784,18 @@ export default function RuteoPage() {
                   <div className="space-y-3">
                     {pedidosVuelta.map((pedido, idx) => {
                       const entregado = pedido.estado === 'entregado'
+                      const rechazado = pedido.estado === 'rechazado'
+                      const finalizado = entregado || rechazado
                       return (
                         <div key={pedido.id}
                           className="bg-white rounded-xl shadow-sm overflow-hidden"
-                          style={{ opacity: entregado ? 0.7 : 1, border: `2px solid ${entregado ? '#d1fae5' : '#f0f0f0'}` }}>
+                          style={{ opacity: finalizado ? 0.75 : 1, border: `2px solid ${entregado ? '#d1fae5' : rechazado ? '#fde8e8' : '#f0f0f0'}` }}>
                           <div className="px-4 py-3 flex items-center justify-between"
-                            style={{ background: entregado ? '#f0fdf4' : 'white', borderBottom: '1px solid #f4f4f3' }}>
+                            style={{ background: entregado ? '#f0fdf4' : rechazado ? '#fff5f5' : 'white', borderBottom: '1px solid #f4f4f3' }}>
                             <div className="flex items-center gap-3">
                               <div className="w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold text-white shrink-0"
-                                style={{ background: entregado ? '#10b981' : '#254A96' }}>
-                                {entregado ? '✓' : (pedido.orden_entrega ?? idx + 1)}
+                                style={{ background: entregado ? '#10b981' : rechazado ? '#E52322' : '#254A96' }}>
+                                {entregado ? '✓' : rechazado ? '✕' : (pedido.orden_entrega ?? idx + 1)}
                               </div>
                               <div>
                                 <p className="font-semibold text-sm" style={{ color: '#254A96' }}>{pedido.cliente}</p>
@@ -767,8 +803,8 @@ export default function RuteoPage() {
                               </div>
                             </div>
                             <span className="text-xs px-2 py-1 rounded-full font-medium"
-                              style={entregado ? { background: '#d1fae5', color: '#065f46' } : { background: '#e8edf8', color: '#254A96' }}>
-                              {entregado ? 'Entregado' : 'Pendiente'}
+                              style={entregado ? { background: '#d1fae5', color: '#065f46' } : rechazado ? { background: '#fde8e8', color: '#E52322' } : { background: '#e8edf8', color: '#254A96' }}>
+                              {entregado ? 'Entregado' : rechazado ? 'Rechazado' : 'Pendiente'}
                             </span>
                           </div>
                           <div className="px-4 py-3 space-y-3">
@@ -786,12 +822,17 @@ export default function RuteoPage() {
                                 ))}
                               </div>
                             )}
-                            {pedido.notas && !entregado && (
+                            {pedido.notas && !finalizado && (
                               <p className="text-xs rounded-lg px-3 py-2" style={{ background: '#fff8e1', color: '#b45309' }}>
                                 ⚠️ {pedido.notas}
                               </p>
                             )}
-                            {!entregado && (
+                            {rechazado && (pedido as any).motivo_rechazo && (
+                              <p className="text-xs rounded-lg px-3 py-2" style={{ background: '#fde8e8', color: '#E52322' }}>
+                                ✕ {(pedido as any).motivo_rechazo}
+                              </p>
+                            )}
+                            {!finalizado && (
                               <div className="flex gap-2 pt-1">
                                 <button onClick={() => abrirMaps(pedido)}
                                   className="flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-medium border"
@@ -805,7 +846,7 @@ export default function RuteoPage() {
                                 </button>
                               </div>
                             )}
-                            {entregado && pedido.notas && (
+                            {finalizado && pedido.notas && (
                               <p className="text-xs" style={{ color: '#B9BBB7' }}>Nota: {pedido.notas}</p>
                             )}
                           </div>

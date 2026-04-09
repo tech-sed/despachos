@@ -75,6 +75,8 @@ export default function NuevoDespacho() {
   const [reprogFecha, setReprogFecha] = useState('')
   const [reprogVuelta, setReprogVuelta] = useState(1)
   const [reprogMotivo, setReprogMotivo] = useState('')
+  const [linkMaps, setLinkMaps] = useState('')
+  const [linkMapsOk, setLinkMapsOk] = useState<boolean | null>(null)
 
   useEffect(() => { _setToast = setToastState; return () => { _setToast = null } }, [])
 
@@ -316,6 +318,45 @@ export default function NuevoDespacho() {
     setPdfListo(false)
   }
 
+  const parsearLinkMaps = (url: string) => {
+    // Patrones: /@lat,lng,zoom  |  ?q=lat,lng  |  ll=lat,lng
+    const patrones = [
+      /@(-?\d+\.\d+),(-?\d+\.\d+)/,
+      /[?&]q=(-?\d+\.\d+),(-?\d+\.\d+)/,
+      /[?&]ll=(-?\d+\.\d+),(-?\d+\.\d+)/,
+    ]
+    for (const re of patrones) {
+      const m = url.match(re)
+      if (m) {
+        const lat = parseFloat(m[1]), lng = parseFloat(m[2])
+        // Intentar extraer nombre del lugar desde /place/NOMBRE/@...
+        const placeMatch = url.match(/\/place\/([^/@]+)/)
+        const direccionMaps = placeMatch
+          ? decodeURIComponent(placeMatch[1].replace(/\+/g, ' ')).replace(/,.*/, '').trim()
+          : null
+        return { lat, lng, direccion: direccionMaps }
+      }
+    }
+    return null
+  }
+
+  const handleLinkMaps = (url: string) => {
+    setLinkMaps(url)
+    if (!url.trim()) { setLinkMapsOk(null); return }
+    const resultado = parsearLinkMaps(url)
+    if (resultado) {
+      setForm(prev => ({
+        ...prev,
+        latitud: resultado.lat,
+        longitud: resultado.lng,
+        ...(resultado.direccion ? { direccion: resultado.direccion } : {}),
+      }))
+      setLinkMapsOk(true)
+    } else {
+      setLinkMapsOk(false)
+    }
+  }
+
   const inputClass = "w-full border rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:ring-2 transition-colors"
   const inputStyle = { borderColor: '#e8edf8', fontFamily: 'Barlow, sans-serif' }
 
@@ -542,6 +583,22 @@ export default function NuevoDespacho() {
                 <input type="text" name="direccion" value={form.direccion} onChange={handleChange}
                   placeholder="Dirección de entrega"
                   className={inputClass} style={{ ...inputStyle, background: 'white' }} />
+              </div>
+              <div>
+                <label className="block text-xs mb-1" style={{ color: '#B9BBB7' }}>
+                  Link de Google Maps <span style={{ color: '#B9BBB7', fontWeight: 400 }}>(opcional — actualiza coordenadas)</span>
+                </label>
+                <div className="relative">
+                  <input type="url" value={linkMaps}
+                    onChange={e => handleLinkMaps(e.target.value)}
+                    placeholder="https://maps.google.com/..."
+                    className={inputClass}
+                    style={{ ...inputStyle, background: 'white', paddingRight: '2rem',
+                      borderColor: linkMapsOk === true ? '#10b981' : linkMapsOk === false ? '#E52322' : '#e8edf8' }} />
+                  {linkMapsOk === true && <span className="absolute right-3 top-1/2 -translate-y-1/2 text-sm" style={{ color: '#10b981' }}>✓</span>}
+                  {linkMapsOk === false && <span className="absolute right-3 top-1/2 -translate-y-1/2 text-sm" style={{ color: '#E52322' }}>✕</span>}
+                </div>
+                {linkMapsOk === false && <p className="text-xs mt-1" style={{ color: '#E52322' }}>No se encontraron coordenadas en el link</p>}
               </div>
               {form.latitud && form.longitud && (
                 <div>

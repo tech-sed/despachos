@@ -132,8 +132,8 @@ export default function AbastecimientoPage() {
     nv: '', cliente: '', sucursal_origen: 'Guernica', sucursal_destino: 'LP520',
     fecha_solicitada: '', notas: '',
   })
-  const [itemsCrear, setItemsCrear] = useState<{ nombre_producto: string; cantidad_solicitada: number; id_producto: number | null }[]>([
-    { nombre_producto: '', cantidad_solicitada: 1, id_producto: null }
+  const [itemsCrear, setItemsCrear] = useState<{ nombre_producto: string; cantidad_solicitada: number; id_producto: number | null; _codigo?: string; _encontrado?: boolean; _noEncontrado?: boolean }[]>([
+    { nombre_producto: '', cantidad_solicitada: 1, id_producto: null, _codigo: '', _encontrado: false, _noEncontrado: false }
   ])
   const [stockConsulta, setStockConsulta] = useState<Record<string, { sucursal: string; cantidad: number }[]>>({})
 
@@ -294,7 +294,9 @@ export default function AbastecimientoPage() {
         fecha_req: hoy(),
         solicitado_por: userEmail,
         estado: 'pendiente',
-        items: itemsCrear.filter(it => it.nombre_producto),
+        items: itemsCrear
+          .filter(it => it.nombre_producto)
+          .map(({ _codigo: _c, _encontrado: _e, _noEncontrado: _n, ...rest }: any) => rest),
       }),
     })
     const data = await res.json()
@@ -303,7 +305,7 @@ export default function AbastecimientoPage() {
     showToast('Requerimiento creado')
     setModalCrear(false)
     setFormCrear({ tipo: 'abastecimiento', nv: '', cliente: '', sucursal_origen: 'Guernica', sucursal_destino: 'LP520', fecha_solicitada: '', notas: '' })
-    setItemsCrear([{ nombre_producto: '', cantidad_solicitada: 1, id_producto: null }])
+    setItemsCrear([{ nombre_producto: '', cantidad_solicitada: 1, id_producto: null, _codigo: '', _encontrado: false, _noEncontrado: false }])
     cargarReqs(tab)
   }
 
@@ -312,14 +314,40 @@ export default function AbastecimientoPage() {
     const res = await fetch(`/api/stock-import?nombre=${encodeURIComponent(nombre)}`)
     const data = await res.json()
     if (Array.isArray(data)) {
-      // Agrupar por producto y sucursal
       const byProd: Record<string, { sucursal: string; cantidad: number }[]> = {}
       for (const row of data) {
-        const key = `${row.nombre}`
-        if (!byProd[key]) byProd[key] = []
-        byProd[key].push({ sucursal: row.sucursal, cantidad: row.cantidad })
+        if (!byProd[row.nombre]) byProd[row.nombre] = []
+        byProd[row.nombre].push({ sucursal: row.sucursal, cantidad: row.cantidad })
       }
       setStockConsulta(prev => ({ ...prev, [idx]: Object.values(byProd)[0] ?? [] }))
+    }
+  }
+
+  async function buscarPorCodigo(codigo: string, idx: number) {
+    const cod = codigo.trim()
+    if (!cod || isNaN(Number(cod))) return
+    const res = await fetch(`/api/stock-import?id_producto=${cod}`)
+    const data = await res.json()
+    if (Array.isArray(data) && data.length > 0) {
+      const nombre = data[0].nombre
+      const id = data[0].id_producto
+      // Autofill nombre e id_producto en el item
+      setItemsCrear(prev => {
+        const upd = [...prev]
+        upd[idx] = { ...upd[idx], nombre_producto: nombre, id_producto: id, _encontrado: true, _noEncontrado: false }
+        return upd
+      })
+      // Cargar stock por sucursal (solo los que tienen cantidad > 0)
+      const stock = data.filter((r: any) => r.cantidad > 0).map((r: any) => ({ sucursal: r.sucursal, cantidad: r.cantidad }))
+      setStockConsulta(prev => ({ ...prev, [idx]: stock }))
+    } else {
+      // No existe en maestro — modo manual
+      setItemsCrear(prev => {
+        const upd = [...prev]
+        upd[idx] = { ...upd[idx], nombre_producto: '', id_producto: null, _encontrado: false, _noEncontrado: true }
+        return upd
+      })
+      setStockConsulta(prev => ({ ...prev, [idx]: [] }))
     }
   }
 
@@ -384,7 +412,7 @@ export default function AbastecimientoPage() {
             </div>
           </div>
           {(rol === 'deposito' || rol === 'gerencia') && (
-            <button onClick={() => setModalCrear(true)}
+            <button onClick={() => { setModalCrear(true); setItemsCrear([{ nombre_producto: '', cantidad_solicitada: 1, id_producto: null, _codigo: '', _encontrado: false, _noEncontrado: false }]) }}
               className="px-4 py-2 text-sm font-semibold rounded-lg text-white"
               style={{ background: '#0f766e' }}>
               + Nuevo requerimiento
@@ -492,6 +520,7 @@ export default function AbastecimientoPage() {
           setForm={setFormCrear}
           setItems={setItemsCrear}
           onConsultarStock={consultarStock}
+          onBuscarPorCodigo={buscarPorCodigo}
           onCreate={crearRequerimiento}
           onClose={() => setModalCrear(false)}
         />
@@ -703,7 +732,7 @@ function ModalDetalle({ req, rol, guardando, editItems, editNotas, editNViaje, e
 }
 
 /* ─── Modal Crear ───────────────────────────────────── */
-function ModalCrear({ form, items, guardando, stockConsulta, rol, setForm, setItems, onConsultarStock, onCreate, onClose }: any) {
+function ModalCrear({ form, items, guardando, stockConsulta, rol, setForm, setItems, onConsultarStock, onBuscarPorCodigo, onCreate, onClose }: any) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
       <div className="bg-white rounded-2xl shadow-xl w-full max-w-lg max-h-[90vh] flex flex-col"
@@ -773,29 +802,75 @@ function ModalCrear({ form, items, guardando, stockConsulta, rol, setForm, setIt
             <div className="space-y-3">
               {items.map((item: any, idx: number) => (
                 <div key={idx} className="rounded-lg p-3 space-y-2" style={{ background: '#f9f9f9', border: '1px solid #f0f0f0' }}>
-                  <div className="flex gap-2">
-                    <input
-                      value={item.nombre_producto}
-                      onChange={e => {
-                        const upd = [...items]; upd[idx] = { ...upd[idx], nombre_producto: e.target.value }; setItems(upd)
-                      }}
-                      onBlur={e => onConsultarStock(e.target.value, idx)}
-                      placeholder="Nombre del producto"
-                      className="flex-1 border rounded px-2.5 py-1.5 text-xs focus:outline-none"
-                      style={{ borderColor: '#e8edf8' }} />
-                    <input type="number" min={1}
-                      value={item.cantidad_solicitada}
-                      onChange={e => {
-                        const upd = [...items]; upd[idx] = { ...upd[idx], cantidad_solicitada: parseInt(e.target.value) || 1 }; setItems(upd)
-                      }}
-                      className="w-16 border rounded px-2 py-1.5 text-xs text-center focus:outline-none"
-                      style={{ borderColor: '#e8edf8' }} />
+
+                  {/* Fila 1: código + nombre + cantidad + quitar */}
+                  <div className="flex gap-2 items-start">
+                    {/* Input código */}
+                    <div className="flex flex-col gap-0.5">
+                      <span className="text-xs" style={{ color: '#B9BBB7' }}>Código</span>
+                      <input
+                        value={item._codigo ?? ''}
+                        onChange={e => {
+                          const upd = [...items]
+                          upd[idx] = { ...upd[idx], _codigo: e.target.value, _encontrado: false, _noEncontrado: false }
+                          setItems(upd)
+                        }}
+                        onBlur={e => onBuscarPorCodigo(e.target.value, idx)}
+                        placeholder="ej: 1234"
+                        className="w-20 border rounded px-2 py-1.5 text-xs text-center focus:outline-none"
+                        style={{ borderColor: item._encontrado ? '#bbf7d0' : item._noEncontrado ? '#fca5a5' : '#e8edf8' }} />
+                    </div>
+
+                    {/* Nombre (auto-fill o manual) */}
+                    <div className="flex flex-col gap-0.5 flex-1">
+                      <span className="text-xs flex items-center gap-1" style={{ color: '#B9BBB7' }}>
+                        Producto
+                        {item._encontrado && <span className="text-xs px-1 rounded" style={{ background: '#d1fae5', color: '#065f46' }}>✓ maestro</span>}
+                        {item._noEncontrado && <span className="text-xs px-1 rounded" style={{ background: '#fef3c7', color: '#b45309' }}>manual</span>}
+                      </span>
+                      <input
+                        value={item.nombre_producto}
+                        readOnly={item._encontrado}
+                        onChange={e => {
+                          const upd = [...items]; upd[idx] = { ...upd[idx], nombre_producto: e.target.value }; setItems(upd)
+                        }}
+                        onBlur={e => !item._encontrado && onConsultarStock(e.target.value, idx)}
+                        placeholder={item._noEncontrado ? 'Ingresá el nombre del producto' : 'Nombre o buscá por código'}
+                        className="flex-1 border rounded px-2.5 py-1.5 text-xs focus:outline-none"
+                        style={{
+                          borderColor: '#e8edf8',
+                          background: item._encontrado ? '#f0fdf4' : 'white',
+                          color: '#1a1a1a',
+                        }} />
+                    </div>
+
+                    {/* Cantidad */}
+                    <div className="flex flex-col gap-0.5">
+                      <span className="text-xs" style={{ color: '#B9BBB7' }}>Cant.</span>
+                      <input type="number" min={1}
+                        value={item.cantidad_solicitada}
+                        onChange={e => {
+                          const upd = [...items]; upd[idx] = { ...upd[idx], cantidad_solicitada: parseInt(e.target.value) || 1 }; setItems(upd)
+                        }}
+                        className="w-16 border rounded px-2 py-1.5 text-xs text-center focus:outline-none"
+                        style={{ borderColor: '#e8edf8' }} />
+                    </div>
+
+                    {/* Quitar */}
                     {items.length > 1 && (
                       <button onClick={() => setItems(items.filter((_: any, i: number) => i !== idx))}
-                        className="text-xs px-2 rounded" style={{ color: '#E52322', background: '#fde8e8' }}>✕</button>
+                        className="text-xs px-2 py-1.5 rounded mt-4" style={{ color: '#E52322', background: '#fde8e8' }}>✕</button>
                     )}
                   </div>
-                  {/* Stock disponible */}
+
+                  {/* Mensaje si código no encontrado */}
+                  {item._noEncontrado && !item.nombre_producto && (
+                    <p className="text-xs" style={{ color: '#b45309' }}>
+                      ⚠ Código no encontrado en el maestro de stock — ingresá el nombre manualmente y se guardará igual.
+                    </p>
+                  )}
+
+                  {/* Stock disponible por sucursal */}
                   {stockConsulta[idx]?.length > 0 && (
                     <div className="flex gap-1.5 flex-wrap">
                       {stockConsulta[idx].map((s: any) => (
@@ -808,7 +883,7 @@ function ModalCrear({ form, items, guardando, stockConsulta, rol, setForm, setIt
                   )}
                 </div>
               ))}
-              <button onClick={() => setItems([...items, { nombre_producto: '', cantidad_solicitada: 1, id_producto: null }])}
+              <button onClick={() => setItems([...items, { nombre_producto: '', cantidad_solicitada: 1, id_producto: null, _codigo: '', _encontrado: false, _noEncontrado: false }])}
                 className="w-full py-2 text-xs rounded-lg border-dashed border"
                 style={{ borderColor: '#e8edf8', color: '#B9BBB7' }}>
                 + Agregar producto

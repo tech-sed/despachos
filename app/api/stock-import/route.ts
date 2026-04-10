@@ -91,9 +91,8 @@ export async function GET(req: NextRequest) {
   if (id_producto) {
     const { data } = await admin
       .from('stock_sucursal')
-      .select('sucursal, cantidad, actualizado_en')
+      .select('id_producto, nombre, sucursal, cantidad, actualizado_en')
       .eq('id_producto', parseInt(id_producto))
-      .gt('cantidad', 0)
       .order('cantidad', { ascending: false })
     return NextResponse.json(data ?? [])
   }

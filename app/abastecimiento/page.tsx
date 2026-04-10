@@ -476,7 +476,7 @@ export default function AbastecimientoPage() {
           setEditVehiculo={setEditVehiculo}
           setEditFechaRec={setEditFechaRec}
           setEditTipoEntrega={setEditTipoEntrega}
-          onCambiarEstado={(est) => cambiarEstado(detalle, est)}
+          onCambiarEstado={(est: string) => cambiarEstado(detalle, est)}
           onClose={() => setDetalle(null)}
         />
       )}
@@ -624,7 +624,7 @@ function ModalDetalle({ req, rol, guardando, editItems, editNotas, editNViaje, e
                     🚛 Camiones sugeridos para {req.fecha_solicitada}
                   </p>
                   <div className="space-y-1">
-                    {camionesRec.map(c => (
+                    {camionesRec.map((c: CamionSugerido) => (
                       <button key={c.codigo} onClick={() => setEditVehiculo(c.codigo)}
                         className="w-full text-left rounded px-2 py-1.5 text-xs flex items-center justify-between hover:opacity-80 transition-opacity"
                         style={{ background: c.pedidos_destino > 0 ? '#d1fae5' : '#f4f4f3', color: '#1a1a1a' }}>

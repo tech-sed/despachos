@@ -11,6 +11,7 @@ const TODAS_LAS_CARDS = [
   { href: '/programacion',   icon: '📅', titulo: 'Programación',       descripcion: 'Asignar pedidos a camiones',         disponible: true,  roles: ['gerencia','ruteador'] },
   { href: '/ruteo',          icon: '🗺️', titulo: 'Ruteo',              descripcion: 'Ver recorridos del día',             disponible: true,  roles: ['gerencia','admin_flota','ruteador'] },
   { href: '/confirmaciones', icon: '📞', titulo: 'Confirmaciones',     descripcion: 'Confirmar horarios con clientes',    disponible: true,  roles: ['gerencia','confirmador'] },
+  { href: '/abastecimiento', icon: '🏭', titulo: 'Abastecimiento',     descripcion: 'Transferencias entre sucursales',    disponible: true,  roles: ['gerencia','ruteador','deposito'] },
   { href: '/usuarios',       icon: '👥', titulo: 'Usuarios',            descripcion: 'Gestión de usuarios y permisos',    disponible: true,  roles: ['gerencia'] },
   { href: '/fin-del-dia',    icon: '🌙', titulo: 'Fin del día',         descripcion: 'Reprogramar pedidos no entregados',  disponible: true,  roles: ['gerencia','ruteador','admin_flota'] },
   { href: '/metricas',       icon: '📊', titulo: 'Métricas',            descripcion: 'Ocupación de flota y tiempos de ruta', disponible: true, roles: ['gerencia','ruteador','admin_flota'] },
@@ -89,6 +90,7 @@ export default function Dashboard() {
 
       if (userData?.rol === 'chofer') { router.push('/ruteo'); return }
       if (userData?.rol === 'confirmador') { router.push('/confirmaciones'); return }
+      if (userData?.rol === 'deposito') { router.push('/abastecimiento'); return }
 
       setUsuario(user)
       setRolUsuario(userData?.rol ?? '')

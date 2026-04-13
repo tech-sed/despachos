@@ -72,6 +72,7 @@ interface Foto {
 
 interface EditState {
   id: string; sucursal: string; peso: string; posiciones: string; estado_pago: string
+  fecha_entrega: string; vuelta: number
 }
 
 export default function PedidosPage() {
@@ -211,6 +212,8 @@ export default function PedidosPage() {
       peso: p.peso_total_kg != null ? String(p.peso_total_kg) : '',
       posiciones: p.volumen_total_m3 != null ? String(p.volumen_total_m3) : '',
       estado_pago: p.estado_pago ?? '',
+      fecha_entrega: p.fecha_entrega ?? '',
+      vuelta: p.vuelta ?? 1,
     })
   }
 
@@ -221,6 +224,8 @@ export default function PedidosPage() {
     if (editando.peso !== '') updates.peso_total_kg = Math.round(parseFloat(editando.peso) || 0)
     if (editando.posiciones !== '') updates.volumen_total_m3 = parseFloat(editando.posiciones) || 0
     if (editando.estado_pago !== '') updates.estado_pago = editando.estado_pago
+    if (editando.fecha_entrega !== '') updates.fecha_entrega = editando.fecha_entrega
+    updates.vuelta = editando.vuelta
 
     const res = await fetch('/api/pedidos', {
       method: 'PATCH',
@@ -237,6 +242,8 @@ export default function PedidosPage() {
         peso_total_kg: updates.peso_total_kg ?? p.peso_total_kg,
         volumen_total_m3: updates.volumen_total_m3 ?? p.volumen_total_m3,
         estado_pago: updates.estado_pago ?? p.estado_pago,
+        fecha_entrega: updates.fecha_entrega ?? p.fecha_entrega,
+        vuelta: updates.vuelta ?? p.vuelta,
       } : p))
       showToast('Pedido actualizado')
       setEditando(null)
@@ -295,6 +302,28 @@ export default function PedidosPage() {
                   onChange={e => setEditando(prev => prev ? { ...prev, posiciones: e.target.value } : prev)}
                   className="w-full border rounded-xl px-3 py-2 text-sm focus:outline-none"
                   style={{ borderColor: '#e8edf8' }} placeholder="ej: 4.5" />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>Fecha entrega</label>
+                  <input type="date" value={editando.fecha_entrega}
+                    onChange={e => setEditando(prev => prev ? { ...prev, fecha_entrega: e.target.value } : prev)}
+                    className="w-full border rounded-xl px-3 py-2 text-sm focus:outline-none"
+                    style={{ borderColor: '#e8edf8' }} />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>Vuelta</label>
+                  <select value={editando.vuelta}
+                    onChange={e => setEditando(prev => prev ? { ...prev, vuelta: parseInt(e.target.value) } : prev)}
+                    className="w-full border rounded-xl px-3 py-2 text-sm focus:outline-none"
+                    style={{ borderColor: '#e8edf8' }}>
+                    <option value={1}>V1 · 8–10h</option>
+                    <option value={2}>V2 · 10–12h</option>
+                    <option value={3}>V3 · 13–15h</option>
+                    <option value={4}>V4 · 15–17h</option>
+                    <option value={5}>Después de hora</option>
+                  </select>
+                </div>
               </div>
               <div>
                 <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>Estado de pago</label>

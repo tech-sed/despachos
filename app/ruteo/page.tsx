@@ -4,6 +4,7 @@ import { useEffect, useState, useRef } from 'react'
 import { supabase } from '../supabase'
 import { useRouter } from 'next/navigation'
 import { logAuditoria } from '../lib/auditoria'
+import type { jsPDF as JsPDFType } from 'jspdf'
 
 interface Pedido {
   id: string
@@ -460,6 +461,137 @@ export default function RuteoPage() {
       </body></html>`)
     win.document.close()
   }
+  const descargarPDF = async () => {
+    const { jsPDF } = await import('jspdf')
+    const doc: JsPDFType = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' })
+
+    const fechaStr = new Date(fecha + 'T12:00:00').toLocaleDateString('es-AR', {
+      weekday: 'long', day: '2-digit', month: 'long', year: 'numeric'
+    })
+
+    const azul: [number, number, number] = [37, 74, 150]
+    const gris: [number, number, number] = [100, 100, 100]
+    const blanco: [number, number, number] = [255, 255, 255]
+    const grisClaro: [number, number, number] = [245, 245, 245]
+
+    let y = 15
+    const margenIzq = 14
+    const ancho = 182
+
+    // ── Encabezado ──
+    doc.setFillColor(...azul)
+    doc.rect(margenIzq, y, ancho, 14, 'F')
+    doc.setTextColor(...blanco)
+    doc.setFontSize(13)
+    doc.setFont('helvetica', 'bold')
+    doc.text(`${camionSeleccionado} — Vuelta ${vueltaActiva} · ${VUELTA_LABEL[vueltaActiva!] ?? ''}`, margenIzq + 3, y + 9)
+    y += 16
+    doc.setTextColor(...gris)
+    doc.setFontSize(9)
+    doc.setFont('helvetica', 'normal')
+    doc.text(`${fechaStr} · ${pedidosVuelta.length} entregas`, margenIzq, y)
+    y += 8
+
+    // ── Detalle por entrega ──
+    doc.setTextColor(...azul)
+    doc.setFontSize(10)
+    doc.setFont('helvetica', 'bold')
+    doc.text('DETALLE POR ENTREGA', margenIzq, y)
+    doc.setDrawColor(...azul)
+    doc.line(margenIzq, y + 1.5, margenIzq + ancho, y + 1.5)
+    y += 6
+
+    pedidosVuelta.forEach((p, idx) => {
+      const items = p.items ?? []
+      const filas = items.length === 0 ? [['Sin items', '', '']] : items.map(i => [i.nombre, i.cantidad.toLocaleString('es-AR'), i.unidad])
+      const numEntrega = p.orden_entrega ?? idx + 1
+
+      // Estimar altura para page break
+      const alturaEstimada = 14 + filas.length * 6
+      if (y + alturaEstimada > 270) { doc.addPage(); y = 15 }
+
+      // Fila de cabecera del pedido
+      doc.setFillColor(...grisClaro)
+      doc.rect(margenIzq, y, ancho, 8, 'F')
+      doc.setTextColor(...azul)
+      doc.setFontSize(9)
+      doc.setFont('helvetica', 'bold')
+      doc.text(`${numEntrega}. ${p.cliente}`, margenIzq + 2, y + 5.5)
+      doc.setFont('helvetica', 'normal')
+      doc.setTextColor(...gris)
+      doc.setFontSize(8)
+      doc.text(`NV ${p.nv} · ${p.direccion ?? ''}`, margenIzq + 60, y + 5.5)
+      y += 8
+
+      // Filas de items
+      filas.forEach((fila, i) => {
+        doc.setFillColor(i % 2 === 0 ? 255 : 250, i % 2 === 0 ? 255 : 250, i % 2 === 0 ? 255 : 250)
+        doc.rect(margenIzq, y, ancho, 6, 'F')
+        doc.setTextColor(30, 30, 30)
+        doc.setFontSize(8.5)
+        doc.setFont('helvetica', 'normal')
+        doc.text(fila[0], margenIzq + 4, y + 4.2)
+        doc.setFont('helvetica', 'bold')
+        doc.setTextColor(...azul)
+        doc.text(fila[1], margenIzq + ancho - 20, y + 4.2, { align: 'right' })
+        doc.setFont('helvetica', 'normal')
+        doc.setTextColor(...gris)
+        doc.text(fila[2], margenIzq + ancho - 2, y + 4.2, { align: 'right' })
+        y += 6
+      })
+      y += 3
+    })
+
+    // ── Totales generales ──
+    const totales: Record<string, { nombre: string; cantidad: number; unidad: string }> = {}
+    pedidosVuelta.forEach(p => {
+      ;(p.items ?? []).forEach(item => {
+        if (!totales[item.nombre]) totales[item.nombre] = { nombre: item.nombre, cantidad: 0, unidad: item.unidad }
+        totales[item.nombre].cantidad += item.cantidad
+      })
+    })
+    const filasTotales = Object.values(totales).sort((a, b) => a.nombre.localeCompare(b.nombre))
+
+    if (filasTotales.length > 0) {
+      if (y + filasTotales.length * 6 + 20 > 270) { doc.addPage(); y = 15 }
+      y += 3
+      doc.setTextColor(...azul)
+      doc.setFontSize(10)
+      doc.setFont('helvetica', 'bold')
+      doc.text('MATERIALES A PREPARAR — TOTAL VUELTA', margenIzq, y)
+      doc.setDrawColor(...azul)
+      doc.line(margenIzq, y + 1.5, margenIzq + ancho, y + 1.5)
+      y += 6
+
+      // Cabecera tabla
+      doc.setFillColor(...azul)
+      doc.rect(margenIzq, y, ancho, 7, 'F')
+      doc.setTextColor(...blanco)
+      doc.setFontSize(8.5)
+      doc.text('Material', margenIzq + 3, y + 5)
+      doc.text('Cantidad', margenIzq + ancho - 25, y + 5, { align: 'right' })
+      doc.text('U.', margenIzq + ancho - 2, y + 5, { align: 'right' })
+      y += 7
+
+      filasTotales.forEach((t, i) => {
+        doc.setFillColor(i % 2 === 0 ? 255 : 250, i % 2 === 0 ? 255 : 250, i % 2 === 0 ? 255 : 250)
+        doc.rect(margenIzq, y, ancho, 6, 'F')
+        doc.setTextColor(30, 30, 30)
+        doc.setFont('helvetica', 'normal')
+        doc.text(t.nombre, margenIzq + 3, y + 4.2)
+        doc.setFont('helvetica', 'bold')
+        doc.setTextColor(...azul)
+        doc.text(t.cantidad.toLocaleString('es-AR'), margenIzq + ancho - 25, y + 4.2, { align: 'right' })
+        doc.setFont('helvetica', 'normal')
+        doc.setTextColor(...gris)
+        doc.text(t.unidad, margenIzq + ancho - 2, y + 4.2, { align: 'right' })
+        y += 6
+      })
+    }
+
+    doc.save(`${camionSeleccionado}_V${vueltaActiva}_${fecha}.pdf`)
+  }
+
   // Vuelta iniciada = al menos un pedido ya no está en "programado"
   const vueltaIniciada = vueltaActiva != null && vueltasIniciadas.has(vueltaActiva)
 
@@ -815,13 +947,20 @@ export default function RuteoPage() {
                   </div>
                 )}
 
-                {/* Botón imprimir hoja de vuelta */}
+                {/* Botones imprimir / descargar PDF */}
                 {datosUsuario?.rol !== 'chofer' && pedidosVuelta.length > 0 && (
-                  <button onClick={imprimirVuelta}
-                    className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-medium mb-4"
-                    style={{ background: '#f4f4f3', color: '#254A96', border: '1px solid #e8edf8' }}>
-                    🖨️ Imprimir hoja de armado — V{vueltaActiva}
-                  </button>
+                  <div className="flex gap-2 mb-4">
+                    <button onClick={imprimirVuelta}
+                      className="flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-medium"
+                      style={{ background: '#f4f4f3', color: '#254A96', border: '1px solid #e8edf8' }}>
+                      🖨️ Imprimir — V{vueltaActiva}
+                    </button>
+                    <button onClick={descargarPDF}
+                      className="flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-medium"
+                      style={{ background: '#e8edf8', color: '#254A96', border: '1px solid #254A96' }}>
+                      ⬇️ Descargar PDF
+                    </button>
+                  </div>
                 )}
 
                 {/* Botón recorrido completo */}

@@ -26,6 +26,7 @@ const VUELTAS = [
   { num: 2, label: 'V2', horario: '10:00–12:00' },
   { num: 3, label: 'V3', horario: '13:00–15:00' },
   { num: 4, label: 'V4', horario: '15:00–17:00' },
+  { num: 5, label: 'DHora', horario: 'Fuera de hora' },
 ]
 const PAGO_COLOR: Record<string, string> = {
   cobrado: 'bg-green-100 text-green-800', cuenta_corriente: 'bg-blue-100 text-blue-800',
@@ -38,11 +39,19 @@ const PAGO_LABEL: Record<string, string> = {
 function hoy() { return new Date().toISOString().split('T')[0] }
 
 // Hora de corte para cada vuelta: si ya pasó ese horario, la vuelta no está disponible para hoy
-const VUELTA_CORTE: Record<number, number> = { 1: 8, 2: 10, 3: 13, 4: 15 }
+// V4 y "después de hora" no tienen corte — siempre disponibles para emergencias
+const VUELTA_CORTE: Record<number, number> = { 1: 8, 2: 10, 3: 13 }
+const TODAS_VUELTAS = [
+  { num: 1, label: 'Vuelta 1 (8–10h)' },
+  { num: 2, label: 'Vuelta 2 (10–12h)' },
+  { num: 3, label: 'Vuelta 3 (13–15h)' },
+  { num: 4, label: 'Vuelta 4 (15–17h)' },
+  { num: 5, label: 'Después de hora' },
+]
 function vueltasDisponibles(fecha: string): number[] {
-  if (fecha !== hoy()) return [1, 2, 3, 4]
+  if (fecha !== hoy()) return TODAS_VUELTAS.map(v => v.num)
   const horaActual = new Date().getHours()
-  return [1, 2, 3, 4].filter(v => horaActual < VUELTA_CORTE[v])
+  return TODAS_VUELTAS.map(v => v.num).filter(v => !(v in VUELTA_CORTE) || horaActual < VUELTA_CORTE[v])
 }
 function pesoColumna(ps: Pedido[]) { return ps.reduce((a, p) => a + (p.peso_total_kg ?? 0), 0) }
 function posColumna(ps: Pedido[]) { return ps.reduce((a, p) => a + (p.volumen_total_m3 ?? 0), 0) }
@@ -269,11 +278,11 @@ function PedidoCard({ pedido, onDragStart, onCancelar, onCambiarVuelta, onReprog
               onMouseDown={e => e.stopPropagation()}
               className="w-full text-xs border rounded px-2 py-1.5 focus:outline-none"
               style={{ borderColor: '#e8edf8' }}>
-              {[1, 2, 3, 4].map(v => {
-                const disponible = vueltasDisponibles(reprogFecha).includes(v)
+              {TODAS_VUELTAS.map(({ num, label }) => {
+                const disponible = vueltasDisponibles(reprogFecha).includes(num)
                 return (
-                  <option key={v} value={v} disabled={!disponible}>
-                    Vuelta {v}{!disponible ? ' (pasada)' : ''}
+                  <option key={num} value={num} disabled={!disponible}>
+                    {label}{!disponible ? ' (pasada)' : ''}
                   </option>
                 )
               })}
@@ -1019,11 +1028,11 @@ function ProgramacionInner() {
                 <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>Nueva vuelta</label>
                 <select value={reprogVueltaNueva} onChange={e => setReprogVueltaNueva(parseInt(e.target.value))}
                   className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none" style={{ borderColor: '#e8edf8' }}>
-                  {[1, 2, 3, 4].map(v => {
-                    const disponible = vueltasDisponibles(reprogVueltaFecha).includes(v)
+                  {TODAS_VUELTAS.map(({ num, label }) => {
+                    const disponible = vueltasDisponibles(reprogVueltaFecha).includes(num)
                     return (
-                      <option key={v} value={v} disabled={!disponible}>
-                        Vuelta {v}{!disponible ? ' (pasada)' : ''}
+                      <option key={num} value={num} disabled={!disponible}>
+                        {label}{!disponible ? ' (pasada)' : ''}
                       </option>
                     )
                   })}

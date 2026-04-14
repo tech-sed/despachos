@@ -27,6 +27,8 @@ interface SoporteContacto {
   activo: boolean
 }
 
+const EMAILS_ADMIN_PERMISOS = ['joaquin.serna3@gmail.com', 'astaffieri@construyoalcosto.com']
+
 export default function UsuariosPage() {
   const router = useRouter()
   const [usuarios, setUsuarios] = useState<Usuario[]>([])
@@ -39,6 +41,7 @@ export default function UsuariosPage() {
   const [modalPermisos, setModalPermisos] = useState<Usuario | null>(null)
   const [permisosEdit, setPermisosEdit] = useState<Record<string, string>>({})
   const [guardandoPermisos, setGuardandoPermisos] = useState(false)
+  const [esAdminPermisos, setEsAdminPermisos] = useState(false)
 
   // Soporte técnico
   const [contactosSoporte, setContactosSoporte] = useState<SoporteContacto[]>([])
@@ -55,6 +58,7 @@ export default function UsuariosPage() {
       if (!user) { router.push('/'); return }
       const { data } = await supabase.from('usuarios').select('rol').eq('id', user.id).single()
       if (data?.rol !== 'gerencia') { router.push('/dashboard'); return }
+      setEsAdminPermisos(EMAILS_ADMIN_PERMISOS.includes(user.email ?? ''))
       cargarUsuarios()
       cargarSoporte()
     })
@@ -114,9 +118,13 @@ export default function UsuariosPage() {
   const guardarPermisos = async () => {
     if (!modalPermisos) return
     setGuardandoPermisos(true)
+    const { data: { session } } = await supabase.auth.getSession()
     const res = await fetch('/api/crear-usuario', {
       method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(session?.access_token ? { 'Authorization': `Bearer ${session.access_token}` } : {}),
+      },
       body: JSON.stringify({ id: modalPermisos.id, permisos: permisosEdit }),
     })
     const data = await res.json()
@@ -468,11 +476,13 @@ export default function UsuariosPage() {
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex items-center justify-end gap-2">
-                        <button onClick={() => abrirPermisos(u)}
-                          className="text-xs px-2 py-1 rounded-lg"
-                          style={{ background: '#fef3c7', color: '#d97706' }}>
-                          🔐 Permisos
-                        </button>
+                        {esAdminPermisos && (
+                          <button onClick={() => abrirPermisos(u)}
+                            className="text-xs px-2 py-1 rounded-lg"
+                            style={{ background: '#fef3c7', color: '#d97706' }}>
+                            🔐 Permisos
+                          </button>
+                        )}
                         <button onClick={() => abrirEditar(u)}
                           className="text-xs px-2 py-1 rounded-lg"
                           style={{ background: '#e8edf8', color: '#254A96' }}>

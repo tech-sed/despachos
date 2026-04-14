@@ -78,9 +78,20 @@ export async function PUT(req: NextRequest) {
   }
 }
 
-// PATCH - actualizar permisos de un usuario
+const EMAILS_ADMIN_PERMISOS = ['joaquin.serna3@gmail.com', 'astaffieri@construyoalcosto.com']
+
+// PATCH - actualizar permisos de un usuario (solo admins autorizados)
 export async function PATCH(req: NextRequest) {
   try {
+    // Verificar que el solicitante es un admin de permisos
+    const authHeader = req.headers.get('authorization')
+    if (authHeader) {
+      const token = authHeader.replace('Bearer ', '')
+      const { data: { user } } = await getAdmin().auth.getUser(token)
+      if (!user || !EMAILS_ADMIN_PERMISOS.includes(user.email ?? '')) {
+        return NextResponse.json({ error: 'No autorizado' }, { status: 403 })
+      }
+    }
     const { id, permisos } = await req.json()
     if (!id) return NextResponse.json({ error: 'Falta id' }, { status: 400 })
     const { error } = await getAdmin().from('usuarios').update({ permisos }).eq('id', id)

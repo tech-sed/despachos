@@ -61,6 +61,9 @@ export default function NuevoDespacho() {
   const [error, setError] = useState('')
   const [exito, setExito] = useState(false)
   const [cuposDisponibles, setCuposDisponibles] = useState<number[]>([])
+  const [vueltasSinCupoConFlota, setVueltasSinCupoConFlota] = useState<number[]>([])
+  const [maxCamionPosiciones, setMaxCamionPosiciones] = useState(0)
+  const [pedidoGrande, setPedidoGrande] = useState(false)
   const [verificando, setVerificando] = useState(false)
   const [productosNV, setProductosNV] = useState<any[]>([])
   const [pesoTotal, setPesoTotal] = useState(0)
@@ -143,6 +146,7 @@ export default function NuevoDespacho() {
   const verificarCupos = async () => {
     setVerificando(true)
     const disponibles: number[] = []
+    const sinCupoConFlota: number[] = []
 
     const { data: flotaData } = await supabase
       .from('flota_dia').select('camion_codigo')
@@ -152,6 +156,7 @@ export default function NuevoDespacho() {
 
     if (codigos.length === 0) {
       setCuposDisponibles([])
+      setVueltasSinCupoConFlota([])
       setVerificando(false)
       return
     }
@@ -160,13 +165,15 @@ export default function NuevoDespacho() {
       .from('camiones_flota').select('codigo, tonelaje_max_kg, posiciones_total').in('codigo', codigos)
     const camiones = camionesData ?? []
 
-    const pesoTotalFlota = camiones.reduce((a, c) => a + c.tonelaje_max_kg, 0)
-    const posTotalFlota = camiones.reduce((a, c) => a + c.posiciones_total, 0)
+    const pesoTotalFlota = camiones.reduce((a: number, c: any) => a + c.tonelaje_max_kg, 0)
+    const posTotalFlota = camiones.reduce((a: number, c: any) => a + c.posiciones_total, 0)
+    const maxPos = camiones.reduce((a: number, c: any) => Math.max(a, c.posiciones_total), 0)
+    setMaxCamionPosiciones(maxPos)
+
     const pesoNuevo = pesoTotal > 0 ? pesoTotal : 0
     const posNuevas = posicionesTotal > 0 ? posicionesTotal : 0
 
     for (const { vuelta } of FRANJAS) {
-      // Franja "tarde" (3) cubre V3 y V4 combinadas
       const vueltas = vuelta === 3 ? [3, 4] : [vuelta]
       let pesoUsado = 0; let posUsadas = 0
       for (const v of vueltas) {
@@ -185,10 +192,19 @@ export default function NuevoDespacho() {
       const capeOk = pesoNuevo === 0 && posNuevas === 0
         ? true
         : (pesoTotalFlota - pesoUsado) >= pesoNuevo && (posTotalFlota - posUsadas) >= posNuevas
-      if (ocupacionOk && capeOk) disponibles.push(vuelta)
+
+      if (ocupacionOk && capeOk) {
+        disponibles.push(vuelta)
+      } else {
+        // Sin cupo pero hay flota → se puede cargar como pedido grande
+        sinCupoConFlota.push(vuelta)
+      }
     }
 
     setCuposDisponibles(disponibles)
+    setVueltasSinCupoConFlota(sinCupoConFlota)
+    // Reset flag si cambia la selección
+    if (form.vuelta && disponibles.includes(parseInt(form.vuelta))) setPedidoGrande(false)
     setVerificando(false)
   }
 
@@ -287,7 +303,11 @@ export default function NuevoDespacho() {
       vendedor_id: userId,
       estado: 'pendiente',
       peso_total_kg: pesoTotal,
-      volumen_total_m3: posicionesTotal,
+      // Si es pedido grande, capear posiciones al máximo de un camión para reservar solo uno
+      volumen_total_m3: pedidoGrande && maxCamionPosiciones > 0
+        ? Math.max(posicionesTotal, maxCamionPosiciones)
+        : posicionesTotal,
+      pedido_grande: pedidoGrande || undefined,
       latitud: form.latitud,
       longitud: form.longitud,
     }).select('id').single()
@@ -598,15 +618,31 @@ export default function NuevoDespacho() {
                 </div>
                 <div>
                   <label className="block text-xs font-medium mb-1.5" style={{ color: '#254A96' }}>Franja horaria</label>
-                  <select name="vuelta" value={form.vuelta} onChange={handleChange} required
-                    className={inputClass} style={inputStyle} disabled={!form.fecha_entrega}>
+                  <select name="vuelta" value={form.vuelta}
+                    onChange={e => {
+                      handleChange(e)
+                      const v = parseInt(e.target.value)
+                      setPedidoGrande(vueltasSinCupoConFlota.includes(v))
+                    }}
+                    required className={inputClass} style={inputStyle} disabled={!form.fecha_entrega}>
                     <option value="">{!form.fecha_entrega ? 'Primero elegí la fecha' : verificando ? 'Verificando...' : 'Seleccionar'}</option>
-                    {FRANJAS.map(({ vuelta, label, horario }) => (
-                      cuposDisponibles.includes(vuelta)
-                        ? <option key={vuelta} value={vuelta}>{label} — {horario}</option>
-                        : <option key={vuelta} value={vuelta} disabled>{label} — Sin cupo</option>
-                    ))}
+                    {FRANJAS.map(({ vuelta, label, horario }) => {
+                      const tieneFlota = vueltasSinCupoConFlota.includes(vuelta)
+                      const disponible = cuposDisponibles.includes(vuelta)
+                      if (disponible) return <option key={vuelta} value={vuelta}>{label} — {horario}</option>
+                      if (tieneFlota) return <option key={vuelta} value={vuelta}>{label} — ⚠️ Sin cupo (cargar igual)</option>
+                      return <option key={vuelta} value={vuelta} disabled>{label} — Sin cupo</option>
+                    })}
                   </select>
+
+                  {/* Aviso pedido grande */}
+                  {pedidoGrande && (
+                    <div className="mt-2 rounded-xl px-4 py-3 text-xs leading-relaxed"
+                      style={{ background: '#fef3c7', border: '1px solid #fde68a', color: '#92400e' }}>
+                      <p className="font-semibold mb-1">⚠️ Este pedido supera el cupo disponible</p>
+                      <p>Se va a cargar como <strong>pedido grande</strong>. Se reservará un camión completo para esta vuelta y el programador deberá separarlo manualmente. El resto de los camiones queda disponible para otros pedidos.</p>
+                    </div>
+                  )}
                 </div>
               </div>
 

@@ -41,6 +41,7 @@ export default function Dashboard() {
   const [nombreUsuario, setNombreUsuario] = useState<string>('')
   const [stats, setStats] = useState({ pendientes: 0, hoy: 0, enCamino: 0, entregadosHoy: 0 })
   const [recientes, setRecientes] = useState<PedidoReciente[]>([])
+  const [pedidosGrandes, setPedidosGrandes] = useState(0)
   const [cargando, setCargando] = useState(true)
   const [verificando, setVerificando] = useState(true)
   const [modalPassword, setModalPassword] = useState(false)
@@ -145,15 +146,19 @@ export default function Dashboard() {
     const hoy = new Date().toISOString().split('T')[0]
     const filtrarPorVendedor = (q: any) => rol === 'comercial' ? q.eq('vendedor_id', userId) : q
 
-    const [{ count: p }, { count: h }, { count: e }, { count: ed }, { data: r }] = await Promise.all([
+    const manana = new Date(); manana.setDate(manana.getDate() + 1)
+    const mananaStr = manana.toISOString().split('T')[0]
+    const [{ count: p }, { count: h }, { count: e }, { count: ed }, { data: r }, { count: pg }] = await Promise.all([
       filtrarPorVendedor(supabase.from('pedidos').select('*', { count: 'exact', head: true }).eq('estado', 'pendiente')),
       filtrarPorVendedor(supabase.from('pedidos').select('*', { count: 'exact', head: true }).eq('fecha_entrega', hoy)),
       filtrarPorVendedor(supabase.from('pedidos').select('*', { count: 'exact', head: true }).eq('estado', 'en_camino')),
       filtrarPorVendedor(supabase.from('pedidos').select('*', { count: 'exact', head: true }).eq('estado', 'entregado').eq('fecha_entrega', hoy)),
       filtrarPorVendedor(supabase.from('pedidos').select('id,nv,cliente,sucursal,estado,fecha_entrega,vuelta').order('created_at', { ascending: false }).limit(10)),
+      supabase.from('pedidos').select('*', { count: 'exact', head: true }).eq('pedido_grande', true).eq('estado', 'pendiente').gte('fecha_entrega', hoy).lte('fecha_entrega', mananaStr),
     ])
     setStats({ pendientes: p || 0, hoy: h || 0, enCamino: e || 0, entregadosHoy: ed || 0 })
     setRecientes(r || [])
+    setPedidosGrandes(pg || 0)
     setCargando(false)
     setUltimaActualizacion(new Date())
   }
@@ -341,6 +346,12 @@ export default function Dashboard() {
                       <span className="font-semibold text-sm" style={{ color: '#254A96' }}>{card.titulo}</span>
                       {!card.disponible && (
                         <span className="text-xs px-1.5 py-0.5 rounded-full bg-gray-100" style={{ color: '#B9BBB7' }}>Próximamente</span>
+                      )}
+                      {card.href === '/programacion' && pedidosGrandes > 0 && (
+                        <span className="text-xs px-2 py-0.5 rounded-full font-semibold"
+                          style={{ background: '#fde68a', color: '#92400e' }}>
+                          ⚠️ {pedidosGrandes} pedido{pedidosGrandes !== 1 ? 's' : ''} grande{pedidosGrandes !== 1 ? 's' : ''}
+                        </span>
                       )}
                     </div>
                     <p className="text-xs mt-0.5" style={{ color: '#B9BBB7' }}>{card.descripcion}</p>

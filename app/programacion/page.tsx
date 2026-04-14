@@ -8,7 +8,7 @@ import { puedeEditar } from '@/app/lib/permisos'
 interface Pedido {
   id: string; nv: string; cliente: string; direccion: string; sucursal: string
   fecha_entrega: string; vuelta: number; estado: string; estado_pago: string; peso_total_kg: number | null
-  volumen_total_m3: number | null
+  volumen_total_m3: number | null; pedido_grande?: boolean
   notas: string | null; camion_id: string | null; orden_entrega: number | null
   latitud: number | null; longitud: number | null; barrio_cerrado?: boolean; prioridad?: boolean
   requiere_volcador?: boolean
@@ -216,7 +216,14 @@ function PedidoCard({ pedido, onDragStart, onCancelar, onCambiarVuelta, onReprog
   return (
     <div draggable onDragStart={e => onDragStart(e, pedido)}
       className="bg-white rounded-lg p-3 mb-2 cursor-grab active:cursor-grabbing select-none hover:shadow-md transition-shadow"
-      style={{ border: `1px solid ${esReprogramado ? '#fbbf24' : '#f0f0f0'}` }}>
+      style={{ border: `1px solid ${pedido.pedido_grande ? '#f59e0b' : esReprogramado ? '#fbbf24' : '#f0f0f0'}`,
+               background: pedido.pedido_grande ? '#fffbeb' : 'white' }}>
+      {pedido.pedido_grande && (
+        <div className="text-xs font-semibold mb-1.5 px-2 py-1 rounded-lg"
+          style={{ background: '#fde68a', color: '#92400e' }}>
+          ⚠️ Pedido grande — requiere separación
+        </div>
+      )}
       <div className="flex items-start justify-between gap-2 mb-1">
         <span className="font-semibold text-xs leading-tight" style={{ color: '#254A96' }}>{pedido.cliente}</span>
         <div className="flex items-center gap-1 shrink-0">
@@ -1142,6 +1149,23 @@ function ProgramacionInner() {
 
       {/* Kanban — ocupa todo el alto restante */}
       <div className="flex-1 overflow-hidden flex flex-col px-3 pt-2 pb-3">
+
+        {/* Banner pedidos grandes */}
+        {pedidos.some(p => p.pedido_grande) && (
+          <div className="mb-2 rounded-xl px-4 py-3 flex items-center gap-3"
+            style={{ background: '#fef3c7', border: '1px solid #fde68a', color: '#92400e' }}>
+            <span className="text-lg">⚠️</span>
+            <div className="flex-1">
+              <span className="font-semibold text-sm">
+                {pedidos.filter(p => p.pedido_grande).length === 1
+                  ? 'Hay 1 pedido grande que requiere separación manual'
+                  : `Hay ${pedidos.filter(p => p.pedido_grande).length} pedidos grandes que requieren separación manual`}
+              </span>
+              <span className="text-xs ml-2">— Usá "Separar pedido" en la tarjeta correspondiente</span>
+            </div>
+          </div>
+        )}
+
         {/* Banner overflow */}
         {overflowPedidos.length > 0 && (
           <div className="mb-4 rounded-xl p-4 flex items-center justify-between gap-4 flex-wrap"

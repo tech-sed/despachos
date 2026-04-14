@@ -129,15 +129,20 @@ function sugerirAsignacion(sin: Pedido[], camiones: Camion[], ya: Pedido[], sucu
 
     if (elegibles.length === 0) { asigs[p.id] = null; continue }
 
-    // Afinidad geográfica: preferir el camión cuyo centroide de pedidos esté más cerca
+    // Afinidad geográfica + agrupación por cliente
     let mejor: Camion | null = null
     let mejorScore = Infinity
 
     for (const c of elegibles) {
-      const yaAsignados = [
+      const todosPedidosCamion = [
         ...ya.filter(pp => pp.camion_id === c.codigo),
         ...Object.entries(asigs).filter(([, cod]) => cod === c.codigo).map(([id]) => sin.find(pp => pp.id === id)).filter(Boolean) as Pedido[],
-      ].filter(pp => pp.latitud && pp.longitud)
+      ]
+      const yaAsignados = todosPedidosCamion.filter(pp => pp.latitud && pp.longitud)
+
+      // Prioridad máxima: mismo cliente ya asignado a este camión
+      const mismoCliente = todosPedidosCamion.some(pp => pp.cliente === p.cliente)
+      if (mismoCliente) { mejor = c; break }
 
       let score: number
       if (p.latitud && p.longitud && yaAsignados.length > 0) {

@@ -108,10 +108,20 @@ export default function PedidosPage() {
   }
 
   const [puedeEditarPedidos, setPuedeEditarPedidos] = useState(false)
+  const [userEmail, setUserEmail] = useState('')
+
+  // Modal solicitar transferencia
+  const [modalTransfer, setModalTransfer] = useState<Pedido | null>(null)
+  const [transOrigen, setTransOrigen] = useState('')
+  const [transItems, setTransItems] = useState<{ nombre: string; cantidad: number; id_producto: number | null }[]>([])
+  const [transFecha, setTransFecha] = useState('')
+  const [transNotas, setTransNotas] = useState('')
+  const [transLoading, setTransLoading] = useState(false)
 
   useEffect(() => {
     supabase.auth.getUser().then(({ data: { user } }) => {
       if (!user) { router.push('/'); return }
+      setUserEmail(user.email ?? '')
       supabase.from('usuarios').select('rol, permisos').eq('id', user.id).single().then(({ data }) => {
         if (!tieneAcceso(data?.permisos, data?.rol, 'pedidos')) {
           router.push('/dashboard'); return
@@ -255,6 +265,55 @@ export default function PedidosPage() {
     setGuardando(false)
   }
 
+  function abrirTransferencia(p: Pedido) {
+    const items = itemsMap[p.id] ?? []
+    // Pre-cargar items del pedido (excluir Logística)
+    setTransItems(items
+      .filter(it => it.categoria !== 'Logística')
+      .map(it => ({ nombre: it.nombre, cantidad: it.cantidad, id_producto: it.material_id ?? null }))
+    )
+    setTransOrigen('')
+    setTransFecha(p.fecha_entrega ?? '')
+    setTransNotas('')
+    setModalTransfer(p)
+  }
+
+  async function confirmarTransferencia() {
+    if (!modalTransfer || !transOrigen) return
+    setTransLoading(true)
+    const itemsValidos = transItems.filter(it => it.nombre.trim() && it.cantidad > 0)
+    const res = await fetch('/api/requerimientos', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        tipo: 'pedido',
+        pedido_id: modalTransfer.id,
+        nv: modalTransfer.nv,
+        cliente: modalTransfer.cliente,
+        sucursal_origen: transOrigen,
+        sucursal_destino: modalTransfer.sucursal,
+        fecha_req: new Date().toISOString().split('T')[0],
+        fecha_solicitada: transFecha || null,
+        estado: 'pendiente',
+        solicitado_por: userEmail,
+        notas: transNotas || null,
+        items: itemsValidos.map(it => ({
+          nombre_producto: it.nombre,
+          cantidad_solicitada: it.cantidad,
+          id_producto: it.id_producto,
+        })),
+      }),
+    })
+    const data = await res.json()
+    setTransLoading(false)
+    if (data.error) {
+      showToast(`Error: ${data.error}`, 'err')
+    } else {
+      showToast(`Transferencia solicitada desde ${transOrigen} → ${modalTransfer.sucursal}`)
+      setModalTransfer(null)
+    }
+  }
+
   const COLS = 12 // número de columnas de la tabla para el colspan del detalle
 
   return (
@@ -349,6 +408,96 @@ export default function PedidosPage() {
                 {guardando ? 'Guardando...' : 'Guardar'}
               </button>
               <button onClick={() => setEditando(null)}
+                className="px-4 py-2.5 rounded-xl text-sm font-medium"
+                style={{ background: '#f4f4f3', color: '#666' }}>
+                Cancelar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal solicitar transferencia */}
+      {modalTransfer && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
+          <div className="bg-white rounded-2xl shadow-xl p-6 w-full max-w-lg max-h-[90vh] overflow-y-auto" style={{ fontFamily: 'Barlow, sans-serif' }}>
+            <h3 className="font-bold text-sm mb-1" style={{ color: '#254A96' }}>🔄 Solicitar transferencia</h3>
+            <p className="text-xs mb-4" style={{ color: '#B9BBB7' }}>
+              {modalTransfer.cliente} · NV {modalTransfer.nv} · destino <strong>{modalTransfer.sucursal}</strong>
+            </p>
+
+            <div className="space-y-4">
+              {/* Sucursal origen */}
+              <div>
+                <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>Transferir desde (origen) <span style={{ color: '#E52322' }}>*</span></label>
+                <select value={transOrigen} onChange={e => setTransOrigen(e.target.value)}
+                  className="w-full border rounded-xl px-3 py-2 text-sm focus:outline-none"
+                  style={{ borderColor: '#e8edf8' }}>
+                  <option value="">Seleccionar sucursal origen...</option>
+                  {SUCURSALES.filter(s => s !== modalTransfer.sucursal).map(s => (
+                    <option key={s} value={s}>{s}</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Fecha solicitada */}
+              <div>
+                <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>Fecha solicitada</label>
+                <input type="date" value={transFecha} onChange={e => setTransFecha(e.target.value)}
+                  className="w-full border rounded-xl px-3 py-2 text-sm focus:outline-none"
+                  style={{ borderColor: '#e8edf8' }} />
+              </div>
+
+              {/* Items */}
+              <div>
+                <label className="block text-xs font-medium mb-2" style={{ color: '#254A96' }}>Productos a transferir</label>
+                {transItems.length === 0 ? (
+                  <p className="text-xs px-3 py-2 rounded-lg" style={{ background: '#fef3c7', color: '#b45309' }}>
+                    ⚠️ Este pedido no tiene items registrados. Podés agregarlos manualmente.
+                  </p>
+                ) : (
+                  <div className="border rounded-xl overflow-hidden" style={{ borderColor: '#e8edf8' }}>
+                    {transItems.map((it, idx) => (
+                      <div key={idx} className="flex items-center gap-3 px-3 py-2 text-sm border-b last:border-0" style={{ borderColor: '#f4f4f3' }}>
+                        <span className="flex-1 text-xs" style={{ color: '#1a1a1a' }}>{it.nombre}</span>
+                        <input type="number" min={1} value={it.cantidad}
+                          onChange={e => {
+                            const upd = [...transItems]
+                            upd[idx] = { ...upd[idx], cantidad: parseInt(e.target.value) || 1 }
+                            setTransItems(upd)
+                          }}
+                          className="w-20 border rounded-lg px-2 py-1 text-xs text-right focus:outline-none"
+                          style={{ borderColor: '#e8edf8' }} />
+                        <button onClick={() => setTransItems(prev => prev.filter((_, i) => i !== idx))}
+                          className="text-xs px-1.5 py-1 rounded" style={{ color: '#E52322', background: '#fde8e8' }}>✕</button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <button onClick={() => setTransItems(prev => [...prev, { nombre: '', cantidad: 1, id_producto: null }])}
+                  className="mt-2 w-full py-1.5 text-xs rounded-lg border-dashed border"
+                  style={{ borderColor: '#e8edf8', color: '#B9BBB7' }}>
+                  + Agregar item
+                </button>
+              </div>
+
+              {/* Notas */}
+              <div>
+                <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>Notas</label>
+                <textarea value={transNotas} onChange={e => setTransNotas(e.target.value)} rows={2}
+                  className="w-full border rounded-xl px-3 py-2 text-sm focus:outline-none"
+                  style={{ borderColor: '#e8edf8' }}
+                  placeholder="Instrucciones, urgencia, etc." />
+              </div>
+            </div>
+
+            <div className="flex gap-2 mt-5">
+              <button onClick={confirmarTransferencia} disabled={transLoading || !transOrigen}
+                className="flex-1 py-2.5 rounded-xl text-sm font-semibold text-white disabled:opacity-40"
+                style={{ background: '#254A96' }}>
+                {transLoading ? 'Creando...' : '🔄 Crear requerimiento'}
+              </button>
+              <button onClick={() => setModalTransfer(null)}
                 className="px-4 py-2.5 rounded-xl text-sm font-medium"
                 style={{ background: '#f4f4f3', color: '#666' }}>
                 Cancelar
@@ -591,6 +740,18 @@ export default function PedidosPage() {
                                       })}
                                     </tbody>
                                   </table>
+                                )}
+
+                                {/* Acción transferencia */}
+                                {puedeEditarPedidos && p.tipo !== 'retiro' && (
+                                  <div className="px-4 py-3 border-t flex items-center gap-3" style={{ borderColor: '#e8edf8', background: '#f8faff' }}>
+                                    <button onClick={() => abrirTransferencia(p)}
+                                      className="px-4 py-2 text-xs font-semibold rounded-lg flex items-center gap-1.5"
+                                      style={{ background: '#e8edf8', color: '#254A96' }}>
+                                      🔄 Solicitar transferencia
+                                    </button>
+                                    <span className="text-xs" style={{ color: '#B9BBB7' }}>Genera un requerimiento en Abastecimiento para traer stock de otra sucursal</span>
+                                  </div>
                                 )}
 
                                 {/* Fotos de entrega */}

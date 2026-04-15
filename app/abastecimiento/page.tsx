@@ -411,13 +411,20 @@ export default function AbastecimientoPage() {
               <span className="text-xs ml-2" style={{ color: '#B9BBB7' }}>Transferencias entre sucursales</span>
             </div>
           </div>
-          {(rol === 'deposito' || rol === 'gerencia') && (
-            <button onClick={() => { setModalCrear(true); setItemsCrear([{ nombre_producto: '', cantidad_solicitada: 1, id_producto: null, _codigo: '', _encontrado: false, _noEncontrado: false }]) }}
-              className="px-4 py-2 text-sm font-semibold rounded-lg text-white"
-              style={{ background: '#0f766e' }}>
-              + Nuevo requerimiento
+          <div className="flex items-center gap-2">
+            {(rol === 'deposito' || rol === 'gerencia') && (
+              <button onClick={() => { setModalCrear(true); setItemsCrear([{ nombre_producto: '', cantidad_solicitada: 1, id_producto: null, _codigo: '', _encontrado: false, _noEncontrado: false }]) }}
+                className="px-4 py-2 text-sm font-semibold rounded-lg text-white"
+                style={{ background: '#0f766e' }}>
+                + Nuevo requerimiento
+              </button>
+            )}
+            <button onClick={() => { supabase.auth.signOut(); router.push('/') }}
+              className="px-3 py-1.5 text-sm font-medium rounded-lg"
+              style={{ color: '#666', background: '#f4f4f3' }}>
+              Salir
             </button>
-          )}
+          </div>
         </div>
         {/* Tabs */}
         <div className="flex px-4 md:px-6 border-t" style={{ borderColor: '#f0f0f0' }}>

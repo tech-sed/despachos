@@ -47,7 +47,7 @@ interface Pedido {
   id: string; nv: string; id_despacho: string | null; cliente: string; direccion: string
   sucursal: string; fecha_entrega: string; vuelta: number
   estado: string; estado_pago: string | null; peso_total_kg: number | null; volumen_total_m3: number | null
-  notas: string | null; camion_id: string | null; tipo?: string
+  notas: string | null; camion_id: string | null; tipo?: string; created_at?: string
 }
 
 const PAGO_COLOR: Record<string, { bg: string; text: string }> = {
@@ -138,7 +138,7 @@ export default function PedidosPage() {
     setExpandidos(new Set())
     let q = supabase
       .from('pedidos')
-      .select('id, nv, id_despacho, cliente, direccion, sucursal, fecha_entrega, vuelta, estado, estado_pago, peso_total_kg, volumen_total_m3, notas, camion_id, tipo', { count: 'exact' })
+      .select('id, nv, id_despacho, cliente, direccion, sucursal, fecha_entrega, vuelta, estado, estado_pago, peso_total_kg, volumen_total_m3, notas, camion_id, tipo, created_at', { count: 'exact' })
       .order('fecha_entrega', { ascending: false })
       .order('cliente')
       .limit(200)
@@ -314,7 +314,7 @@ export default function PedidosPage() {
     }
   }
 
-  const COLS = 12 // número de columnas de la tabla para el colspan del detalle
+  const COLS = 13 // número de columnas de la tabla para el colspan del detalle
 
   return (
     <div className="min-h-screen bg-gray-50" style={{ fontFamily: 'Barlow, sans-serif' }}>
@@ -585,6 +585,7 @@ export default function PedidosPage() {
                   <th className="text-left px-4 py-3 text-xs font-semibold" style={{ color: '#254A96' }}>Estado</th>
                   <th className="text-left px-4 py-3 text-xs font-semibold whitespace-nowrap" style={{ color: '#254A96' }}>Pago</th>
                   <th className="text-left px-4 py-3 text-xs font-semibold whitespace-nowrap" style={{ color: '#254A96' }}>Kg / Pos</th>
+                  <th className="text-left px-4 py-3 text-xs font-semibold whitespace-nowrap" style={{ color: '#254A96' }}>Cargado</th>
                   <th className="text-left px-4 py-3 text-xs font-semibold" style={{ color: '#254A96' }}>Productos</th>
                   <th className="px-4 py-3"></th>
                 </tr>
@@ -651,6 +652,17 @@ export default function PedidosPage() {
                         <td className="px-4 py-2.5 text-xs whitespace-nowrap" style={{ color: '#555' }}>
                           <div>{p.peso_total_kg != null ? `${p.peso_total_kg.toLocaleString('es-AR')} kg` : <span style={{ color: '#ccc' }}>—</span>}</div>
                           <div style={{ color: '#888' }}>{p.volumen_total_m3 != null ? `${p.volumen_total_m3} pos` : <span style={{ color: '#ccc' }}>—</span>}</div>
+                        </td>
+                        <td className="px-4 py-2.5 text-xs whitespace-nowrap" style={{ color: '#666' }}>
+                          {p.created_at ? (() => {
+                            const d = new Date(p.created_at)
+                            return (
+                              <div>
+                                <div>{d.toLocaleDateString('es-AR', { day: '2-digit', month: '2-digit' })}</div>
+                                <div style={{ color: '#B9BBB7' }}>{d.toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' })}</div>
+                              </div>
+                            )
+                          })() : <span style={{ color: '#ccc' }}>—</span>}
                         </td>
                         <td className="px-4 py-2.5">
                           <div className="flex flex-wrap gap-1">

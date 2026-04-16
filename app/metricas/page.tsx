@@ -189,18 +189,28 @@ export default function MetricasPage() {
     const camionMap: Record<string, any> = {}
     ;(camionesData ?? []).forEach((c: any) => { camionMap[c.codigo] = c })
 
-    let datos: DatosCamionDia[] = (flotaDia ?? []).map((f: any) => {
-      const camion = camionMap[f.camion_codigo]
+    // Index flota_dia by camion_codigo for fast lookup
+    const flotaDiaMap: Record<string, any> = {}
+    ;(flotaDia ?? []).forEach((f: any) => { flotaDiaMap[f.camion_codigo] = f })
+
+    // Build the set of camion codes to display:
+    // union of flota_dia entries AND camion_ids that have pedidos for this date.
+    // This ensures a truck with confirmed programming shows even if it has no flota_dia entry.
+    const camionCodigosSet = new Set<string>()
+    ;(flotaDia ?? []).forEach((f: any) => camionCodigosSet.add(f.camion_codigo))
+    ;(pedidosData ?? []).forEach((p: any) => { if (p.camion_id) camionCodigosSet.add(p.camion_id) })
+
+    const buildCamionData = (camionCodigo: string): DatosCamionDia | null => {
+      const camion = camionMap[camionCodigo]
       if (!camion) return null
       if (sucursal && camion.sucursal !== sucursal) return null
 
-      const pedidosCamion = (pedidosData ?? []).filter((p: any) => p.camion_id === f.camion_codigo)
+      const f = flotaDiaMap[camionCodigo] ?? null
+      const pedidosCamion = (pedidosData ?? []).filter((p: any) => p.camion_id === camionCodigo)
       const kgUsados = pedidosCamion.reduce((a: number, p: any) => a + (p.peso_total_kg ?? 0), 0)
       const posicionesUsadas = pedidosCamion.reduce((a: number, p: any) => a + (p.volumen_total_m3 ?? 0), 0)
-
       const depot = DEPOSITOS[camion.sucursal] ?? { lat: -34.9205, lng: -57.9536 }
 
-      // Desglose por vuelta
       const vueltasSet = [...new Set(pedidosCamion.map((p: any) => p.vuelta as number))].sort((a, b) => a - b)
       const vueltas: DatosVuelta[] = vueltasSet.map(v => {
         const pv = pedidosCamion.filter((p: any) => p.vuelta === v)
@@ -228,19 +238,17 @@ export default function MetricasPage() {
       })
 
       const distanciaTotalKm = calcularDistanciaRuta(pedidosCamion, depot)
-
-      // Capacidad diaria = capacidad por viaje × número de vueltas realizadas
       const numVueltas = vueltas.length || 1
       const capacidadKgDia = camion.tonelaje_max_kg * numVueltas
       const capacidadPosDia = camion.posiciones_total * numVueltas
 
       return {
-        camion_codigo: f.camion_codigo,
+        camion_codigo: camionCodigo,
         tipo_unidad: camion.tipo_unidad,
         sucursal: camion.sucursal,
         posiciones_total: camion.posiciones_total,
         tonelaje_max_kg: camion.tonelaje_max_kg,
-        chofer_nombre: f.chofer_id ? (choferMap[f.chofer_id] ?? 'Sin nombre') : 'Sin chofer',
+        chofer_nombre: f?.chofer_id ? (choferMap[f.chofer_id] ?? 'Sin nombre') : 'Sin chofer',
         posicionesUsadas,
         kgUsados,
         pedidos: pedidosCamion.length,
@@ -248,13 +256,17 @@ export default function MetricasPage() {
         pctKg: pct(kgUsados, capacidadKgDia),
         capacidadKgDia,
         capacidadPosDia,
-        hora_inicio: f.hora_inicio,
-        hora_fin: f.hora_fin,
-        km_ruta: f.km_ruta,
+        hora_inicio: f?.hora_inicio ?? null,
+        hora_fin: f?.hora_fin ?? null,
+        km_ruta: f?.km_ruta ?? null,
         vueltas,
         distanciaTotalKm,
       }
-    }).filter(Boolean) as DatosCamionDia[]
+    }
+
+    let datos: DatosCamionDia[] = [...camionCodigosSet]
+      .map(buildCamionData)
+      .filter(Boolean) as DatosCamionDia[]
 
     setDatosDia(datos.sort((a, b) => b.pctKg - a.pctKg))
     setLoading(false)

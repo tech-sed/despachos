@@ -100,6 +100,8 @@ interface DatosCamionDia {
   pedidos: number
   pctPos: number
   pctKg: number
+  capacidadKgDia: number
+  capacidadPosDia: number
   hora_inicio: string | null
   hora_fin: string | null
   km_ruta: number | null
@@ -206,6 +208,11 @@ export default function MetricasPage() {
 
       const distanciaTotalKm = calcularDistanciaRuta(pedidosCamion, depot)
 
+      // Capacidad diaria = capacidad por viaje × número de vueltas realizadas
+      const numVueltas = vueltas.length || 1
+      const capacidadKgDia = camion.tonelaje_max_kg * numVueltas
+      const capacidadPosDia = camion.posiciones_total * numVueltas
+
       return {
         camion_codigo: f.camion_codigo,
         tipo_unidad: camion.tipo_unidad,
@@ -216,8 +223,10 @@ export default function MetricasPage() {
         posicionesUsadas,
         kgUsados,
         pedidos: pedidosCamion.length,
-        pctPos: pct(posicionesUsadas, camion.posiciones_total),
-        pctKg: pct(kgUsados, camion.tonelaje_max_kg),
+        pctPos: pct(posicionesUsadas, capacidadPosDia),
+        pctKg: pct(kgUsados, capacidadKgDia),
+        capacidadKgDia,
+        capacidadPosDia,
         hora_inicio: f.hora_inicio,
         hora_fin: f.hora_fin,
         km_ruta: f.km_ruta,
@@ -376,6 +385,8 @@ export default function MetricasPage() {
 // ─── Vista Diaria ────────────────────────────────────────────────────────────────
 
 function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string }) {
+  const [filtroFlota, setFiltroFlota] = useState<'todos' | 'con_pedidos' | 'sin_pedidos'>('todos')
+
   if (datos.length === 0) return (
     <div className="flex flex-col items-center justify-center py-24" style={{ color: '#B9BBB7' }}>
       <div className="text-5xl mb-4">🚛</div>
@@ -384,17 +395,43 @@ function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string 
     </div>
   )
 
-  const totalPedidos = datos.reduce((a, d) => a + d.pedidos, 0)
-  const avgPctKg = datos.length > 0 ? Math.round(datos.reduce((a, d) => a + d.pctKg, 0) / datos.length) : 0
-  const avgPctPos = datos.length > 0 ? Math.round(datos.reduce((a, d) => a + d.pctPos, 0) / datos.length) : 0
-  const totalDistancia = datos.reduce((a, d) => a + d.distanciaTotalKm, 0)
+  const datosFiltrados = filtroFlota === 'con_pedidos' ? datos.filter(d => d.pedidos > 0)
+    : filtroFlota === 'sin_pedidos' ? datos.filter(d => d.pedidos === 0)
+    : datos
+
+  const totalPedidos = datosFiltrados.reduce((a, d) => a + d.pedidos, 0)
+  const avgPctKg = datosFiltrados.length > 0 ? Math.round(datosFiltrados.reduce((a, d) => a + d.pctKg, 0) / datosFiltrados.length) : 0
+  const avgPctPos = datosFiltrados.length > 0 ? Math.round(datosFiltrados.reduce((a, d) => a + d.pctPos, 0) / datosFiltrados.length) : 0
+  const totalDistancia = datosFiltrados.reduce((a, d) => a + d.distanciaTotalKm, 0)
+
+  const conPedidos = datos.filter(d => d.pedidos > 0).length
+  const sinPedidos = datos.filter(d => d.pedidos === 0).length
 
   return (
     <div className="space-y-4">
+
+      {/* Filtro con/sin pedidos */}
+      <div className="flex items-center gap-2">
+        {([
+          { key: 'todos', label: `Todos (${datos.length})` },
+          { key: 'con_pedidos', label: `Con pedidos (${conPedidos})` },
+          { key: 'sin_pedidos', label: `Sin pedidos (${sinPedidos})` },
+        ] as const).map(f => (
+          <button key={f.key} onClick={() => setFiltroFlota(f.key)}
+            className="px-3 py-1.5 rounded-lg text-xs font-semibold"
+            style={{
+              background: filtroFlota === f.key ? '#254A96' : '#f4f4f3',
+              color: filtroFlota === f.key ? 'white' : '#666',
+            }}>
+            {f.label}
+          </button>
+        ))}
+      </div>
+
       {/* Resumen */}
       <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-2">
         {[
-          { label: 'Camiones activos', value: datos.length, emoji: '🚛', bg: '#e8edf8', color: '#254A96' },
+          { label: 'Camiones', value: datosFiltrados.length, emoji: '🚛', bg: '#e8edf8', color: '#254A96' },
           { label: 'Total pedidos', value: totalPedidos, emoji: '📦', bg: '#f3e8ff', color: '#7c3aed' },
           { label: 'Ocup. prom. kg', value: `${avgPctKg}%`, emoji: '⚖️', bg: colorSemaforo(avgPctKg).bg, color: colorSemaforo(avgPctKg).color },
           { label: 'Ocup. prom. pos', value: `${avgPctPos}%`, emoji: '📐', bg: colorSemaforo(avgPctPos).bg, color: colorSemaforo(avgPctPos).color },
@@ -411,7 +448,7 @@ function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string 
       </div>
 
       {/* Cards por camión */}
-      {datos.map(d => {
+      {datosFiltrados.map(d => {
         const semaforo = colorSemaforo(Math.max(d.pctKg, d.pctPos))
         return (
           <div key={d.camion_codigo} className="bg-white rounded-xl shadow-sm overflow-hidden" style={{ border: '1px solid #f0f0f0' }}>
@@ -447,7 +484,10 @@ function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string 
                   <div className="w-full h-3 rounded-full" style={{ background: '#f0f0f0' }}>
                     <div className="h-3 rounded-full transition-all" style={{ width: `${Math.min(d.pctKg, 100)}%`, background: colorBarra(d.pctKg) }} />
                   </div>
-                  <p className="text-xs mt-1" style={{ color: '#B9BBB7' }}>{Math.round(d.kgUsados).toLocaleString('es-AR')} / {d.tonelaje_max_kg.toLocaleString('es-AR')} kg</p>
+                  <p className="text-xs mt-1" style={{ color: '#B9BBB7' }}>
+                    {Math.round(d.kgUsados).toLocaleString('es-AR')} / {d.capacidadKgDia.toLocaleString('es-AR')} kg
+                    {d.vueltas.length > 1 && <span style={{ color: '#254A96' }}> · {d.vueltas.length}×</span>}
+                  </p>
                 </div>
                 <div>
                   <div className="flex justify-between items-center mb-1">
@@ -457,7 +497,10 @@ function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string 
                   <div className="w-full h-3 rounded-full" style={{ background: '#f0f0f0' }}>
                     <div className="h-3 rounded-full transition-all" style={{ width: `${Math.min(d.pctPos, 100)}%`, background: colorBarra(d.pctPos) }} />
                   </div>
-                  <p className="text-xs mt-1" style={{ color: '#B9BBB7' }}>{Math.round(d.posicionesUsadas)} / {d.posiciones_total} pos</p>
+                  <p className="text-xs mt-1" style={{ color: '#B9BBB7' }}>
+                    {Math.round(d.posicionesUsadas)} / {d.capacidadPosDia} pos
+                    {d.vueltas.length > 1 && <span style={{ color: '#254A96' }}> · {d.vueltas.length}×</span>}
+                  </p>
                 </div>
               </div>
 

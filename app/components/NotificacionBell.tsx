@@ -68,34 +68,38 @@ export default function NotificacionBell() {
     if (loggedIn) cargar()
   }, [pathname])
 
-  if (!loggedIn || HIDDEN_PATHS.includes(pathname) || count === 0) return null
+  if (!loggedIn || HIDDEN_PATHS.includes(pathname)) return null
+
+  const hayNotificaciones = count > 0
 
   return (
     <div ref={ref} className="fixed z-[9999]" style={{ top: 10, right: 12 }}>
       {/* Bell button */}
       <button
         onClick={() => setOpen(o => !o)}
-        className="relative flex items-center justify-center rounded-xl shadow-lg"
+        className="relative flex items-center justify-center rounded-xl shadow-md"
         style={{
           width: 38, height: 38,
-          background: open ? '#1a3a7a' : '#254A96',
+          background: open ? '#1a3a7a' : hayNotificaciones ? '#254A96' : '#e8edf8',
           transition: 'background 0.15s',
         }}
-        title={`${count} pedido${count !== 1 ? 's' : ''} para hoy sin asignar`}
+        title={hayNotificaciones ? `${count} pedido${count !== 1 ? 's' : ''} para hoy sin asignar` : 'Sin pedidos pendientes para hoy'}
       >
-        <span style={{ fontSize: 17, lineHeight: 1 }}>🔔</span>
-        <span
-          className="absolute flex items-center justify-center rounded-full font-bold text-white"
-          style={{
-            top: -5, right: -5,
-            minWidth: 18, height: 18,
-            fontSize: 10,
-            padding: '0 4px',
-            background: '#E52322',
-          }}
-        >
-          {count > 9 ? '9+' : count}
-        </span>
+        <span style={{ fontSize: 17, lineHeight: 1, opacity: hayNotificaciones ? 1 : 0.45 }}>🔔</span>
+        {hayNotificaciones && (
+          <span
+            className="absolute flex items-center justify-center rounded-full font-bold text-white"
+            style={{
+              top: -5, right: -5,
+              minWidth: 18, height: 18,
+              fontSize: 10,
+              padding: '0 4px',
+              background: '#E52322',
+            }}
+          >
+            {count > 9 ? '9+' : count}
+          </span>
+        )}
       </button>
 
       {/* Dropdown */}
@@ -116,14 +120,21 @@ export default function NotificacionBell() {
             </div>
             <span
               className="text-xs font-semibold rounded-full px-2 py-0.5"
-              style={{ background: '#fde8e8', color: '#E52322' }}
+              style={hayNotificaciones
+                ? { background: '#fde8e8', color: '#E52322' }
+                : { background: '#d1fae5', color: '#065f46' }}
             >
-              {count} sin asignar
+              {hayNotificaciones ? `${count} sin asignar` : 'Al día ✓'}
             </span>
           </div>
 
           {/* List */}
           <div style={{ maxHeight: 200, overflowY: 'auto' }}>
+            {!hayNotificaciones && (
+              <p className="px-4 py-5 text-sm text-center" style={{ color: '#B9BBB7' }}>
+                No hay pedidos pendientes para hoy
+              </p>
+            )}
             {pedidos.map(p => (
               <div
                 key={p.id}

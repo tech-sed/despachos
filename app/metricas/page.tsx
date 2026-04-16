@@ -82,7 +82,7 @@ interface PedidoDetalle {
   nv: string
   cliente: string
   direccion: string
-  sucursal_destino: string
+  sucursal: string
   estado: string
   peso_total_kg: number
   volumen_total_m3: number
@@ -173,7 +173,7 @@ export default function MetricasPage() {
     const [{ data: flotaDia }, { data: pedidosData }, { data: camionesData }] = await Promise.all([
       supabase.from('flota_dia').select('camion_codigo, chofer_id, hora_inicio, hora_fin, km_ruta').eq('fecha', fecha).eq('activo', true),
       supabase.from('pedidos')
-        .select('id, nv, cliente, direccion, sucursal_destino, estado, camion_id, peso_total_kg, volumen_total_m3, vuelta, orden_entrega, latitud, longitud')
+        .select('id, nv, cliente, direccion, sucursal, estado, camion_id, peso_total_kg, volumen_total_m3, vuelta, orden_entrega, latitud, longitud')
         .eq('fecha_entrega', fecha).neq('estado', 'cancelado').not('camion_id', 'is', null),
       supabase.from('camiones_flota').select('codigo, tipo_unidad, sucursal, posiciones_total, tonelaje_max_kg'),
     ])
@@ -230,7 +230,7 @@ export default function MetricasPage() {
             .sort((a: any, b: any) => (a.orden_entrega ?? 999) - (b.orden_entrega ?? 999))
             .map((p: any) => ({
               id: p.id, nv: p.nv, cliente: p.cliente, direccion: p.direccion,
-              sucursal_destino: p.sucursal_destino, estado: p.estado,
+              sucursal: p.sucursal, estado: p.estado,
               peso_total_kg: p.peso_total_kg ?? 0, volumen_total_m3: p.volumen_total_m3 ?? 0,
               orden_entrega: p.orden_entrega,
             })),
@@ -677,7 +677,7 @@ function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string 
                           <p className="text-xs font-medium" style={{ color: '#1a1a1a' }}>{p.cliente}</p>
                           <p className="text-xs" style={{ color: '#B9BBB7' }}>{p.direccion}</p>
                         </td>
-                        <td className="px-4 py-2.5 text-xs whitespace-nowrap" style={{ color: '#B9BBB7' }}>{p.sucursal_destino}</td>
+                        <td className="px-4 py-2.5 text-xs whitespace-nowrap" style={{ color: '#B9BBB7' }}>{p.sucursal}</td>
                         <td className="px-4 py-2.5 text-xs whitespace-nowrap" style={{ color: '#1a1a1a' }}>
                           {Math.round(p.peso_total_kg).toLocaleString('es-AR')} kg
                         </td>

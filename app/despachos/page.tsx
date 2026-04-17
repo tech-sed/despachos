@@ -7,11 +7,24 @@ import { puedeEditar } from '../lib/permisos'
 
 // Franjas horarias para comerciales (se mapean a vueltas internas)
 // Franja 3 "tarde" cubre V3+V4 — el ruteador decide la vuelta exacta
+// cutoff: hora límite de carga (en minutos desde medianoche, sobre la fecha de entrega)
+//   V1 → día anterior 14:00 (se indica como offsetDias=-1, hora=14:00)
+//   V2 → mismo día 06:00 (4h antes de las 10:00)
+//   V3 → mismo día 09:00 (4h antes de las 13:00)
 const FRANJAS = [
-  { vuelta: 1, label: 'Primera hora', horario: '8:00 a 10:00hs' },
-  { vuelta: 2, label: 'Antes del mediodía', horario: '10:00 a 12:00hs' },
-  { vuelta: 3, label: 'Después del mediodía', horario: '13:00 a 17:00hs' },
+  { vuelta: 1, label: 'Primera hora',        horario: '8:00 a 10:00hs',  cutoffDiaOffset: -1, cutoffHora: 14, cutoffMin: 0 },
+  { vuelta: 2, label: 'Antes del mediodía',  horario: '10:00 a 12:00hs', cutoffDiaOffset:  0, cutoffHora:  6, cutoffMin: 0 },
+  { vuelta: 3, label: 'Después del mediodía',horario: '13:00 a 17:00hs', cutoffDiaOffset:  0, cutoffHora:  9, cutoffMin: 0 },
 ]
+
+// Devuelve true si el cutoff ya pasó (no se puede cargar más en esa franja)
+function vultaCerrada(fechaEntrega: string, franja: typeof FRANJAS[number]): boolean {
+  // Usamos hora local (Argentina, UTC-3) sin depender de timezone del servidor
+  const ahora = new Date()
+  const [anio, mes, dia] = fechaEntrega.split('-').map(Number)
+  const cutoff = new Date(anio, mes - 1, dia + franja.cutoffDiaOffset, franja.cutoffHora, franja.cutoffMin, 0)
+  return ahora >= cutoff
+}
 
 function detectarSucursal(sucursalObra: string, deposito: string): string {
   const obra = sucursalObra?.toUpperCase() || ''
@@ -62,6 +75,7 @@ export default function NuevoDespacho() {
   const [exito, setExito] = useState(false)
   const [cuposDisponibles, setCuposDisponibles] = useState<number[]>([])
   const [vueltasSinCupoConFlota, setVueltasSinCupoConFlota] = useState<number[]>([])
+  const [vueltasCerradas, setVueltasCerradas] = useState<number[]>([])
   const [maxCamionPosiciones, setMaxCamionPosiciones] = useState(0)
   const [pedidoGrande, setPedidoGrande] = useState(false)
   const [verificando, setVerificando] = useState(false)
@@ -116,7 +130,7 @@ export default function NuevoDespacho() {
 
   useEffect(() => {
     if (form.sucursal && form.fecha_entrega) verificarCupos()
-    else setCuposDisponibles([])
+    else { setCuposDisponibles([]); setVueltasCerradas([]) }
   }, [form.sucursal, form.fecha_entrega, pesoTotal, posicionesTotal])
 
   async function cargarMisPedidos() {
@@ -163,6 +177,10 @@ export default function NuevoDespacho() {
     const disponibles: number[] = []
     const sinCupoConFlota: number[] = []
 
+    // Calcular vueltas cerradas por horario
+    const cerradas = FRANJAS.filter(f => vultaCerrada(form.fecha_entrega, f)).map(f => f.vuelta)
+    setVueltasCerradas(cerradas)
+
     const { data: flotaData } = await supabase
       .from('flota_dia').select('camion_codigo')
       .eq('fecha', form.fecha_entrega).eq('sucursal', form.sucursal).eq('activo', true)
@@ -175,6 +193,7 @@ export default function NuevoDespacho() {
       setVerificando(false)
       return
     }
+
 
     const { data: camionesData } = await supabase
       .from('camiones_flota').select('codigo, tonelaje_max_kg, posiciones_total').in('codigo', codigos)
@@ -778,9 +797,12 @@ export default function NuevoDespacho() {
                     }}
                     required className={inputClass} style={inputStyle} disabled={!form.fecha_entrega}>
                     <option value="">{!form.fecha_entrega ? 'Primero elegí la fecha' : verificando ? 'Verificando...' : 'Seleccionar'}</option>
-                    {FRANJAS.map(({ vuelta, label, horario }) => {
+                    {FRANJAS.map((franja) => {
+                      const { vuelta, label, horario } = franja
+                      const cerrada = vueltasCerradas.includes(vuelta)
                       const tieneFlota = vueltasSinCupoConFlota.includes(vuelta)
                       const disponible = cuposDisponibles.includes(vuelta)
+                      if (cerrada) return <option key={vuelta} value={vuelta} disabled>{label} — ⛔ Fuera de horario</option>
                       if (disponible) return <option key={vuelta} value={vuelta}>{label} — {horario}</option>
                       if (tieneFlota) return <option key={vuelta} value={vuelta}>{label} — ⚠️ Sin cupo (cargar igual)</option>
                       return <option key={vuelta} value={vuelta} disabled>{label} — Sin cupo</option>

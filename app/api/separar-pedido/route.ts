@@ -93,6 +93,7 @@ export async function POST(req: NextRequest) {
       volumen_total_m3: totalesNuevo.posiciones || null,
       requiere_volcador: nuevoRequiereVolcador,
       notas: notaNuevo,
+      pedido_grande: false,
     }).select('id').single()
     if (errNuevo) return NextResponse.json({ error: errNuevo.message }, { status: 400 })
 
@@ -110,6 +111,7 @@ export async function POST(req: NextRequest) {
       volumen_total_m3: totalesMantener.posiciones || null,
       requiere_volcador: mantenerRequiereVolcador,
       notas: notaMantener,
+      pedido_grande: false,
     }).eq('id', pedido_id)
 
     return NextResponse.json({ success: true, tipo: 'separado', nuevo_id: nuevoPedido.id })

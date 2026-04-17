@@ -760,6 +760,7 @@ function ProgramacionInner() {
   const [reprogVueltaNueva, setReprogVueltaNueva] = useState(1)
   const [camionParaReprog, setCamionParaReprog] = useState<string | null>(null)
   const [overflowPedidos, setOverflowPedidos] = useState<Pedido[]>([])
+  const [bannerGrandeDismissed, setBannerGrandeDismissed] = useState(false)
 
   const showToast = (msg: string, tipo: 'ok' | 'err' = 'ok') => { setToast({ msg, tipo }); setTimeout(() => setToast(null), 3000) }
 
@@ -903,8 +904,8 @@ function ProgramacionInner() {
 
   async function handleEditarPeso(id: string, peso: number, posiciones: number) {
     try {
-      await patchPedido(id, { peso_total_kg: peso, volumen_total_m3: posiciones })
-      const act = pedidos.map(p => p.id === id ? { ...p, peso_total_kg: peso, volumen_total_m3: posiciones } : p)
+      await patchPedido(id, { peso_total_kg: peso, volumen_total_m3: posiciones, pedido_grande: false })
+      const act = pedidos.map(p => p.id === id ? { ...p, peso_total_kg: peso, volumen_total_m3: posiciones, pedido_grande: false } : p)
       setPedidos(act); construirColumnas(act, camiones)
       showToast('Peso y posiciones actualizados')
     } catch { showToast('Error al actualizar', 'err') }
@@ -1099,9 +1100,9 @@ function ProgramacionInner() {
               </div>
             </div>
             <div className="flex items-center gap-2 flex-wrap">
-              <input type="date" value={fecha} onChange={e => { setFecha(e.target.value); setConfirmado(false) }}
+              <input type="date" value={fecha} onChange={e => { setFecha(e.target.value); setConfirmado(false); setBannerGrandeDismissed(false) }}
                 className="border rounded-lg px-3 py-1.5 text-sm focus:outline-none" style={{ borderColor: '#e8edf8' }} />
-              <select value={sucursal} onChange={e => { setSucursal(e.target.value); setConfirmado(false) }}
+              <select value={sucursal} onChange={e => { setSucursal(e.target.value); setConfirmado(false); setBannerGrandeDismissed(false) }}
                 className="border rounded-lg px-3 py-1.5 text-sm focus:outline-none" style={{ borderColor: '#e8edf8' }}>
                 {SUCURSALES.map(s => <option key={s} value={s}>{s}</option>)}
               </select>
@@ -1159,7 +1160,7 @@ function ProgramacionInner() {
       <div className="flex-1 overflow-hidden flex flex-col px-3 pt-2 pb-3">
 
         {/* Banner pedidos grandes */}
-        {pedidos.some(p => p.pedido_grande) && (
+        {pedidos.some(p => p.pedido_grande) && !bannerGrandeDismissed && (
           <div className="mb-2 rounded-xl px-4 py-3 flex items-center gap-3"
             style={{ background: '#fef3c7', border: '1px solid #fde68a', color: '#92400e' }}>
             <span className="text-lg">⚠️</span>
@@ -1169,8 +1170,16 @@ function ProgramacionInner() {
                   ? 'Hay 1 pedido grande que requiere separación manual'
                   : `Hay ${pedidos.filter(p => p.pedido_grande).length} pedidos grandes que requieren separación manual`}
               </span>
-              <span className="text-xs ml-2">— Usá "Separar pedido" en la tarjeta correspondiente</span>
+              <span className="text-xs ml-2">— Usá "Separar pedido" o editá el peso en la tarjeta correspondiente</span>
             </div>
+            <button
+              onClick={() => setBannerGrandeDismissed(true)}
+              className="text-xs px-2 py-1 rounded-lg font-medium flex-shrink-0"
+              style={{ background: '#fde68a', color: '#92400e' }}
+              title="Descartar aviso"
+            >
+              ✕ Descartar
+            </button>
           </div>
         )}
 

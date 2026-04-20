@@ -195,6 +195,23 @@ export default function UsuariosPage() {
     }
   }
 
+  const resetSucursalComerciales = async () => {
+    const comerciales = usuarios.filter(u => u.rol === 'comercial' && u.sucursal !== null)
+    if (comerciales.length === 0) { showToast('Todos los comerciales ya tienen "Todas las sucursales"'); return }
+    if (!confirm(`¿Asignar "Todas las sucursales" a ${comerciales.length} comerciale${comerciales.length !== 1 ? 's' : ''}?`)) return
+    try {
+      await Promise.all(comerciales.map(u =>
+        fetch('/api/crear-usuario', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: u.id, emailAnterior: u.email, nombre: u.nombre, email: u.email, rol: u.rol, sucursal: '' }),
+        })
+      ))
+      showToast(`${comerciales.length} comercial${comerciales.length !== 1 ? 'es' : ''} actualizados`)
+      cargarUsuarios()
+    } catch { showToast('Error al actualizar', 'err') }
+  }
+
   const toggleActivo = async (u: Usuario) => {
     const nuevoEstado = !(u.activo !== false)  // undefined → true → false
     const accion = nuevoEstado ? 'activar' : 'inactivar'
@@ -425,6 +442,13 @@ export default function UsuariosPage() {
               className="text-xs px-3 py-1.5 rounded-lg border focus:outline-none w-52"
               style={{ borderColor: '#e8edf8', color: '#1a1a1a' }}
             />
+            {esAdminPermisos && usuarios.some(u => u.rol === 'comercial' && u.sucursal !== null) && (
+              <button onClick={resetSucursalComerciales}
+                className="text-xs px-3 py-1.5 rounded-lg font-medium border"
+                style={{ borderColor: '#fde68a', color: '#92400e', background: '#fef9c3' }}>
+                🏪 Comerciales → Todas las sucursales
+              </button>
+            )}
             <button onClick={exportarExcel}
               className="text-xs px-3 py-1.5 rounded-lg font-medium border"
               style={{ borderColor: '#e8edf8', color: '#254A96' }}>

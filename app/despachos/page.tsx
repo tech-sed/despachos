@@ -322,11 +322,8 @@ export default function NuevoDespacho() {
       await supabase.storage.from('solicitudes-despacho').upload(fileName, pdfFile)
     }
 
-    // Si la vuelta seleccionada ya cerró su horario → guardar en vuelta 5 (fuera de programación)
-    const franjaSeleccionada = FRANJAS.find(f => f.vuelta === parseInt(form.vuelta))
-    const vueltaFinal = franjaSeleccionada && vultaCerrada(form.fecha_entrega, franjaSeleccionada)
-      ? 5
-      : parseInt(form.vuelta)
+    // "fuera_prog" = pedido sin vuelta asignada, el ruteador la asigna después
+    const vueltaFinal = form.vuelta === 'fuera_prog' ? null : parseInt(form.vuelta)
 
     const { data: pedidoInsertado, error } = await supabase.from('pedidos').insert({
       nv: form.nv,
@@ -808,11 +805,12 @@ export default function NuevoDespacho() {
                       const cerrada = vueltasCerradas.includes(vuelta)
                       const tieneFlota = vueltasSinCupoConFlota.includes(vuelta)
                       const disponible = cuposDisponibles.includes(vuelta)
-                      if (cerrada) return <option key={vuelta} value={vuelta}>{label} — ⏰ Fuera de programación</option>
+                      if (cerrada) return <option key={vuelta} value={vuelta} disabled>{label} — ⛔ Fuera de horario</option>
                       if (disponible) return <option key={vuelta} value={vuelta}>{label} — {horario}</option>
                       if (tieneFlota) return <option key={vuelta} value={vuelta}>{label} — ⚠️ Sin cupo (cargar igual)</option>
                       return <option key={vuelta} value={vuelta} disabled>{label} — Sin cupo</option>
                     })}
+                    <option value="fuera_prog">Pedido fuera de programación</option>
                   </select>
 
                   {/* Aviso pedido grande */}
@@ -824,12 +822,12 @@ export default function NuevoDespacho() {
                     </div>
                   )}
 
-                  {/* Aviso fuera de programación */}
-                  {form.vuelta && vueltasCerradas.includes(parseInt(form.vuelta)) && (
+                  {/* Aviso pedido fuera de programación */}
+                  {form.vuelta === 'fuera_prog' && (
                     <div className="mt-2 rounded-xl px-4 py-3 text-xs leading-relaxed"
-                      style={{ background: '#fef3c7', border: '1px solid #fde68a', color: '#92400e' }}>
-                      <p className="font-semibold mb-1">⏰ Este pedido queda fuera de la programación</p>
-                      <p>El horario de carga para esta vuelta ya cerró. El pedido se va a guardar como <strong>Fuera de programación</strong> y el ruteador lo asignará a la vuelta que corresponda.</p>
+                      style={{ background: '#f0f4ff', border: '1px solid #c7d2fe', color: '#3730a3' }}>
+                      <p className="font-semibold mb-1">📋 Pedido fuera de programación</p>
+                      <p>El ruteador va a asignarle la vuelta y el camión que corresponda.</p>
                     </div>
                   )}
                 </div>

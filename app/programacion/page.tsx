@@ -23,12 +23,14 @@ interface ColumnaKanban { camion: Camion; pedidos: Pedido[]; pesoTotal: number; 
 
 const SUCURSALES = ['LP139', 'LP520', 'Guernica', 'Cañuelas', 'Pinamar']
 const VUELTAS = [
-  { num: 1, label: 'V1', horario: '8:00–10:00' },
-  { num: 2, label: 'V2', horario: '10:00–12:00' },
-  { num: 3, label: 'V3', horario: '13:00–15:00' },
-  { num: 4, label: 'V4', horario: '15:00–17:00' },
-  { num: 5, label: 'Fuera de prog.', horario: 'Después de hora' },
+  { num: 1,  label: 'V1',             horario: '8:00–10:00' },
+  { num: 2,  label: 'V2',             horario: '10:00–12:00' },
+  { num: 3,  label: 'V3',             horario: '13:00–15:00' },
+  { num: 4,  label: 'V4',             horario: '15:00–17:00' },
+  { num: 5,  label: 'DHora',          horario: 'Después de hora' },
+  { num: -1, label: 'Fuera de prog.', horario: '' },
 ]
+const VUELTA_FUERA = -1
 const PAGO_COLOR: Record<string, string> = {
   cobrado: 'bg-green-100 text-green-800', cuenta_corriente: 'bg-blue-100 text-blue-800',
   pendiente_cobro: 'bg-yellow-100 text-yellow-800', pago_en_obra: 'bg-orange-100 text-orange-800',
@@ -761,7 +763,7 @@ function ProgramacionInner() {
   const [camionParaReprog, setCamionParaReprog] = useState<string | null>(null)
   const [overflowPedidos, setOverflowPedidos] = useState<Pedido[]>([])
   const [bannerGrandeDismissed, setBannerGrandeDismissed] = useState(false)
-  const [contadorFueraProg, setContadorFueraProg] = useState(0)
+  const [contadorSinVuelta, setContadorSinVuelta] = useState(0)
 
   const showToast = (msg: string, tipo: 'ok' | 'err' = 'ok') => { setToast({ msg, tipo }); setTimeout(() => setToast(null), 3000) }
 
@@ -779,10 +781,12 @@ function ProgramacionInner() {
 
   async function cargarDatos() {
     setCargando(true); setConfirmado(false)
-    const { data: pd } = await supabase.from('pedidos')
+    let q = supabase.from('pedidos')
       .select('*, prioridad, barrio_cerrado')
-      .eq('fecha_entrega', fecha).eq('sucursal', sucursal).eq('vuelta', vueltaActiva)
+      .eq('fecha_entrega', fecha).eq('sucursal', sucursal)
       .in('estado', ['pendiente', 'programado']).order('cliente')
+    q = vueltaActiva === VUELTA_FUERA ? q.is('vuelta', null) : q.eq('vuelta', vueltaActiva)
+    const { data: pd } = await q
     const pedidosBase = pd ?? []
     // Fetch items via API (admin key, bypasses RLS)
     let todosConItems: Pedido[] = pedidosBase
@@ -814,12 +818,12 @@ function ProgramacionInner() {
     const { data: cd } = codigos.length > 0 ? await supabase.from('camiones_flota').select('*').in('codigo', codigos).eq('activo', true) : { data: [] }
     const cams = cd ?? []
 
-    // Contador de pedidos fuera de prog. sin asignar (vuelta 5, sin camion_id)
-    const { count: cFuera } = await supabase.from('pedidos')
+    // Contador de pedidos sin vuelta asignada (para badge del tab)
+    const { count: cSinVuelta } = await supabase.from('pedidos')
       .select('id', { count: 'exact', head: true })
-      .eq('fecha_entrega', fecha).eq('sucursal', sucursal).eq('vuelta', 5)
-      .is('camion_id', null).in('estado', ['pendiente', 'programado'])
-    setContadorFueraProg(cFuera ?? 0)
+      .eq('fecha_entrega', fecha).eq('sucursal', sucursal)
+      .is('vuelta', null).in('estado', ['pendiente', 'programado'])
+    setContadorSinVuelta(cSinVuelta ?? 0)
 
     setPedidos(todosConItems); setCamiones(cams); construirColumnas(todosConItems, cams); setCargando(false)
   }
@@ -909,6 +913,16 @@ function ProgramacionInner() {
     } finally {
       setGuardando(false)
     }
+  }
+
+  async function handleAsignarVuelta(id: string, vuelta: number) {
+    try {
+      await patchPedido(id, { vuelta, camion_id: null, orden_entrega: null })
+      const act = pedidos.filter(p => p.id !== id)
+      setPedidos(act); construirColumnas(act, camiones)
+      setContadorSinVuelta(prev => Math.max(0, prev - 1))
+      showToast(`Pedido asignado a ${vuelta === 5 ? 'DHora' : `V${vuelta}`}`)
+    } catch { showToast('Error al asignar vuelta', 'err') }
   }
 
   async function handleEditarPeso(id: string, peso: number, posiciones: number) {
@@ -1120,21 +1134,23 @@ function ProgramacionInner() {
           <div className="flex gap-1.5 pb-3 flex-wrap">
             {VUELTAS.map(v => {
               const activo = vueltaActiva === v.num
-              const esFuera = v.num === 5
+              const esFuera = v.num === VUELTA_FUERA
+              const badge = esFuera && contadorSinVuelta > 0
               return (
                 <button key={v.num} onClick={() => setVueltaActiva(v.num)}
-                  className="px-4 py-1.5 rounded-lg text-sm font-medium transition-colors flex flex-col items-start leading-tight"
+                  className="relative px-4 py-1.5 rounded-lg text-sm font-medium transition-colors"
                   style={{
-                    background: activo ? (esFuera ? '#92400e' : '#254A96') : (esFuera ? '#fef3c7' : '#f4f4f3'),
-                    color: activo ? 'white' : (esFuera ? '#92400e' : '#666'),
-                    border: esFuera && !activo ? '1px solid #fde68a' : '1px solid transparent',
+                    background: activo ? '#254A96' : '#f4f4f3',
+                    color: activo ? 'white' : '#666',
                   }}>
-                  <span>{v.label}</span>
-                  <span className="text-xs font-normal" style={{ opacity: activo ? 0.8 : 0.7 }}>
-                    {esFuera
-                      ? (contadorFueraProg > 0 ? `Sin asignar: ${contadorFueraProg}` : v.horario)
-                      : v.horario}
-                  </span>
+                  {v.label}
+                  {v.horario && <span className="text-xs opacity-70 ml-1">{v.horario}</span>}
+                  {badge && (
+                    <span className="absolute -top-1.5 -right-1.5 flex items-center justify-center rounded-full font-bold text-white"
+                      style={{ minWidth: 17, height: 17, fontSize: 9, padding: '0 3px', background: '#E52322' }}>
+                      {contadorSinVuelta}
+                    </span>
+                  )}
                 </button>
               )
             })}
@@ -1151,7 +1167,7 @@ function ProgramacionInner() {
             <span>Sin asignar: <strong style={{ color: totalSin > 0 ? '#E52322' : '#B9BBB7' }}>{totalSin}</strong></span>
           </div>
           <div className="flex items-center gap-2">
-            {puedeEditarProg && <>
+            {puedeEditarProg && vueltaActiva !== VUELTA_FUERA && <>
               <button onClick={() => { const l = pedidos.map(p => ({ ...p, camion_id: null })); setPedidos(l); construirColumnas(l, camiones); setConfirmado(false) }}
                 disabled={cargando || guardando}
                 className="px-3 py-2 text-sm rounded-lg border transition-colors disabled:opacity-40"
@@ -1240,7 +1256,51 @@ function ProgramacionInner() {
           <div className="flex flex-col items-center justify-center py-24" style={{ color: '#B9BBB7' }}>
             <div className="text-5xl mb-4">📦</div>
             <p className="font-medium">No hay pedidos para esta fecha y sucursal</p>
-            <p className="text-sm mt-1">Cambiá la fecha, la sucursal o la vuelta</p>
+            <p className="text-sm mt-1">
+              {vueltaActiva === VUELTA_FUERA ? 'No hay pedidos fuera de programación' : 'Cambiá la fecha, la sucursal o la vuelta'}
+            </p>
+          </div>
+        ) : vueltaActiva === VUELTA_FUERA ? (
+          /* ── Vista especial: pedidos sin vuelta asignada ── */
+          <div className="flex-1 overflow-y-auto p-4">
+            <div className="max-w-2xl mx-auto space-y-2">
+              <p className="text-xs mb-3 font-medium" style={{ color: '#B9BBB7' }}>
+                {pedidos.length} pedido{pedidos.length !== 1 ? 's' : ''} sin vuelta asignada — elegí a qué vuelta mandar cada uno
+              </p>
+              {pedidos.map(p => (
+                <div key={p.id} className="bg-white rounded-xl border px-4 py-3 flex items-center gap-4"
+                  style={{ borderColor: '#e8edf8' }}>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-semibold truncate" style={{ color: '#1a1a1a' }}>{p.cliente}</p>
+                    <p className="text-xs truncate" style={{ color: '#B9BBB7' }}>
+                      {p.nv && <span className="mr-2">NV {p.nv}</span>}
+                      {p.direccion}
+                    </p>
+                    {(p.peso_total_kg || p.volumen_total_m3) && (
+                      <p className="text-xs mt-0.5" style={{ color: '#B9BBB7' }}>
+                        {p.peso_total_kg ? `${(p.peso_total_kg / 1000).toFixed(2)} t` : ''}
+                        {p.peso_total_kg && p.volumen_total_m3 ? ' · ' : ''}
+                        {p.volumen_total_m3 ? `${p.volumen_total_m3} pos.` : ''}
+                      </p>
+                    )}
+                  </div>
+                  <div className="flex gap-1 shrink-0">
+                    {[1, 2, 3, 4].map(v => (
+                      <button key={v} onClick={() => handleAsignarVuelta(p.id, v)}
+                        className="px-2.5 py-1 rounded-lg text-xs font-semibold transition-colors"
+                        style={{ background: '#e8edf8', color: '#254A96' }}>
+                        V{v}
+                      </button>
+                    ))}
+                    <button onClick={() => handleAsignarVuelta(p.id, 5)}
+                      className="px-2.5 py-1 rounded-lg text-xs font-semibold transition-colors"
+                      style={{ background: '#f0f9ff', color: '#0369a1' }}>
+                      DHora
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
           </div>
         ) : camiones.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-24" style={{ color: '#B9BBB7' }}>

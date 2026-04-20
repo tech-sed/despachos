@@ -27,7 +27,7 @@ const VUELTAS = [
   { num: 2, label: 'V2', horario: '10:00–12:00' },
   { num: 3, label: 'V3', horario: '13:00–15:00' },
   { num: 4, label: 'V4', horario: '15:00–17:00' },
-  { num: 5, label: 'DHora', horario: 'Fuera de hora' },
+  { num: 5, label: 'Fuera de prog.', horario: 'Después de hora' },
 ]
 const PAGO_COLOR: Record<string, string> = {
   cobrado: 'bg-green-100 text-green-800', cuenta_corriente: 'bg-blue-100 text-blue-800',
@@ -761,6 +761,7 @@ function ProgramacionInner() {
   const [camionParaReprog, setCamionParaReprog] = useState<string | null>(null)
   const [overflowPedidos, setOverflowPedidos] = useState<Pedido[]>([])
   const [bannerGrandeDismissed, setBannerGrandeDismissed] = useState(false)
+  const [contadorFueraProg, setContadorFueraProg] = useState(0)
 
   const showToast = (msg: string, tipo: 'ok' | 'err' = 'ok') => { setToast({ msg, tipo }); setTimeout(() => setToast(null), 3000) }
 
@@ -812,6 +813,14 @@ function ProgramacionInner() {
     const codigos = (fd ?? []).map((f: any) => f.camion_codigo)
     const { data: cd } = codigos.length > 0 ? await supabase.from('camiones_flota').select('*').in('codigo', codigos).eq('activo', true) : { data: [] }
     const cams = cd ?? []
+
+    // Contador de pedidos fuera de prog. sin asignar (vuelta 5, sin camion_id)
+    const { count: cFuera } = await supabase.from('pedidos')
+      .select('id', { count: 'exact', head: true })
+      .eq('fecha_entrega', fecha).eq('sucursal', sucursal).eq('vuelta', 5)
+      .is('camion_id', null).in('estado', ['pendiente', 'programado'])
+    setContadorFueraProg(cFuera ?? 0)
+
     setPedidos(todosConItems); setCamiones(cams); construirColumnas(todosConItems, cams); setCargando(false)
   }
 
@@ -1109,13 +1118,26 @@ function ProgramacionInner() {
             </div>
           </div>
           <div className="flex gap-1.5 pb-3 flex-wrap">
-            {VUELTAS.map(v => (
-              <button key={v.num} onClick={() => setVueltaActiva(v.num)}
-                className="px-4 py-1.5 rounded-lg text-sm font-medium transition-colors"
-                style={{ background: vueltaActiva === v.num ? '#254A96' : '#f4f4f3', color: vueltaActiva === v.num ? 'white' : '#666' }}>
-                {v.label} <span className="text-xs opacity-70">{v.horario}</span>
-              </button>
-            ))}
+            {VUELTAS.map(v => {
+              const activo = vueltaActiva === v.num
+              const esFuera = v.num === 5
+              return (
+                <button key={v.num} onClick={() => setVueltaActiva(v.num)}
+                  className="px-4 py-1.5 rounded-lg text-sm font-medium transition-colors flex flex-col items-start leading-tight"
+                  style={{
+                    background: activo ? (esFuera ? '#92400e' : '#254A96') : (esFuera ? '#fef3c7' : '#f4f4f3'),
+                    color: activo ? 'white' : (esFuera ? '#92400e' : '#666'),
+                    border: esFuera && !activo ? '1px solid #fde68a' : '1px solid transparent',
+                  }}>
+                  <span>{v.label}</span>
+                  <span className="text-xs font-normal" style={{ opacity: activo ? 0.8 : 0.7 }}>
+                    {esFuera
+                      ? (contadorFueraProg > 0 ? `Sin asignar: ${contadorFueraProg}` : v.horario)
+                      : v.horario}
+                  </span>
+                </button>
+              )
+            })}
           </div>
         </div>
       </nav>

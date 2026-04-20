@@ -322,6 +322,12 @@ export default function NuevoDespacho() {
       await supabase.storage.from('solicitudes-despacho').upload(fileName, pdfFile)
     }
 
+    // Si la vuelta seleccionada ya cerró su horario → guardar en vuelta 5 (fuera de programación)
+    const franjaSeleccionada = FRANJAS.find(f => f.vuelta === parseInt(form.vuelta))
+    const vueltaFinal = franjaSeleccionada && vultaCerrada(form.fecha_entrega, franjaSeleccionada)
+      ? 5
+      : parseInt(form.vuelta)
+
     const { data: pedidoInsertado, error } = await supabase.from('pedidos').insert({
       nv: form.nv,
       id_despacho: form.id_despacho,
@@ -330,7 +336,7 @@ export default function NuevoDespacho() {
       direccion: form.direccion,
       sucursal: form.sucursal,
       fecha_entrega: form.fecha_entrega,
-      vuelta: parseInt(form.vuelta),
+      vuelta: vueltaFinal,
       estado_pago: form.estado_pago,
       barrio_cerrado: form.barrio_cerrado,
       notas: form.notas,
@@ -802,7 +808,7 @@ export default function NuevoDespacho() {
                       const cerrada = vueltasCerradas.includes(vuelta)
                       const tieneFlota = vueltasSinCupoConFlota.includes(vuelta)
                       const disponible = cuposDisponibles.includes(vuelta)
-                      if (cerrada) return <option key={vuelta} value={vuelta} disabled>{label} — ⛔ Fuera de horario</option>
+                      if (cerrada) return <option key={vuelta} value={vuelta}>{label} — ⏰ Fuera de programación</option>
                       if (disponible) return <option key={vuelta} value={vuelta}>{label} — {horario}</option>
                       if (tieneFlota) return <option key={vuelta} value={vuelta}>{label} — ⚠️ Sin cupo (cargar igual)</option>
                       return <option key={vuelta} value={vuelta} disabled>{label} — Sin cupo</option>
@@ -815,6 +821,15 @@ export default function NuevoDespacho() {
                       style={{ background: '#fef3c7', border: '1px solid #fde68a', color: '#92400e' }}>
                       <p className="font-semibold mb-1">⚠️ Este pedido supera el cupo disponible</p>
                       <p>Se va a cargar como <strong>pedido grande</strong>. Se reservará un camión completo para esta vuelta y el programador deberá separarlo manualmente. El resto de los camiones queda disponible para otros pedidos.</p>
+                    </div>
+                  )}
+
+                  {/* Aviso fuera de programación */}
+                  {form.vuelta && vueltasCerradas.includes(parseInt(form.vuelta)) && (
+                    <div className="mt-2 rounded-xl px-4 py-3 text-xs leading-relaxed"
+                      style={{ background: '#fef3c7', border: '1px solid #fde68a', color: '#92400e' }}>
+                      <p className="font-semibold mb-1">⏰ Este pedido queda fuera de la programación</p>
+                      <p>El horario de carga para esta vuelta ya cerró. El pedido se va a guardar como <strong>Fuera de programación</strong> y el ruteador lo asignará a la vuelta que corresponda.</p>
                     </div>
                   )}
                 </div>

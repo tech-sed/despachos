@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useMemo } from 'react'
 import { supabase } from '../supabase'
 import { useRouter } from 'next/navigation'
 import { puedeEditar, tieneAcceso } from '../lib/permisos'
@@ -114,6 +114,41 @@ export default function PedidosPage() {
   // Modal revertir entrega
   const [modalRevertir, setModalRevertir] = useState<Pedido | null>(null)
   const [revertiendo, setRevertiendo] = useState(false)
+
+  // Ordenamiento de columnas
+  const [sortCol, setSortCol] = useState<string>('fecha_entrega')
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc')
+
+  function toggleSort(col: string) {
+    if (sortCol === col) {
+      setSortDir(d => d === 'asc' ? 'desc' : 'asc')
+    } else {
+      setSortCol(col)
+      setSortDir('asc')
+    }
+  }
+
+  const pedidosOrdenados = useMemo(() => {
+    return [...pedidos].sort((a, b) => {
+      let va: any, vb: any
+      switch (sortCol) {
+        case 'nv':           va = a.nv ?? '';                 vb = b.nv ?? '';                 break
+        case 'cliente':      va = a.cliente ?? '';            vb = b.cliente ?? '';            break
+        case 'direccion':    va = a.direccion ?? '';          vb = b.direccion ?? '';          break
+        case 'fecha_entrega':va = a.fecha_entrega ?? '';      vb = b.fecha_entrega ?? '';      break
+        case 'vuelta':       va = a.vuelta ?? 0;              vb = b.vuelta ?? 0;              break
+        case 'sucursal':     va = a.sucursal ?? '';           vb = b.sucursal ?? '';           break
+        case 'estado':       va = a.estado ?? '';             vb = b.estado ?? '';             break
+        case 'estado_pago':  va = a.estado_pago ?? '';        vb = b.estado_pago ?? '';        break
+        case 'peso':         va = a.peso_total_kg ?? -1;      vb = b.peso_total_kg ?? -1;      break
+        case 'created_at':   va = a.created_at ?? '';         vb = b.created_at ?? '';         break
+        default:             return 0
+      }
+      if (va < vb) return sortDir === 'asc' ? -1 : 1
+      if (va > vb) return sortDir === 'asc' ? 1 : -1
+      return 0
+    })
+  }, [pedidos, sortCol, sortDir])
 
   // Modal solicitar transferencia
   const [modalTransfer, setModalTransfer] = useState<Pedido | null>(null)
@@ -645,26 +680,40 @@ export default function PedidosPage() {
               <thead>
                 <tr style={{ background: '#f4f4f3', borderBottom: '1px solid #e8edf8' }}>
                   <th className="w-8 px-3 py-3"></th>
-                  <th className="text-left px-4 py-3 text-xs font-semibold whitespace-nowrap" style={{ color: '#254A96' }}>NV / SD</th>
-                  <th className="text-left px-4 py-3 text-xs font-semibold" style={{ color: '#254A96' }}>Cliente</th>
-                  <th className="text-left px-4 py-3 text-xs font-semibold" style={{ color: '#254A96' }}>Dirección</th>
-                  <th className="text-left px-4 py-3 text-xs font-semibold whitespace-nowrap" style={{ color: '#254A96' }}>Fecha</th>
-                  <th className="text-left px-4 py-3 text-xs font-semibold" style={{ color: '#254A96' }}>V.</th>
-                  <th className="text-left px-4 py-3 text-xs font-semibold" style={{ color: '#254A96' }}>Sucursal</th>
-                  <th className="text-left px-4 py-3 text-xs font-semibold" style={{ color: '#254A96' }}>Estado</th>
-                  <th className="text-left px-4 py-3 text-xs font-semibold whitespace-nowrap" style={{ color: '#254A96' }}>Pago</th>
-                  <th className="text-left px-4 py-3 text-xs font-semibold whitespace-nowrap" style={{ color: '#254A96' }}>Kg / Pos</th>
-                  <th className="text-left px-4 py-3 text-xs font-semibold whitespace-nowrap" style={{ color: '#254A96' }}>Cargado</th>
+                  {([
+                    { col: 'nv',           label: 'NV / SD',   extra: 'whitespace-nowrap' },
+                    { col: 'cliente',      label: 'Cliente',   extra: '' },
+                    { col: 'direccion',    label: 'Dirección', extra: '' },
+                    { col: 'fecha_entrega',label: 'Fecha',     extra: 'whitespace-nowrap' },
+                    { col: 'vuelta',       label: 'V.',        extra: '' },
+                    { col: 'sucursal',     label: 'Sucursal',  extra: '' },
+                    { col: 'estado',       label: 'Estado',    extra: '' },
+                    { col: 'estado_pago',  label: 'Pago',      extra: 'whitespace-nowrap' },
+                    { col: 'peso',         label: 'Kg / Pos',  extra: 'whitespace-nowrap' },
+                    { col: 'created_at',   label: 'Cargado',   extra: 'whitespace-nowrap' },
+                  ] as { col: string; label: string; extra: string }[]).map(({ col, label, extra }) => (
+                    <th key={col}
+                      onClick={() => toggleSort(col)}
+                      className={`text-left px-4 py-3 text-xs font-semibold cursor-pointer select-none ${extra}`}
+                      style={{ color: '#254A96' }}>
+                      <span className="flex items-center gap-1 whitespace-nowrap">
+                        {label}
+                        <span className="text-xs leading-none" style={{ color: sortCol === col ? '#254A96' : '#ccc' }}>
+                          {sortCol === col ? (sortDir === 'asc' ? '↑' : '↓') : '↕'}
+                        </span>
+                      </span>
+                    </th>
+                  ))}
                   <th className="text-left px-4 py-3 text-xs font-semibold" style={{ color: '#254A96' }}>Productos</th>
                   <th className="px-4 py-3"></th>
                 </tr>
               </thead>
               <tbody>
-                {pedidos.map((p, i) => {
+                {pedidosOrdenados.map((p, i) => {
                   const cats = categoriasMap[p.id]
                   const items = itemsMap[p.id]
                   const expandido = expandidos.has(p.id)
-                  const borderColor = i < pedidos.length - 1 || expandido ? '1px solid #f4f4f3' : 'none'
+                  const borderColor = i < pedidosOrdenados.length - 1 || expandido ? '1px solid #f4f4f3' : 'none'
                   return (
                     <>
                       <tr key={p.id} style={{ borderBottom: expandido ? 'none' : borderColor }}

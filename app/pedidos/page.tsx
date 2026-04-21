@@ -48,6 +48,7 @@ interface Pedido {
   sucursal: string; fecha_entrega: string; vuelta: number
   estado: string; estado_pago: string | null; peso_total_kg: number | null; volumen_total_m3: number | null
   notas: string | null; camion_id: string | null; tipo?: string; created_at?: string
+  vendedor_id?: string | null
 }
 
 const PAGO_COLOR: Record<string, { bg: string; text: string }> = {
@@ -86,6 +87,7 @@ export default function PedidosPage() {
   const [categoriasMap, setCategoriasMap] = useState<Record<string, { label: string; tipo: string }[]>>({})
   const [itemsMap, setItemsMap] = useState<Record<string, Item[]>>({})
   const [fotosMap, setFotosMap] = useState<Record<string, Foto[]>>({})
+  const [vendedoresMap, setVendedoresMap] = useState<Record<string, string>>({}) // vendedor_id → nombre
 
   // Filas expandidas (múltiples a la vez)
   const [expandidos, setExpandidos] = useState<Set<string>>(new Set())
@@ -142,13 +144,14 @@ export default function PedidosPage() {
         case 'estado_pago':  va = a.estado_pago ?? '';        vb = b.estado_pago ?? '';        break
         case 'peso':         va = a.peso_total_kg ?? -1;      vb = b.peso_total_kg ?? -1;      break
         case 'created_at':   va = a.created_at ?? '';         vb = b.created_at ?? '';         break
+        case 'vendedor':     va = vendedoresMap[a.vendedor_id ?? ''] ?? ''; vb = vendedoresMap[b.vendedor_id ?? ''] ?? ''; break
         default:             return 0
       }
       if (va < vb) return sortDir === 'asc' ? -1 : 1
       if (va > vb) return sortDir === 'asc' ? 1 : -1
       return 0
     })
-  }, [pedidos, sortCol, sortDir])
+  }, [pedidos, sortCol, sortDir, vendedoresMap])
 
   // Modal solicitar transferencia
   const [modalTransfer, setModalTransfer] = useState<Pedido | null>(null)
@@ -180,7 +183,7 @@ export default function PedidosPage() {
     setExpandidos(new Set())
     let q = supabase
       .from('pedidos')
-      .select('id, nv, id_despacho, cliente, direccion, sucursal, fecha_entrega, vuelta, estado, estado_pago, peso_total_kg, volumen_total_m3, notas, camion_id, tipo, created_at', { count: 'exact' })
+      .select('id, nv, id_despacho, cliente, direccion, sucursal, fecha_entrega, vuelta, estado, estado_pago, peso_total_kg, volumen_total_m3, notas, camion_id, tipo, created_at, vendedor_id', { count: 'exact' })
       .order('fecha_entrega', { ascending: false })
       .order('cliente')
       .limit(200)
@@ -201,7 +204,18 @@ export default function PedidosPage() {
     setTotal(count ?? 0)
     setCargando(false)
 
-    if (pedidosList.length > 0) cargarDetalle(pedidosList.map(p => p.id))
+    if (pedidosList.length > 0) {
+      cargarDetalle(pedidosList.map(p => p.id))
+      // Fetch vendedor names for unique vendedor_ids
+      const vendedorIds = [...new Set(pedidosList.map(p => p.vendedor_id).filter(Boolean))] as string[]
+      if (vendedorIds.length > 0) {
+        const { data: vData } = await supabase
+          .from('usuarios').select('id, nombre').in('id', vendedorIds)
+        const map: Record<string, string> = {}
+        for (const v of vData ?? []) map[v.id] = v.nombre
+        setVendedoresMap(map)
+      }
+    }
   }
 
   async function cargarDetalle(ids: string[]) {
@@ -385,7 +399,7 @@ export default function PedidosPage() {
     setRevertiendo(false)
   }
 
-  const COLS = 13 // número de columnas de la tabla para el colspan del detalle
+  const COLS = 14 // número de columnas de la tabla para el colspan del detalle
 
   return (
     <div className="min-h-screen bg-gray-50" style={{ fontFamily: 'Barlow, sans-serif' }}>
@@ -691,6 +705,7 @@ export default function PedidosPage() {
                     { col: 'estado_pago',  label: 'Pago',      extra: 'whitespace-nowrap' },
                     { col: 'peso',         label: 'Kg / Pos',  extra: 'whitespace-nowrap' },
                     { col: 'created_at',   label: 'Cargado',   extra: 'whitespace-nowrap' },
+                    { col: 'vendedor',     label: 'Por',       extra: 'whitespace-nowrap' },
                   ] as { col: string; label: string; extra: string }[]).map(({ col, label, extra }) => (
                     <th key={col}
                       onClick={() => toggleSort(col)}
@@ -781,6 +796,11 @@ export default function PedidosPage() {
                               </div>
                             )
                           })() : <span style={{ color: '#ccc' }}>—</span>}
+                        </td>
+                        <td className="px-4 py-2.5 text-xs whitespace-nowrap" style={{ color: '#555', maxWidth: 120 }}>
+                          {p.vendedor_id
+                            ? <span className="truncate block" style={{ maxWidth: 110 }}>{vendedoresMap[p.vendedor_id] ?? '—'}</span>
+                            : <span style={{ color: '#ccc' }}>—</span>}
                         </td>
                         <td className="px-4 py-2.5">
                           <div className="flex flex-wrap gap-1">

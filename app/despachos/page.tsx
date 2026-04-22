@@ -183,6 +183,12 @@ export default function NuevoDespacho() {
     // Si todas las vueltas cerraron, auto-seleccionar "fuera de programación"
     if (cerradas.length === FRANJAS.length) {
       setForm(prev => ({ ...prev, vuelta: 'fuera_prog' }))
+    } else if (form.vuelta && form.vuelta !== 'fuera_prog') {
+      // Si la vuelta ya seleccionada quedó cerrada, resetearla
+      const vueltaSeleccionada = parseInt(form.vuelta)
+      if (!isNaN(vueltaSeleccionada) && cerradas.includes(vueltaSeleccionada)) {
+        setForm(prev => ({ ...prev, vuelta: '' }))
+      }
     }
 
     const { data: flotaData } = await supabase
@@ -317,6 +323,17 @@ export default function NuevoDespacho() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault(); setLoading(true); setError('')
+
+    // Validar que la vuelta seleccionada no esté cerrada por horario
+    if (form.vuelta && form.vuelta !== 'fuera_prog') {
+      const vueltaNum = parseInt(form.vuelta)
+      const franja = FRANJAS.find(f => f.vuelta === vueltaNum)
+      if (franja && vultaCerrada(form.fecha_entrega, franja)) {
+        setError('Esta vuelta ya cerró. Seleccioná "Fuera de programación" para que el ruteador lo asigne a la franja disponible.')
+        setLoading(false)
+        return
+      }
+    }
 
     const { data: existente } = await supabase.from('pedidos').select('id').eq('id_despacho', form.id_despacho).single()
     if (existente) { setError(`Ya existe un pedido para la solicitud ${form.id_despacho}`); setLoading(false); return }

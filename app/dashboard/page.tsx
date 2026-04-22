@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react'
 import { supabase } from '../supabase'
 import { useRouter } from 'next/navigation'
 import NotificacionBell from '../components/NotificacionBell'
+import { FRANJAS, vultaCerrada, vueltasCerradasPara } from '../lib/franjas'
 
 const TODAS_LAS_CARDS = [
   { href: '/despachos',      icon: '📦', titulo: 'Nuevo pedido',       descripcion: 'Cargar solicitud de despacho',              disponible: true, roles: ['gerencia','ruteador','comercial'] },
@@ -126,6 +127,11 @@ export default function Dashboard() {
   }
 
   const handleReprogramarDashboard = async (p: PedidoReciente, fecha: string, vuelta: number, motivo: string) => {
+    const franja = FRANJAS.find(f => f.vuelta === vuelta)
+    if (franja && vultaCerrada(fecha, franja)) {
+      showToast('Esta vuelta ya cerró para esa fecha. Elegí una franja disponible.', 'err')
+      return
+    }
     const nota = `⚡ Reprogramado desde ${p.fecha_entrega} V${p.vuelta}${motivo ? ` — ${motivo}` : ''}`
     const res = await fetch('/api/pedidos', {
       method: 'PATCH', headers: { 'Content-Type': 'application/json' },
@@ -226,16 +232,41 @@ export default function Dashboard() {
               <div>
                 <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>Nueva fecha</label>
                 <input type="date" value={reprogFechaDash}
-                  min={(() => { const d = new Date(); d.setDate(d.getDate() + 1); return d.toISOString().split('T')[0] })()}
-                  onChange={e => setReprogFechaDash(e.target.value)}
+                  min={new Date().toISOString().split('T')[0]}
+                  onChange={e => {
+                    setReprogFechaDash(e.target.value)
+                    const cerradas = vueltasCerradasPara(e.target.value)
+                    if (cerradas.includes(reprogVueltaDash)) {
+                      const primerLibre = [1, 2, 3, 4].find(v => !cerradas.includes(v))
+                      setReprogVueltaDash(primerLibre ?? 4)
+                    }
+                  }}
                   className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none" style={{ borderColor: '#e8edf8' }} />
               </div>
               <div>
                 <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>Vuelta</label>
-                <select value={reprogVueltaDash} onChange={e => setReprogVueltaDash(parseInt(e.target.value))}
-                  className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none" style={{ borderColor: '#e8edf8' }}>
-                  {[1, 2, 3, 4].map(v => <option key={v} value={v}>Vuelta {v}</option>)}
-                </select>
+                {(() => {
+                  const cerradas = vueltasCerradasPara(reprogFechaDash)
+                  return (
+                    <>
+                      <select value={reprogVueltaDash} onChange={e => setReprogVueltaDash(parseInt(e.target.value))}
+                        className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none" style={{ borderColor: '#e8edf8' }}>
+                        {[1, 2, 3, 4].map(v => {
+                          const franja = FRANJAS.find(f => f.vuelta === v)
+                          const cerrada = franja ? cerradas.includes(v) : false
+                          return (
+                            <option key={v} value={v} disabled={cerrada}>
+                              Vuelta {v}{cerrada ? ' — ⛔ Fuera de horario' : ''}
+                            </option>
+                          )
+                        })}
+                      </select>
+                      {reprogFechaDash && cerradas.includes(reprogVueltaDash) && (
+                        <p className="text-xs mt-1" style={{ color: '#E52322' }}>Esta vuelta ya cerró para esa fecha.</p>
+                      )}
+                    </>
+                  )
+                })()}
               </div>
               <div>
                 <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>Motivo</label>
@@ -245,7 +276,7 @@ export default function Dashboard() {
               </div>
             </div>
             <div className="flex gap-2 mt-5">
-              <button disabled={!reprogFechaDash}
+              <button disabled={!reprogFechaDash || vueltasCerradasPara(reprogFechaDash).includes(reprogVueltaDash)}
                 onClick={() => handleReprogramarDashboard(pedidoReprogDash, reprogFechaDash, reprogVueltaDash, reprogMotivoDash)}
                 className="flex-1 py-2.5 rounded-xl text-sm font-semibold text-white disabled:opacity-40"
                 style={{ background: '#254A96' }}>Confirmar</button>

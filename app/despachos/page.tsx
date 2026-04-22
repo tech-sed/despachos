@@ -180,6 +180,10 @@ export default function NuevoDespacho() {
     // Calcular vueltas cerradas por horario
     const cerradas = FRANJAS.filter(f => vultaCerrada(form.fecha_entrega, f)).map(f => f.vuelta)
     setVueltasCerradas(cerradas)
+    // Si todas las vueltas cerraron, auto-seleccionar "fuera de programación"
+    if (cerradas.length === FRANJAS.length) {
+      setForm(prev => ({ ...prev, vuelta: 'fuera_prog' }))
+    }
 
     const { data: flotaData } = await supabase
       .from('flota_dia').select('camion_codigo')
@@ -812,6 +816,15 @@ export default function NuevoDespacho() {
                     })}
                     <option value="fuera_prog">Pedido fuera de programación</option>
                   </select>
+
+                  {/* Aviso todas las vueltas cerradas */}
+                  {vueltasCerradas.length === FRANJAS.length && form.fecha_entrega && (
+                    <div className="mt-2 rounded-xl px-4 py-3 text-xs leading-relaxed"
+                      style={{ background: '#fef3c7', border: '1px solid #fde68a', color: '#92400e' }}>
+                      <p className="font-semibold mb-1">⏰ Las vueltas de hoy ya cerraron</p>
+                      <p>El pedido se cargó como <strong>fuera de programación</strong>. El ruteador lo va a asignar a la vuelta que corresponda según disponibilidad.</p>
+                    </div>
+                  )}
 
                   {/* Aviso pedido grande */}
                   {pedidoGrande && (

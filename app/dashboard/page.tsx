@@ -21,15 +21,19 @@ const TODAS_LAS_CARDS = [
 ]
  
 const ESTADO_COLOR: Record<string, string> = {
-  pendiente:  'bg-yellow-100 text-yellow-700',
-  programado: 'bg-blue-100 text-blue-700',
-  en_camino:  'bg-purple-100 text-purple-700',
-  entregado:  'bg-green-100 text-green-700',
-  cancelado:  'bg-red-100 text-red-700',
+  pendiente:          'bg-yellow-100 text-yellow-700',
+  programado:         'bg-blue-100 text-blue-700',
+  en_camino:          'bg-purple-100 text-purple-700',
+  entregado:          'bg-green-100 text-green-700',
+  cancelado:          'bg-red-100 text-red-700',
+  rechazado:          'bg-red-100 text-red-700',
+  entregado_parcial:  'bg-orange-100 text-orange-700',
 }
- 
+
 const ESTADO_LABEL: Record<string, string> = {
-  pendiente: 'Pendiente', programado: 'Programado', en_camino: 'En camino', entregado: 'Entregado', cancelado: 'Cancelado',
+  pendiente: 'Pendiente', programado: 'Programado', en_camino: 'En camino',
+  entregado: 'Entregado', cancelado: 'Cancelado', rechazado: 'Rechazado',
+  entregado_parcial: 'Parcial',
 }
  
 interface PedidoReciente {
@@ -455,7 +459,14 @@ export default function Dashboard() {
                           <span className={`text-xs px-2 py-0.5 rounded-full font-medium whitespace-nowrap ${ESTADO_COLOR[p.estado] ?? 'bg-gray-100 text-gray-500'}`}>
                             {ESTADO_LABEL[p.estado] ?? p.estado}
                           </span>
-                          {['pendiente', 'programado'].includes(p.estado) && (
+                          {p.estado === 'rechazado' ? (
+                            <button
+                              onClick={() => router.push('/despachos')}
+                              className="text-xs px-2.5 py-1 rounded-lg font-medium"
+                              style={{ background: '#fde8e8', color: '#E52322' }}>
+                              📋 Cargar nuevo ID
+                            </button>
+                          ) : ['pendiente', 'programado'].includes(p.estado) && (
                             <>
                               <button
                                 onClick={() => { setPedidoReprogDash(p); setReprogFechaDash(''); setReprogVueltaDash(1); setReprogMotivoDash('') }}

@@ -84,11 +84,12 @@ export default function Dashboard() {
     supabase.auth.getUser().then(async ({ data: { user } }) => {
       if (!user) { router.push('/'); return }
 
-      const { data: userData } = await supabase
-        .from('usuarios')
-        .select('rol, nombre, permisos')
-        .eq('id', user.id)
-        .single()
+      // Usar el endpoint admin para bypasar RLS y leer permisos correctamente
+      const { data: { session } } = await supabase.auth.getSession()
+      const res = await fetch('/api/mi-perfil', {
+        headers: session?.access_token ? { 'Authorization': `Bearer ${session.access_token}` } : {},
+      })
+      const { perfil: userData } = await res.json()
 
       if (userData?.rol === 'chofer') { router.push('/ruteo'); return }
       if (userData?.rol === 'confirmador') { router.push('/confirmaciones'); return }

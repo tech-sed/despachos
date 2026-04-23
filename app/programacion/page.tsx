@@ -652,6 +652,12 @@ function ColumnaCamion({ columna, sinAsignar = false, onDrop, onDragOver, onDrag
             <div className="flex justify-between items-center mb-1">
               <span className="font-bold text-sm" style={{ color: '#254A96' }}>{camion.codigo}</span>
               <div className="flex gap-1 items-center">
+                {(camion as any)._desde_sucursal && (
+                  <span className="text-xs px-1.5 py-0.5 rounded-full font-medium" style={{ background: '#f5f3ff', color: '#7c3aed' }}
+                    title={`Viene de ${(camion as any)._desde_sucursal}, disponible desde V${(camion as any)._disponible_desde_vuelta ?? 2}`}>
+                    🔀 {(camion as any)._desde_sucursal} V{(camion as any)._disponible_desde_vuelta ?? 2}+
+                  </span>
+                )}
                 {camion.grua_hidraulica && <span className="text-xs px-1.5 py-0.5 rounded-full" style={{ background: '#e8edf8', color: '#254A96' }}>Grúa</span>}
                 {camion.volcador && <span className="text-xs px-1.5 py-0.5 rounded-full" style={{ background: '#fef3c7', color: '#d97706' }}>Volc.</span>}
                 <button onClick={() => setManualExpanded(e => !e)} className="text-xs px-1.5 py-0.5 rounded ml-1" style={{ color: '#B9BBB7', background: '#f0f0f0' }} title={isExpanded ? 'Contraer' : 'Expandir'}>
@@ -828,7 +834,10 @@ function ProgramacionInner() {
         }
       } catch { /* si falla, mostrar pedidos sin items */ }
     }
-    const { data: fd } = await supabase.from('flota_dia').select('camion_codigo, revisado').eq('fecha', fecha).eq('sucursal', sucursal).eq('activo', true)
+    const { data: fd } = await supabase.from('flota_dia').select('camion_codigo, revisado, sucursal_extra, sucursal_extra_desde_vuelta').eq('fecha', fecha).eq('sucursal', sucursal).eq('activo', true)
+    // También traer camiones cuya sucursal_extra coincide con esta sucursal
+    const { data: fdExtra } = await supabase.from('flota_dia').select('camion_codigo, sucursal, sucursal_extra_desde_vuelta').eq('fecha', fecha).eq('sucursal_extra', sucursal).eq('activo', true)
+
     let codigos = (fd ?? []).map((f: any) => f.camion_codigo)
     let flotaSinRevisar = (fd ?? []).length === 0 || (fd ?? []).some((f: any) => f.revisado === false)
 
@@ -839,8 +848,19 @@ function ProgramacionInner() {
       flotaSinRevisar = true
     }
 
-    const { data: cd } = codigos.length > 0 ? await supabase.from('camiones_flota').select('*').in('codigo', codigos).eq('activo', true) : { data: [] }
-    const cams = cd ?? []
+    // Agregar camiones de otras sucursales que operan también acá
+    const codigosExtra = (fdExtra ?? []).map((f: any) => f.camion_codigo)
+    const todosCodigos = [...new Set([...codigos, ...codigosExtra])]
+
+    const { data: cd } = todosCodigos.length > 0 ? await supabase.from('camiones_flota').select('*').in('codigo', todosCodigos).eq('activo', true) : { data: [] }
+
+    // Enriquecer con metadata de sucursal extra
+    const cams = (cd ?? []).map((c: any) => {
+      const extra = (fdExtra ?? []).find((f: any) => f.camion_codigo === c.codigo)
+      return extra
+        ? { ...c, _desde_sucursal: extra.sucursal, _disponible_desde_vuelta: extra.sucursal_extra_desde_vuelta ?? 2 }
+        : c
+    })
     setFlotaSinRevisar(flotaSinRevisar)
 
     // Contador de pedidos sin vuelta asignada (para badge del tab)

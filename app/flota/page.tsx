@@ -406,8 +406,9 @@ function VistaEditar({ fecha, onVolver, showToast }: {
         ...c,
         sucursal_dia: diaConfig ? diaConfig.sucursal : c.sucursal,
         activo_dia: diaConfig ? diaConfig.activo : true,
-        // Si ya hay config del día usarla; si no, pre-cargar chofer habitual de la flota base
         chofer_id: diaConfig?.chofer_id ?? c.chofer_id_default ?? '',
+        sucursal_extra: diaConfig?.sucursal_extra ?? '',
+        sucursal_extra_desde_vuelta: diaConfig?.sucursal_extra_desde_vuelta ?? 2,
       }
     }))
     setLoading(false)
@@ -444,6 +445,8 @@ function VistaEditar({ fecha, onVolver, showToast }: {
               activo: c.activo_dia,
               chofer_id: c.chofer_id || null,
               revisado: true,
+              sucursal_extra: c.sucursal_extra || null,
+              sucursal_extra_desde_vuelta: c.sucursal_extra ? (c.sucursal_extra_desde_vuelta ?? 2) : null,
             },
             { onConflict: 'fecha,camion_codigo' }
           )
@@ -585,7 +588,7 @@ function VistaEditar({ fecha, onVolver, showToast }: {
                       )}
 
                       {sucursal !== 'Fuera de servicio' && c.activo_dia && (
-                        <div onMouseDown={e => e.stopPropagation()}>
+                        <div onMouseDown={e => e.stopPropagation()} className="space-y-1.5">
                           <select
                             value={c.chofer_id ?? ''}
                             onChange={e => asignarChofer(c.codigo, e.target.value)}
@@ -603,6 +606,38 @@ function VistaEditar({ fecha, onVolver, showToast }: {
                               </option>
                             ))}
                           </select>
+
+                          {/* Segunda sucursal */}
+                          <select
+                            value={c.sucursal_extra ?? ''}
+                            onChange={e => setCamiones(prev => prev.map(x =>
+                              x.codigo === c.codigo ? { ...x, sucursal_extra: e.target.value, sucursal_extra_desde_vuelta: 2 } : x
+                            ))}
+                            className="w-full text-xs border rounded-lg px-2 py-1 focus:outline-none"
+                            style={{
+                              borderColor: c.sucursal_extra ? '#7c3aed' : '#e8edf8',
+                              color: c.sucursal_extra ? '#7c3aed' : '#B9BBB7',
+                              background: c.sucursal_extra ? '#f5f3ff' : 'white',
+                            }}>
+                            <option value="">🔀 Sin 2ª sucursal</option>
+                            {SUCURSALES.filter(s => s !== sucursal && s !== 'Fuera de servicio').map(s => (
+                              <option key={s} value={s}>{s}</option>
+                            ))}
+                          </select>
+
+                          {/* Desde qué vuelta está disponible en la 2ª sucursal */}
+                          {c.sucursal_extra && (
+                            <select
+                              value={c.sucursal_extra_desde_vuelta ?? 2}
+                              onChange={e => setCamiones(prev => prev.map(x =>
+                                x.codigo === c.codigo ? { ...x, sucursal_extra_desde_vuelta: parseInt(e.target.value) } : x
+                              ))}
+                              className="w-full text-xs border rounded-lg px-2 py-1 focus:outline-none"
+                              style={{ borderColor: '#e8edf8', color: '#7c3aed', background: '#f5f3ff' }}>
+                              <option value={2}>Disponible desde V2</option>
+                              <option value={3}>Disponible desde V3</option>
+                            </select>
+                          )}
                         </div>
                       )}
                     </div>

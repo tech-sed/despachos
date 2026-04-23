@@ -774,6 +774,7 @@ function ProgramacionInner() {
   const [camionParaReprog, setCamionParaReprog] = useState<string | null>(null)
   const [overflowPedidos, setOverflowPedidos] = useState<Pedido[]>([])
   const [bannerGrandeDismissed, setBannerGrandeDismissed] = useState(false)
+  const [flotaSinRevisar, setFlotaSinRevisar] = useState(false)
   const [contadorSinVuelta, setContadorSinVuelta] = useState(0)
 
   const showToast = (msg: string, tipo: 'ok' | 'err' = 'ok') => { setToast({ msg, tipo }); setTimeout(() => setToast(null), 3000) }
@@ -827,16 +828,26 @@ function ProgramacionInner() {
         }
       } catch { /* si falla, mostrar pedidos sin items */ }
     }
-    const { data: fd } = await supabase.from('flota_dia').select('camion_codigo').eq('fecha', fecha).eq('sucursal', sucursal).eq('activo', true)
-    const codigos = (fd ?? []).map((f: any) => f.camion_codigo)
+    const { data: fd } = await supabase.from('flota_dia').select('camion_codigo, revisado').eq('fecha', fecha).eq('sucursal', sucursal).eq('activo', true)
+    let codigos = (fd ?? []).map((f: any) => f.camion_codigo)
+    let flotaSinRevisar = (fd ?? []).length === 0 || (fd ?? []).some((f: any) => f.revisado === false)
+
+    // Fallback a flota base si no hay flota_dia para este día
+    if (codigos.length === 0) {
+      const { data: baseData } = await supabase.from('camiones_flota').select('codigo').eq('sucursal', sucursal).eq('activo', true)
+      codigos = (baseData ?? []).map((b: any) => b.codigo)
+      flotaSinRevisar = true
+    }
+
     const { data: cd } = codigos.length > 0 ? await supabase.from('camiones_flota').select('*').in('codigo', codigos).eq('activo', true) : { data: [] }
     const cams = cd ?? []
+    setFlotaSinRevisar(flotaSinRevisar)
 
     // Contador de pedidos sin vuelta asignada (para badge del tab)
     const { count: cSinVuelta } = await supabase.from('pedidos')
       .select('id', { count: 'exact', head: true })
       .eq('fecha_entrega', fecha).eq('sucursal', sucursal)
-      .is('vuelta', null).in('estado', ['pendiente', 'programado'])
+      .eq('vuelta', 0).in('estado', ['pendiente', 'programado'])
     setContadorSinVuelta(cSinVuelta ?? 0)
 
     setPedidos(todosConItems); setCamiones(cams); construirColumnas(todosConItems, cams); setCargando(false)
@@ -1210,6 +1221,17 @@ function ProgramacionInner() {
 
       {/* Kanban — ocupa todo el alto restante */}
       <div className="flex-1 overflow-hidden flex flex-col px-3 pt-2 pb-3">
+
+        {/* Banner flota sin revisar */}
+        {flotaSinRevisar && (
+          <div className="mb-2 rounded-xl px-4 py-3 flex items-center gap-3"
+            style={{ background: '#fef3c7', border: '1px solid #fde68a', color: '#92400e' }}>
+            <span className="text-lg">⚠️</span>
+            <p className="text-sm flex-1">
+              <strong>Flota sin revisar</strong> — El admin de flota todavía no confirmó los camiones para este día. Los cupos son estimados en base a la flota habitual.
+            </p>
+          </div>
+        )}
 
         {/* Banner pedidos grandes */}
         {pedidos.some(p => p.pedido_grande) && !bannerGrandeDismissed && (

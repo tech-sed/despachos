@@ -56,6 +56,7 @@ export default function NuevoDespacho() {
   const [cuposDisponibles, setCuposDisponibles] = useState<number[]>([])
   const [vueltasSinCupoConFlota, setVueltasSinCupoConFlota] = useState<number[]>([])
   const [vueltasCerradas, setVueltasCerradas] = useState<number[]>([])
+  const [flotaSinRevisar, setFlotaSinRevisar] = useState(false)
   const [maxCamionPosiciones, setMaxCamionPosiciones] = useState(0)
   const [pedidoGrande, setPedidoGrande] = useState(false)
   const [verificando, setVerificando] = useState(false)
@@ -179,10 +180,22 @@ export default function NuevoDespacho() {
     }
 
     const { data: flotaData } = await supabase
-      .from('flota_dia').select('camion_codigo')
+      .from('flota_dia').select('camion_codigo, revisado')
       .eq('fecha', form.fecha_entrega).eq('sucursal', form.sucursal).eq('activo', true)
 
-    const codigos = (flotaData ?? []).map((f: any) => f.camion_codigo)
+    let codigos = (flotaData ?? []).map((f: any) => f.camion_codigo)
+    let sinRevisar = (flotaData ?? []).length === 0 || (flotaData ?? []).some((f: any) => f.revisado === false)
+
+    // Fallback a flota base si no hay flota_dia configurada para este día
+    if (codigos.length === 0) {
+      const { data: baseData } = await supabase
+        .from('camiones_flota').select('codigo')
+        .eq('sucursal', form.sucursal).eq('activo', true)
+      codigos = (baseData ?? []).map((b: any) => b.codigo)
+      sinRevisar = true
+    }
+
+    setFlotaSinRevisar(sinRevisar)
 
     if (codigos.length === 0) {
       setCuposDisponibles([])
@@ -843,6 +856,14 @@ export default function NuevoDespacho() {
                     })}
                     <option value="fuera_prog">Pedido fuera de programación</option>
                   </select>
+
+                  {/* Aviso flota sin revisar */}
+                  {flotaSinRevisar && form.fecha_entrega && form.sucursal && (
+                    <div className="mt-2 rounded-xl px-4 py-3 text-xs leading-relaxed"
+                      style={{ background: '#fef3c7', border: '1px solid #fde68a', color: '#92400e' }}>
+                      ⚠️ <strong>Flota sin revisar</strong> — Los cupos son estimados en base a la flota habitual. El admin de flota todavía no confirmó el día.
+                    </div>
+                  )}
 
                   {/* Aviso todas las vueltas cerradas */}
                   {vueltasCerradas.length === FRANJAS.length && form.fecha_entrega && (

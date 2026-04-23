@@ -353,6 +353,7 @@ function VistaEditar({ fecha, onVolver, showToast }: {
   const [dragging, setDragging] = useState<string | null>(null)
   const [dragOver, setDragOver] = useState<string | null>(null)
   const [ultimaModif, setUltimaModif] = useState<string | null>(null)
+  const [sinRevisar, setSinRevisar] = useState(false)
 
   useEffect(() => { cargarFlota() }, [fecha])
 
@@ -363,6 +364,7 @@ function VistaEditar({ fecha, onVolver, showToast }: {
       supabase.from('flota_dia').select('*').eq('fecha', fecha),
       supabase.from('usuarios').select('id, nombre').eq('rol', 'chofer').order('nombre'),
     ])
+    setSinRevisar((flotaDia ?? []).length === 0 || (flotaDia ?? []).some((d: any) => d.revisado === false))
 
     setChoferes(choferesData ?? [])
 
@@ -413,6 +415,7 @@ function VistaEditar({ fecha, onVolver, showToast }: {
               sucursal: c.sucursal_dia,
               activo: c.activo_dia,
               chofer_id: c.chofer_id || null,
+              revisado: true,
             },
             { onConflict: 'fecha,camion_codigo' }
           )
@@ -479,6 +482,16 @@ function VistaEditar({ fecha, onVolver, showToast }: {
       </nav>
 
       <main className="max-w-screen-xl mx-auto px-4 md:px-6 py-6">
+        {sinRevisar && (
+          <div className="mb-5 rounded-xl px-5 py-4 flex items-start gap-3 text-sm"
+            style={{ background: '#fef3c7', border: '1px solid #fde68a', color: '#92400e' }}>
+            <span className="text-lg leading-none mt-0.5">⚠️</span>
+            <div>
+              <p className="font-semibold">Flota sin revisar</p>
+              <p className="text-xs mt-0.5">Esta flota todavía no fue confirmada para este día. Revisá la asignación de camiones y choferes, y guardá para marcarla como revisada.</p>
+            </div>
+          </div>
+        )}
         <p className="text-sm mb-5" style={{ color: '#B9BBB7' }}>
           Arrastrá los camiones entre sucursales. Asigná un chofer a cada camión activo.
         </p>

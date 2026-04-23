@@ -64,15 +64,35 @@ function colorBarra(p: number) { return p >= 90 ? '#E52322' : p >= 70 ? '#f59e0b
 
 function localidadDeDireccion(dir: string): string {
   if (!dir) return ''
+  const skip = ['buenos aires', 'b.a.', 'argentina', 'provincia', 'pba', 'prov.']
+  const isSkip = (s: string) => skip.some(w => s.toLowerCase().includes(w))
+
+  // Intento 1: dividir por comas (ej: "Calle 50 1234, La Plata, Bs As")
   const parts = dir.split(',').map(s => s.trim()).filter(Boolean)
-  if (parts.length < 2) return ''
-  const skip = ['buenos aires', 'b.a.', 'argentina', 'provincia', 'pba']
-  for (let i = parts.length - 1; i >= 1; i--) {
-    const p = parts[i]
-    if (/^\d+$/.test(p)) continue
-    if (skip.some(s => p.toLowerCase().includes(s))) continue
-    if (p.length > 1 && p.length < 50) return p
+  if (parts.length >= 2) {
+    for (let i = parts.length - 1; i >= 1; i--) {
+      const p = parts[i]
+      if (/^\d+$/.test(p)) continue       // solo números
+      if (isSkip(p)) continue              // provincia / país
+      if (p.length > 1 && p.length < 50) return p
+    }
   }
+
+  // Intento 2: últimas palabras del final que no sean números ni abreviaturas de calle
+  // ej: "Av Mitre 456 Guernica" → "Guernica"
+  //     "Calle 13 e/ 60 y 61 La Plata" → "La Plata"
+  const STOP = /^(n°|nro|nro\.|km|bis|piso|dpto|depto|pb|pp|s\/n|esq\.?|e\/|y|entre|av\.?|calle|ruta|cno|camino|diagonal|diag\.?)$/i
+  const words = dir.replace(/,/g, ' ').split(/\s+/).filter(Boolean)
+  const cityWords: string[] = []
+  for (let i = words.length - 1; i >= 0 && cityWords.length < 3; i--) {
+    const w = words[i]
+    if (/^\d/.test(w)) break        // encontró un número → parar
+    if (STOP.test(w)) break         // abreviatura de calle → parar
+    cityWords.unshift(w)
+  }
+  const candidate = cityWords.join(' ')
+  if (candidate.length > 2 && !isSkip(candidate)) return candidate
+
   return ''
 }
 

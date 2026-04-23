@@ -156,6 +156,9 @@ export default function MetricasPage() {
   const [toast, setToast] = useState<string | null>(null)
   const [chatAbierto, setChatAbierto] = useState(false)
   const [exportando, setExportando] = useState(false)
+  const primerDiaMes = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-01` }
+  const [fechaExportDesde, setFechaExportDesde] = useState(primerDiaMes)
+  const [fechaExportHasta, setFechaExportHasta] = useState(hoy)
 
   const showToast = (msg: string) => { setToast(msg); setTimeout(() => setToast(null), 3000) }
 
@@ -182,52 +185,112 @@ export default function MetricasPage() {
   }
 
   async function exportarExcel() {
-    if ((vista === 'diaria' && datosDia.length === 0) || (vista === 'mensual' && datosMes.length === 0)) {
-      showToast('Primero cargá los datos con Buscar')
-      return
-    }
+    if (!fechaExportDesde || !fechaExportHasta) { showToast('Seleccioná el intervalo de fechas'); return }
+    if (fechaExportDesde > fechaExportHasta) { showToast('La fecha de inicio debe ser anterior al fin'); return }
     setExportando(true)
     try {
       const XLSX = await import('xlsx')
       const wb = XLSX.utils.book_new()
 
-      if (vista === 'diaria') {
-        // Fetch full pedidos for selected date
-        let q = supabase.from('pedidos')
-          .select('nv, id_despacho, cliente, direccion, sucursal, fecha_entrega, vuelta, camion_id, estado, estado_pago, peso_total_kg, volumen_total_m3, notas, tipo')
-          .eq('fecha_entrega', fecha).neq('estado', 'cancelado').order('sucursal').order('cliente')
-        if (filtroSucursal) q = q.eq('sucursal', filtroSucursal)
-        const { data: pedidosData } = await q
+      // Queries paralelas: pedidos + flota + camiones para el intervalo
+      let pedQ = supabase.from('pedidos')
+        .select('nv, id_despacho, cliente, direccion, sucursal, fecha_entrega, vuelta, camion_id, estado, estado_pago, peso_total_kg, volumen_total_m3, notas, tipo')
+        .gte('fecha_entrega', fechaExportDesde).lte('fecha_entrega', fechaExportHasta)
+        .neq('estado', 'cancelado').order('fecha_entrega').order('sucursal').order('cliente')
+      let flotQ = supabase.from('flota_dia')
+        .select('fecha, camion_codigo, sucursal, km_ruta')
+        .gte('fecha', fechaExportDesde).lte('fecha', fechaExportHasta).eq('activo', true)
+      if (filtroSucursal) { pedQ = pedQ.eq('sucursal', filtroSucursal); flotQ = flotQ.eq('sucursal', filtroSucursal) }
 
-        const pedRows = (pedidosData ?? []).map(p => ({
+      const [{ data: pedidosData }, { data: flotaData }, { data: camionesData }] = await Promise.all([
+        pedQ, flotQ,
+        supabase.from('camiones_flota').select('codigo, tipo_unidad, sucursal, posiciones_total, tonelaje_max_kg'),
+      ])
+
+      const camionMap: Record<string, any> = {}
+      for (const c of camionesData ?? []) camionMap[c.codigo] = c
+
+      // Hoja 1: Pedidos detalle
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
+        (pedidosData ?? []).map(p => ({
           'NV': p.nv, 'SD': p.id_despacho ?? '', 'Tipo': p.tipo === 'retiro' ? 'Retiro' : 'Entrega',
           'Cliente': p.cliente, 'Dirección': p.direccion, 'Sucursal': p.sucursal,
-          'Fecha': p.fecha_entrega, 'Vuelta': p.vuelta === 0 ? 'Sin asignar' : `V${p.vuelta}`,
+          'Fecha': p.fecha_entrega,
+          'Día': new Date(p.fecha_entrega + 'T12:00:00').toLocaleDateString('es-AR', { weekday: 'long' }),
+          'Vuelta': p.vuelta === 0 ? 'Sin asignar' : `V${p.vuelta}`,
           'Camión': p.camion_id ?? '', 'Estado': p.estado, 'Pago': p.estado_pago ?? '',
           'Kg': p.peso_total_kg ?? 0, 'Posiciones': p.volumen_total_m3 ?? 0, 'Notas': p.notas ?? '',
         }))
-        XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(pedRows), 'Pedidos')
+      ), 'Pedidos')
 
-        const metRows = datosDia.map(d => ({
-          'Camión': d.camion_codigo, 'Tipo': d.tipo_unidad, 'Sucursal': d.sucursal, 'Chofer': d.chofer_nombre,
-          'Pedidos': d.pedidos, 'Kg usados': Math.round(d.kgUsados), 'Cap. Kg día': d.capacidadKgDia,
-          'Ocup. Kg %': d.pctKg, 'Pos usadas': Math.round(d.posicionesUsadas), 'Cap. Pos día': d.capacidadPosDia,
-          'Ocup. Pos %': d.pctPos, 'Km ruta': d.distanciaTotalKm,
-          'Hora inicio': d.hora_inicio ? new Date(d.hora_inicio).toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' }) : '',
-          'Hora fin': d.hora_fin ? new Date(d.hora_fin).toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' }) : '',
-        }))
-        XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(metRows), 'Métricas flota')
-        XLSX.writeFile(wb, `metricas-${fecha}${filtroSucursal ? '-' + filtroSucursal : ''}.xlsx`)
-      } else {
-        const rows = datosMes.map(d => ({
-          'Camión': d.camion_codigo, 'Tipo': d.tipo_unidad, 'Sucursal': d.sucursal,
-          'Días activo': d.diasActivo, 'Avg Ocup. Kg %': d.avgPctKg, 'Avg Ocup. Pos %': d.avgPctPos,
-          'Km totales': d.totalKm, 'Min/km prom.': d.avgMinKm,
-        }))
-        XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows), 'Métricas mensuales')
-        XLSX.writeFile(wb, `metricas-${mes}${filtroSucursal ? '-' + filtroSucursal : ''}.xlsx`)
+      // Hoja 2: Resumen por día
+      const byDia: Record<string, { pedidos: number; kg: number; pos: number; entregados: number; rechazados: number }> = {}
+      for (const p of pedidosData ?? []) {
+        if (!byDia[p.fecha_entrega]) byDia[p.fecha_entrega] = { pedidos: 0, kg: 0, pos: 0, entregados: 0, rechazados: 0 }
+        byDia[p.fecha_entrega].pedidos++
+        byDia[p.fecha_entrega].kg += p.peso_total_kg ?? 0
+        byDia[p.fecha_entrega].pos += p.volumen_total_m3 ?? 0
+        if (p.estado === 'entregado' || p.estado === 'entregado_parcial') byDia[p.fecha_entrega].entregados++
+        if (p.estado === 'rechazado') byDia[p.fecha_entrega].rechazados++
       }
-      showToast('Excel descargado')
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
+        Object.entries(byDia).sort((a, b) => a[0].localeCompare(b[0])).map(([f, d]) => ({
+          'Fecha': f,
+          'Día': new Date(f + 'T12:00:00').toLocaleDateString('es-AR', { weekday: 'long' }),
+          'Pedidos': d.pedidos, 'Entregados': d.entregados, 'Rechazados': d.rechazados,
+          '% Entrega': d.pedidos > 0 ? Math.round(d.entregados / d.pedidos * 100) : 0,
+          'Kg totales': Math.round(d.kg), 'Posiciones': Math.round(d.pos),
+        }))
+      ), 'Por día')
+
+      // Hoja 3: Resumen por camión
+      const byTruck: Record<string, { diasActivo: number; pedidos: number; kg: number; pos: number; km: number; capKg: number; capPos: number }> = {}
+      for (const f of flotaData ?? []) {
+        if (!byTruck[f.camion_codigo]) byTruck[f.camion_codigo] = { diasActivo: 0, pedidos: 0, kg: 0, pos: 0, km: 0, capKg: 0, capPos: 0 }
+        byTruck[f.camion_codigo].diasActivo++; byTruck[f.camion_codigo].km += f.km_ruta ?? 0
+        const c = camionMap[f.camion_codigo]
+        if (c) { byTruck[f.camion_codigo].capKg += c.tonelaje_max_kg; byTruck[f.camion_codigo].capPos += c.posiciones_total }
+      }
+      for (const p of pedidosData ?? []) {
+        if (!p.camion_id) continue
+        if (!byTruck[p.camion_id]) byTruck[p.camion_id] = { diasActivo: 0, pedidos: 0, kg: 0, pos: 0, km: 0, capKg: 0, capPos: 0 }
+        byTruck[p.camion_id].pedidos++; byTruck[p.camion_id].kg += p.peso_total_kg ?? 0; byTruck[p.camion_id].pos += p.volumen_total_m3 ?? 0
+      }
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
+        Object.entries(byTruck).sort((a, b) => b[1].kg - a[1].kg).map(([cod, d]) => {
+          const c = camionMap[cod]
+          return {
+            'Camión': cod, 'Tipo': c?.tipo_unidad ?? '', 'Sucursal': c?.sucursal ?? '',
+            'Días activo': d.diasActivo, 'Pedidos': d.pedidos,
+            'Kg totales': Math.round(d.kg), 'Avg Ocup. Kg %': d.capKg > 0 ? Math.round(d.kg / d.capKg * 100) : 0,
+            'Pos totales': Math.round(d.pos), 'Avg Ocup. Pos %': d.capPos > 0 ? Math.round(d.pos / d.capPos * 100) : 0,
+            'Km totales': Math.round(d.km),
+          }
+        })
+      ), 'Por camión')
+
+      // Hoja 4: Por sucursal
+      const bySuc: Record<string, { pedidos: number; kg: number; pos: number; entregados: number; rechazados: number }> = {}
+      for (const p of pedidosData ?? []) {
+        if (!bySuc[p.sucursal]) bySuc[p.sucursal] = { pedidos: 0, kg: 0, pos: 0, entregados: 0, rechazados: 0 }
+        bySuc[p.sucursal].pedidos++; bySuc[p.sucursal].kg += p.peso_total_kg ?? 0; bySuc[p.sucursal].pos += p.volumen_total_m3 ?? 0
+        if (p.estado === 'entregado' || p.estado === 'entregado_parcial') bySuc[p.sucursal].entregados++
+        if (p.estado === 'rechazado') bySuc[p.sucursal].rechazados++
+      }
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
+        Object.entries(bySuc).sort((a, b) => b[1].pedidos - a[1].pedidos).map(([s, d]) => ({
+          'Sucursal': s, 'Pedidos': d.pedidos, 'Entregados': d.entregados, 'Rechazados': d.rechazados,
+          '% Entrega': d.pedidos > 0 ? Math.round(d.entregados / d.pedidos * 100) : 0,
+          'Kg totales': Math.round(d.kg), 'Posiciones': Math.round(d.pos),
+        }))
+      ), 'Por sucursal')
+
+      const suf = filtroSucursal ? `-${filtroSucursal}` : ''
+      const nombre = fechaExportDesde === fechaExportHasta
+        ? `despachos-app-${fechaExportDesde}${suf}.xlsx`
+        : `despachos-app-${fechaExportDesde}-${fechaExportHasta}${suf}.xlsx`
+      XLSX.writeFile(wb, nombre)
+      showToast(`Excel descargado (${(pedidosData ?? []).length} pedidos)`)
     } catch (e: any) {
       showToast(`Error: ${e.message}`)
     }
@@ -494,7 +557,8 @@ export default function MetricasPage() {
       <main className="max-w-[1400px] mx-auto px-4 md:px-6 py-6">
 
         {/* Filtros */}
-        <div className="bg-white rounded-xl shadow-sm p-4 mb-6">
+        <div className="bg-white rounded-xl shadow-sm p-4 mb-6 space-y-3">
+          {/* Fila 1: vista */}
           <div className="flex flex-wrap gap-3 items-end">
             {vista === 'diaria' ? (
               <div>
@@ -526,11 +590,36 @@ export default function MetricasPage() {
               style={{ background: '#254A96' }}>
               Buscar
             </button>
+          </div>
+
+          {/* Fila 2: exportar por rango */}
+          <div className="flex flex-wrap gap-3 items-end pt-3" style={{ borderTop: '1px solid #f0f0f0' }}>
+            <span className="text-xs font-semibold self-center" style={{ color: '#B9BBB7' }}>📊 EXPORTAR</span>
+            <div>
+              <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>Desde</label>
+              <input type="date" value={fechaExportDesde} onChange={e => setFechaExportDesde(e.target.value)}
+                className="border rounded-lg px-3 py-2 text-sm focus:outline-none"
+                style={{ borderColor: '#e8edf8' }} />
+            </div>
+            <div>
+              <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>Hasta</label>
+              <input type="date" value={fechaExportHasta} onChange={e => setFechaExportHasta(e.target.value)}
+                className="border rounded-lg px-3 py-2 text-sm focus:outline-none"
+                style={{ borderColor: '#e8edf8' }} />
+            </div>
             <button onClick={exportarExcel} disabled={exportando}
               className="px-4 py-2 rounded-lg text-sm font-semibold disabled:opacity-50"
               style={{ background: '#f4f4f3', color: '#254A96', border: '1px solid #e8edf8' }}>
               {exportando ? 'Exportando...' : '⬇️ Excel'}
             </button>
+            {fechaExportDesde && fechaExportHasta && (
+              <span className="text-xs self-center" style={{ color: '#B9BBB7' }}>
+                {fechaExportDesde === fechaExportHasta
+                  ? `1 día${filtroSucursal ? ` · ${filtroSucursal}` : ''}`
+                  : `${fechaExportDesde} → ${fechaExportHasta}${filtroSucursal ? ` · ${filtroSucursal}` : ''}`
+                }
+              </span>
+            )}
           </div>
         </div>
 

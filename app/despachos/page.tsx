@@ -806,8 +806,15 @@ export default function NuevoDespacho() {
               </div>
               {form.latitud && form.longitud && (
                 <div>
-                  <p className="text-xs mb-1" style={{ color: '#B9BBB7' }}>Coordenadas</p>
-                  <p className="font-medium text-sm" style={{ color: '#1a1a1a' }}>{form.latitud}, {form.longitud}</p>
+                  <p className="text-xs mb-1" style={{ color: '#B9BBB7' }}>Ubicación de entrega</p>
+                  <div className="rounded-xl overflow-hidden border" style={{ borderColor: '#e8edf8', height: 180 }}>
+                    <iframe
+                      src={`https://www.google.com/maps?q=${form.latitud},${form.longitud}&hl=es&z=15&output=embed`}
+                      width="100%" height="180" style={{ border: 0, display: 'block' }}
+                      loading="lazy" referrerPolicy="no-referrer-when-downgrade"
+                    />
+                  </div>
+                  <p className="text-xs mt-1" style={{ color: '#B9BBB7' }}>{form.latitud}, {form.longitud}</p>
                 </div>
               )}
               <div>

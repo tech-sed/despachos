@@ -809,9 +809,9 @@ export default function NuevoDespacho() {
                   <p className="text-xs mb-1" style={{ color: '#B9BBB7' }}>Ubicación de entrega</p>
                   <div className="rounded-xl overflow-hidden border" style={{ borderColor: '#e8edf8', height: 220 }}>
                     <iframe
-                      src={`https://www.google.com/maps?q=${form.latitud},${form.longitud}&hl=es&z=15&output=embed`}
+                      src={`https://www.openstreetmap.org/export/embed.html?bbox=${form.longitud! - 0.015},${form.latitud! - 0.015},${form.longitud! + 0.015},${form.latitud! + 0.015}&layer=mapnik&marker=${form.latitud},${form.longitud}`}
                       width="100%" height="220" style={{ border: 0, display: 'block' }}
-                      loading="lazy" referrerPolicy="no-referrer-when-downgrade"
+                      loading="lazy"
                     />
                   </div>
                   <p className="text-xs mt-1" style={{ color: '#B9BBB7' }}>{form.latitud}, {form.longitud}</p>

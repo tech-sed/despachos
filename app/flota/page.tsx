@@ -173,7 +173,7 @@ function VistaLista({ onEditar, onVolver, showToast }: {
     }
 
     const todos = [...resumenExistente, ...proximos]
-      .sort((a, b) => b.fecha.localeCompare(a.fecha))
+      .sort((a, b) => a.fecha.localeCompare(b.fecha))  // ascendente: más cercano primero
 
     setFlotas(todos)
     setLoading(false)
@@ -270,7 +270,7 @@ function VistaLista({ onEditar, onVolver, showToast }: {
             <Section titulo="Próximos días" flotas={flotasFuturas} onEditar={onEditar} />
           )}
           {flotasPasadas.length > 0 && (
-            <Section titulo="Días anteriores" flotas={flotasPasadas} onEditar={onEditar} opaco />
+            <Section titulo="Días anteriores" flotas={[...flotasPasadas].reverse()} onEditar={onEditar} opaco />
           )}
         </div>
       </main>

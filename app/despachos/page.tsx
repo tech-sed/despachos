@@ -4,27 +4,7 @@ import { useEffect, useState } from 'react'
 import { supabase } from '../supabase'
 import { useRouter } from 'next/navigation'
 import { puedeEditar } from '../lib/permisos'
-
-// Franjas horarias para comerciales (se mapean a vueltas internas)
-// Franja 3 "tarde" cubre V3+V4 — el ruteador decide la vuelta exacta
-// cutoff: hora límite de carga (en minutos desde medianoche, sobre la fecha de entrega)
-//   V1 → día anterior 14:00 (se indica como offsetDias=-1, hora=14:00)
-//   V2 → mismo día 06:00 (4h antes de las 10:00)
-//   V3 → mismo día 09:00 (4h antes de las 13:00)
-const FRANJAS = [
-  { vuelta: 1, label: 'Primera hora',        horario: '8:00 a 10:00hs',  cutoffDiaOffset: -1, cutoffHora: 14, cutoffMin: 0 },
-  { vuelta: 2, label: 'Antes del mediodía',  horario: '10:00 a 12:00hs', cutoffDiaOffset:  0, cutoffHora:  6, cutoffMin: 0 },
-  { vuelta: 3, label: 'Después del mediodía',horario: '13:00 a 17:00hs', cutoffDiaOffset:  0, cutoffHora:  9, cutoffMin: 0 },
-]
-
-// Devuelve true si el cutoff ya pasó (no se puede cargar más en esa franja)
-function vultaCerrada(fechaEntrega: string, franja: typeof FRANJAS[number]): boolean {
-  // Usamos hora local (Argentina, UTC-3) sin depender de timezone del servidor
-  const ahora = new Date()
-  const [anio, mes, dia] = fechaEntrega.split('-').map(Number)
-  const cutoff = new Date(anio, mes - 1, dia + franja.cutoffDiaOffset, franja.cutoffHora, franja.cutoffMin, 0)
-  return ahora >= cutoff
-}
+import { FRANJAS, vultaCerrada, vueltasCerradasPara } from '../lib/franjas'
 
 function detectarSucursal(sucursalObra: string, deposito: string): string {
   const obra = sucursalObra?.toUpperCase() || ''
@@ -93,6 +73,7 @@ export default function NuevoDespacho() {
   const [reprogFecha, setReprogFecha] = useState('')
   const [reprogVuelta, setReprogVuelta] = useState(1)
   const [reprogMotivo, setReprogMotivo] = useState('')
+  const reprogVueltasCerradas = vueltasCerradasPara(reprogFecha)
   const [linkMaps, setLinkMaps] = useState('')
   const [linkMapsOk, setLinkMapsOk] = useState<boolean | null>(null)
   const [puedeEditarDespachos, setPuedeEditarDespachos] = useState(false)
@@ -162,6 +143,12 @@ export default function NuevoDespacho() {
   async function handleReprogramarPedido(id: string, fecha: string, vuelta: number, motivo: string) {
     const pedido = misPedidos.find(p => p.id === id)
     if (!pedido) return
+    // Validar cutoff — mismas restricciones que cargar un pedido nuevo
+    const franja = FRANJAS.find(f => f.vuelta === vuelta)
+    if (franja && vultaCerrada(fecha, franja)) {
+      toast('Esta vuelta ya cerró para esa fecha. Elegí una franja disponible.', 'err')
+      return
+    }
     const nota = `⚡ Reprogramado desde ${pedido.fecha_entrega} V${pedido.vuelta}${motivo ? ` — ${motivo}` : ''}`
     const notaFinal = pedido.notas ? `${pedido.notas} | ${nota}` : nota
     try {
@@ -630,18 +617,40 @@ export default function NuevoDespacho() {
               <div>
                 <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>Nueva fecha</label>
                 <input type="date" value={reprogFecha}
-                  min={(() => { const d = new Date(); d.setDate(d.getDate() + 1); return d.toISOString().split('T')[0] })()}
-                  onChange={e => setReprogFecha(e.target.value)}
+                  min={new Date().toISOString().split('T')[0]}
+                  onChange={e => {
+                    setReprogFecha(e.target.value)
+                    // Si la vuelta actual queda cerrada con la nueva fecha, resetear a la primera disponible
+                    const cerradas = vueltasCerradasPara(e.target.value)
+                    if (cerradas.includes(reprogVuelta)) {
+                      const primerLibre = [1, 2, 3, 4].find(v => !cerradas.includes(v))
+                      setReprogVuelta(primerLibre ?? 4)
+                    }
+                  }}
                   className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none"
                   style={{ borderColor: '#e8edf8' }} />
               </div>
               <div>
                 <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>Vuelta</label>
-                <select value={reprogVuelta} onChange={e => setReprogVuelta(parseInt(e.target.value))}
+                <select value={reprogVuelta}
+                  onChange={e => setReprogVuelta(parseInt(e.target.value))}
                   className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none"
                   style={{ borderColor: '#e8edf8' }}>
-                  {[1, 2, 3, 4].map(v => <option key={v} value={v}>Vuelta {v}</option>)}
+                  {[1, 2, 3, 4].map(v => {
+                    const franja = FRANJAS.find(f => f.vuelta === v)
+                    const cerrada = franja ? reprogVueltasCerradas.includes(v) : false
+                    return (
+                      <option key={v} value={v} disabled={cerrada}>
+                        Vuelta {v}{cerrada ? ' — ⛔ Fuera de horario' : ''}
+                      </option>
+                    )
+                  })}
                 </select>
+                {reprogFecha && reprogVueltasCerradas.includes(reprogVuelta) && (
+                  <p className="text-xs mt-1" style={{ color: '#E52322' }}>
+                    Esta vuelta ya cerró para esa fecha. Seleccioná otra.
+                  </p>
+                )}
               </div>
               <div>
                 <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>Motivo</label>
@@ -652,7 +661,7 @@ export default function NuevoDespacho() {
               </div>
             </div>
             <div className="flex gap-2 mt-5">
-              <button disabled={!reprogFecha}
+              <button disabled={!reprogFecha || reprogVueltasCerradas.includes(reprogVuelta)}
                 onClick={() => handleReprogramarPedido(pedidoReprog.id, reprogFecha, reprogVuelta, reprogMotivo)}
                 className="flex-1 py-2.5 rounded-xl text-sm font-semibold text-white disabled:opacity-40"
                 style={{ background: '#254A96' }}>Confirmar</button>

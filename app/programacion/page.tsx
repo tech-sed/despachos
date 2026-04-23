@@ -834,12 +834,24 @@ function ProgramacionInner() {
         }
       } catch { /* si falla, mostrar pedidos sin items */ }
     }
-    const { data: fd } = await supabase.from('flota_dia').select('camion_codigo, revisado, sucursal_extra, sucursal_extra_desde_vuelta').eq('fecha', fecha).eq('sucursal', sucursal).eq('activo', true)
-    // También traer camiones cuya sucursal_extra coincide con esta sucursal
-    const { data: fdExtra } = await supabase.from('flota_dia').select('camion_codigo, sucursal, sucursal_extra_desde_vuelta').eq('fecha', fecha).eq('sucursal_extra', sucursal).eq('activo', true)
+    // Una sola consulta cubre flota propia + camiones de otras sucursales;
+    // el contador de sin-vuelta corre en paralelo para no bloquear
+    const [{ data: allFd }, { count: cSinVuelta }] = await Promise.all([
+      supabase.from('flota_dia')
+        .select('camion_codigo, sucursal, revisado, sucursal_extra, sucursal_extra_desde_vuelta')
+        .eq('fecha', fecha).eq('activo', true)
+        .or(`sucursal.eq.${sucursal},sucursal_extra.eq.${sucursal}`),
+      supabase.from('pedidos')
+        .select('id', { count: 'exact', head: true })
+        .eq('fecha_entrega', fecha).eq('sucursal', sucursal)
+        .eq('vuelta', 0).in('estado', ['pendiente', 'programado']),
+    ])
+    const fd = (allFd ?? []).filter((f: any) => f.sucursal === sucursal)
+    const fdExtra = (allFd ?? []).filter((f: any) => f.sucursal_extra === sucursal)
+    setContadorSinVuelta(cSinVuelta ?? 0)
 
-    let codigos = (fd ?? []).map((f: any) => f.camion_codigo)
-    let flotaSinRevisar = (fd ?? []).length === 0 || (fd ?? []).some((f: any) => f.revisado === false)
+    let codigos = fd.map((f: any) => f.camion_codigo)
+    let flotaSinRevisar = fd.length === 0 || fd.some((f: any) => f.revisado === false)
 
     // Fallback a flota base si no hay flota_dia para este día
     if (codigos.length === 0) {
@@ -849,26 +861,19 @@ function ProgramacionInner() {
     }
 
     // Agregar camiones de otras sucursales que operan también acá
-    const codigosExtra = (fdExtra ?? []).map((f: any) => f.camion_codigo)
+    const codigosExtra = fdExtra.map((f: any) => f.camion_codigo)
     const todosCodigos = [...new Set([...codigos, ...codigosExtra])]
 
     const { data: cd } = todosCodigos.length > 0 ? await supabase.from('camiones_flota').select('*').in('codigo', todosCodigos).eq('activo', true) : { data: [] }
 
     // Enriquecer con metadata de sucursal extra
     const cams = (cd ?? []).map((c: any) => {
-      const extra = (fdExtra ?? []).find((f: any) => f.camion_codigo === c.codigo)
+      const extra = fdExtra.find((f: any) => f.camion_codigo === c.codigo)
       return extra
         ? { ...c, _desde_sucursal: extra.sucursal, _disponible_desde_vuelta: extra.sucursal_extra_desde_vuelta ?? 2 }
         : c
     })
     setFlotaSinRevisar(flotaSinRevisar)
-
-    // Contador de pedidos sin vuelta asignada (para badge del tab)
-    const { count: cSinVuelta } = await supabase.from('pedidos')
-      .select('id', { count: 'exact', head: true })
-      .eq('fecha_entrega', fecha).eq('sucursal', sucursal)
-      .eq('vuelta', 0).in('estado', ['pendiente', 'programado'])
-    setContadorSinVuelta(cSinVuelta ?? 0)
 
     setPedidos(todosConItems); setCamiones(cams); construirColumnas(todosConItems, cams); setCargando(false)
   }

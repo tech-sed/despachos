@@ -172,15 +172,22 @@ export default function PedidosPage() {
         setPuedeEditarPedidos(puedeEditar(data?.permisos, data?.rol, 'pedidos'))
         setUserRol(data?.rol ?? '')
         if (data?.sucursal) setFiltroSucursal(data.sucursal)
+        // Auto-search if navigated from métricas with a NV param
+        const nvParam = new URLSearchParams(window.location.search).get('nv')
+        if (nvParam) {
+          setFiltroTexto(nvParam)
+          buscar(nvParam)
+        }
       })
     })
   }, [])
 
-  async function buscar() {
+  async function buscar(textoOverride?: string) {
     setCargando(true)
     setCategoriasMap({})
     setItemsMap({})
     setExpandidos(new Set())
+    const textoFinal = textoOverride !== undefined ? textoOverride : filtroTexto
     let q = supabase
       .from('pedidos')
       .select('id, nv, id_despacho, cliente, direccion, sucursal, fecha_entrega, vuelta, estado, estado_pago, peso_total_kg, volumen_total_m3, notas, camion_id, tipo, created_at, vendedor_id', { count: 'exact' })
@@ -191,8 +198,8 @@ export default function PedidosPage() {
     if (filtroFecha) q = q.eq('fecha_entrega', filtroFecha)
     if (filtroSucursal) q = q.eq('sucursal', filtroSucursal)
     if (filtroEstado) q = q.eq('estado', filtroEstado)
-    if (filtroTexto) {
-      const txt = `%${filtroTexto}%`
+    if (textoFinal) {
+      const txt = `%${textoFinal}%`
       q = q.or(`cliente.ilike.${txt},nv.ilike.${txt},direccion.ilike.${txt}`)
     }
 
@@ -225,6 +232,9 @@ export default function PedidosPage() {
       supabase.from('pedido_fotos').select('pedido_id, url, label').in('pedido_id', ids).order('created_at'),
     ])
 
+    // Pre-normalizar materiales UNA sola vez (evita repetir normalizar() por cada item×material)
+    const matsNorm = (mats ?? []).map((m: any) => ({ ...m, _n: normalizar(m.nombre) }))
+
     // Items + categorías
     const newItemsMap: Record<string, Item[]> = {}
     // catKey = "tipo_carga|categoria" para deduplicar manteniendo ambos datos
@@ -232,10 +242,7 @@ export default function PedidosPage() {
 
     for (const item of rawItems ?? []) {
       const nItem = normalizar(item.nombre)
-      const mat = (mats ?? []).find((m: any) => {
-        const nMat = normalizar(m.nombre)
-        return nMat === nItem || nMat.includes(nItem) || nItem.includes(nMat)
-      })
+      const mat = matsNorm.find((m: any) => m._n === nItem || m._n.includes(nItem) || nItem.includes(m._n))
       const tipo = mat?.tipo_carga ?? 'otros'
       const categoria = mat?.categoria ?? null
       const subcategoria = mat?.subcategoria ?? null

@@ -85,9 +85,14 @@ interface PedidoDetalle {
   direccion: string
   sucursal: string
   estado: string
+  estado_pago: string | null
+  notas: string | null
+  tipo: string | null
   peso_total_kg: number
   volumen_total_m3: number
   orden_entrega: number | null
+  latitud: number | null
+  longitud: number | null
 }
 
 interface DatosVuelta {
@@ -98,6 +103,7 @@ interface DatosVuelta {
   pctPos: number
   pctKg: number
   distanciaKm: number
+  kmReal: boolean          // true = calculado por OSRM, false = estimado en línea recta
   pedidosConUbicacion: number
   detalle: PedidoDetalle[]
 }
@@ -180,7 +186,7 @@ export default function MetricasPage() {
     const [{ data: flotaDia }, { data: pedidosData }, { data: camionesData }] = await Promise.all([
       supabase.from('flota_dia').select('camion_codigo, chofer_id, hora_inicio, hora_fin, km_ruta').eq('fecha', fecha).eq('activo', true),
       supabase.from('pedidos')
-        .select('id, nv, cliente, direccion, sucursal, estado, camion_id, peso_total_kg, volumen_total_m3, vuelta, orden_entrega, latitud, longitud')
+        .select('id, nv, cliente, direccion, sucursal, estado, estado_pago, notas, tipo, camion_id, peso_total_kg, volumen_total_m3, vuelta, orden_entrega, latitud, longitud')
         .eq('fecha_entrega', fecha).neq('estado', 'cancelado').not('camion_id', 'is', null),
       supabase.from('camiones_flota').select('codigo, tipo_unidad, sucursal, posiciones_total, tonelaje_max_kg'),
     ])
@@ -232,14 +238,17 @@ export default function MetricasPage() {
           pctKg: pct(kg, camion.tonelaje_max_kg),
           pctPos: pct(pos, camion.posiciones_total),
           distanciaKm: dist,
+          kmReal: false,
           pedidosConUbicacion: pv.filter((p: any) => p.latitud && p.longitud).length,
           detalle: pv
             .sort((a: any, b: any) => (a.orden_entrega ?? 999) - (b.orden_entrega ?? 999))
             .map((p: any) => ({
               id: p.id, nv: p.nv, cliente: p.cliente, direccion: p.direccion,
               sucursal: p.sucursal, estado: p.estado,
+              estado_pago: p.estado_pago ?? null, notas: p.notas ?? null, tipo: p.tipo ?? null,
               peso_total_kg: p.peso_total_kg ?? 0, volumen_total_m3: p.volumen_total_m3 ?? 0,
               orden_entrega: p.orden_entrega,
+              latitud: p.latitud ?? null, longitud: p.longitud ?? null,
             })),
         }
       })
@@ -275,8 +284,66 @@ export default function MetricasPage() {
       .map(buildCamionData)
       .filter(Boolean) as DatosCamionDia[]
 
-    setDatosDia(datos.sort((a, b) => b.pctKg - a.pctKg))
+    const sorted = datos.sort((a, b) => b.pctKg - a.pctKg)
+    setDatosDia(sorted)
     setLoading(false)
+    calcularKmReales(sorted)   // actualiza km en background con OSRM
+  }
+
+  // Calcula km reales de ruta usando OSRM (open source, gratis, sin API key)
+  async function calcularKmReales(datos: DatosCamionDia[]) {
+    type Req = { camionCodigo: string; vueltaIdx: number; coords: string }
+    const reqs: Req[] = []
+
+    for (const d of datos) {
+      const depot = DEPOSITOS[d.sucursal] ?? { lat: -34.9205, lng: -57.9536 }
+      d.vueltas.forEach((v, vueltaIdx) => {
+        const stops = v.detalle
+          .filter(p => p.latitud && p.longitud)
+          .sort((a, b) => (a.orden_entrega ?? 999) - (b.orden_entrega ?? 999))
+        if (stops.length === 0) return
+        // OSRM: longitud,latitud (al revés de lo habitual)
+        const pts = [
+          `${depot.lng},${depot.lat}`,
+          ...stops.map(p => `${p.longitud},${p.latitud}`),
+          `${depot.lng},${depot.lat}`,
+        ].join(';')
+        reqs.push({ camionCodigo: d.camion_codigo, vueltaIdx, coords: pts })
+      })
+    }
+
+    if (reqs.length === 0) return
+
+    const results = await Promise.allSettled(
+      reqs.map(async r => {
+        const res = await fetch(
+          `https://router.project-osrm.org/route/v1/driving/${r.coords}?overview=false`
+        )
+        const json = await res.json()
+        const distM: number | null = json.routes?.[0]?.distance ?? null
+        return { ...r, distM }
+      })
+    )
+
+    setDatosDia(prev => {
+      const next = prev.map(d => ({
+        ...d,
+        vueltas: d.vueltas.map(v => ({ ...v })),
+      }))
+      for (const result of results) {
+        if (result.status !== 'fulfilled' || !result.value.distM) continue
+        const { camionCodigo, vueltaIdx, distM } = result.value
+        const ci = next.findIndex(d => d.camion_codigo === camionCodigo)
+        if (ci === -1 || !next[ci].vueltas[vueltaIdx]) continue
+        next[ci].vueltas[vueltaIdx].distanciaKm = Math.round(distM / 1000)
+        next[ci].vueltas[vueltaIdx].kmReal = true
+      }
+      // Recalcular km total del camión como suma de sus vueltas
+      for (const d of next) {
+        d.distanciaTotalKm = d.vueltas.reduce((a, v) => a + v.distanciaKm, 0)
+      }
+      return next
+    })
   }
 
   const cargarMensual = async (sucursalParam?: string) => {
@@ -435,6 +502,7 @@ const ESTADO_COLOR: Record<string, { bg: string; color: string }> = {
 }
 
 function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string }) {
+  const router = useRouter()
   const [filtroFlota, setFiltroFlota] = useState<'todos' | 'con_pedidos' | 'sin_pedidos'>('todos')
   const [modalVuelta, setModalVuelta] = useState<{ camion: string; vuelta: DatosVuelta } | null>(null)
 
@@ -518,7 +586,7 @@ function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string 
                   </div>
                   <p className="text-xs mt-0.5" style={{ color: '#B9BBB7' }}>
                     👤 {d.chofer_nombre} · 📦 {d.pedidos} pedidos
-                    {d.distanciaTotalKm > 0 && <> · 📍 ~{d.distanciaTotalKm} km estimados</>}
+                    {d.distanciaTotalKm > 0 && <> · 📍 {d.vueltas.every(v => v.kmReal) ? `${d.distanciaTotalKm} km` : `~${d.distanciaTotalKm} km`}</>}
                   </p>
                 </div>
               </div>
@@ -598,7 +666,7 @@ function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string 
                         {/* Distancia */}
                         <div className="flex items-center justify-between text-xs pt-1" style={{ borderTop: '1px solid #e8edf8' }}>
                           <span style={{ color: '#B9BBB7' }}>
-                            📍 {v.distanciaKm > 0 ? `~${v.distanciaKm} km` : 'Sin coordenadas'}
+                            📍 {v.distanciaKm > 0 ? (v.kmReal ? `${v.distanciaKm} km` : `~${v.distanciaKm} km`) : 'Sin coordenadas'}
                           </span>
                           {v.pedidosConUbicacion < v.pedidos && v.distanciaKm > 0 && (
                             <span style={{ color: '#f59e0b' }}>({v.pedidosConUbicacion}/{v.pedidos} con ubic.)</span>
@@ -640,7 +708,7 @@ function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string 
         >
           <div
             className="bg-white rounded-2xl shadow-2xl w-full overflow-hidden"
-            style={{ maxWidth: 680, maxHeight: '85vh', display: 'flex', flexDirection: 'column' }}
+            style={{ maxWidth: 820, maxHeight: '85vh', display: 'flex', flexDirection: 'column' }}
             onClick={e => e.stopPropagation()}
           >
             {/* Header */}
@@ -653,22 +721,42 @@ function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string 
                   {modalVuelta.vuelta.pedidos} pedido{modalVuelta.vuelta.pedidos !== 1 ? 's' : ''} ·
                   {' '}{Math.round(modalVuelta.vuelta.kgUsados).toLocaleString('es-AR')} kg ·
                   {' '}{Math.round(modalVuelta.vuelta.posicionesUsadas)} pos
-                  {modalVuelta.vuelta.distanciaKm > 0 && <> · ~{modalVuelta.vuelta.distanciaKm} km</>}
+                  {modalVuelta.vuelta.distanciaKm > 0 && <>
+                    {' '}· {modalVuelta.vuelta.kmReal ? `${modalVuelta.vuelta.distanciaKm} km` : `~${modalVuelta.vuelta.distanciaKm} km est.`}
+                  </>}
                 </p>
               </div>
-              <button
-                onClick={() => setModalVuelta(null)}
-                className="text-xl leading-none px-2"
-                style={{ color: '#B9BBB7' }}
-              >×</button>
+              <div className="flex items-center gap-2">
+                {(() => {
+                  const paradas = modalVuelta.vuelta.detalle
+                    .filter(p => p.latitud && p.longitud)
+                    .sort((a, b) => (a.orden_entrega ?? 999) - (b.orden_entrega ?? 999))
+                  if (paradas.length === 0) return null
+                  const dest = `${paradas[paradas.length - 1].latitud},${paradas[paradas.length - 1].longitud}`
+                  const wps = paradas.slice(0, -1).map(p => `${p.latitud},${p.longitud}`).join('|')
+                  const mapsUrl = `https://www.google.com/maps/dir/?api=1&destination=${dest}&travelmode=driving${wps ? `&waypoints=${wps}` : ''}`
+                  return (
+                    <a href={mapsUrl} target="_blank" rel="noopener noreferrer"
+                      className="text-xs px-3 py-1.5 rounded-lg font-semibold whitespace-nowrap"
+                      style={{ background: '#254A96', color: 'white' }}>
+                      🗺️ Ver en Maps
+                    </a>
+                  )
+                })()}
+                <button
+                  onClick={() => setModalVuelta(null)}
+                  className="text-xl leading-none px-2"
+                  style={{ color: '#B9BBB7' }}
+                >×</button>
+              </div>
             </div>
 
             {/* Table */}
-            <div style={{ overflowY: 'auto', flex: 1 }}>
-              <table className="w-full text-sm">
+            <div style={{ overflowY: 'auto', overflowX: 'auto', flex: 1 }}>
+              <table className="w-full text-sm" style={{ minWidth: 700 }}>
                 <thead>
                   <tr style={{ background: '#f9f9f9', borderBottom: '1px solid #f0f0f0' }}>
-                    {['#', 'NV', 'Cliente', 'Destino', 'Kg', 'Pos', 'Estado'].map(h => (
+                    {['#', 'NV', 'Cliente', 'Kg', 'Pos', 'Estado', 'Pago', ''].map(h => (
                       <th key={h} className="text-left px-4 py-2.5 text-xs font-semibold uppercase tracking-wide whitespace-nowrap" style={{ color: '#B9BBB7' }}>{h}</th>
                     ))}
                   </tr>
@@ -676,15 +764,31 @@ function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string 
                 <tbody>
                   {modalVuelta.vuelta.detalle.map((p, i) => {
                     const sem = ESTADO_COLOR[p.estado] ?? { bg: '#f4f4f3', color: '#666' }
+                    const pagoLabel: Record<string, string> = {
+                      cobrado: 'Cobrado', cuenta_corriente: 'Cta. Cte.',
+                      pendiente_cobro: 'Pend.', pago_en_obra: 'En obra',
+                    }
+                    const pagoBg: Record<string, { bg: string; color: string }> = {
+                      cobrado: { bg: '#dcfce7', color: '#166534' },
+                      cuenta_corriente: { bg: '#dbeafe', color: '#1e40af' },
+                      pendiente_cobro: { bg: '#fef9c3', color: '#854d0e' },
+                      pago_en_obra: { bg: '#ffedd5', color: '#9a3412' },
+                    }
+                    const pagoStyle = p.estado_pago ? (pagoBg[p.estado_pago] ?? { bg: '#f4f4f3', color: '#555' }) : null
                     return (
                       <tr key={p.id} style={{ borderBottom: '1px solid #f9f9f9', background: i % 2 === 0 ? 'white' : '#fdfdfd' }}>
                         <td className="px-4 py-2.5 text-xs" style={{ color: '#B9BBB7' }}>{p.orden_entrega ?? i + 1}</td>
-                        <td className="px-4 py-2.5 text-xs font-medium whitespace-nowrap" style={{ color: '#254A96' }}>{p.nv}</td>
+                        <td className="px-4 py-2.5 text-xs font-medium whitespace-nowrap" style={{ color: '#254A96' }}>
+                          {p.tipo === 'retiro'
+                            ? <span className="text-xs px-1.5 py-0.5 rounded font-semibold" style={{ background: '#ccfbf1', color: '#0f766e' }}>🔄 RETIRO</span>
+                            : p.nv
+                          }
+                        </td>
                         <td className="px-4 py-2.5">
                           <p className="text-xs font-medium" style={{ color: '#1a1a1a' }}>{p.cliente}</p>
                           <p className="text-xs" style={{ color: '#B9BBB7' }}>{p.direccion}</p>
+                          {p.notas && <p className="text-xs mt-0.5 italic" style={{ color: '#94a3b8' }}>📝 {p.notas}</p>}
                         </td>
-                        <td className="px-4 py-2.5 text-xs whitespace-nowrap" style={{ color: '#B9BBB7' }}>{p.sucursal}</td>
                         <td className="px-4 py-2.5 text-xs whitespace-nowrap" style={{ color: '#1a1a1a' }}>
                           {Math.round(p.peso_total_kg).toLocaleString('es-AR')} kg
                         </td>
@@ -696,6 +800,22 @@ function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string 
                             style={{ background: sem.bg, color: sem.color }}>
                             {p.estado}
                           </span>
+                        </td>
+                        <td className="px-4 py-2.5">
+                          {pagoStyle
+                            ? <span className="text-xs px-2 py-0.5 rounded-lg font-medium whitespace-nowrap" style={{ background: pagoStyle.bg, color: pagoStyle.color }}>
+                                {pagoLabel[p.estado_pago!] ?? p.estado_pago}
+                              </span>
+                            : <span style={{ color: '#ddd' }}>—</span>
+                          }
+                        </td>
+                        <td className="px-3 py-2.5">
+                          <button
+                            onClick={() => router.push(`/pedidos?nv=${encodeURIComponent(p.nv)}`)}
+                            className="text-xs px-2 py-1 rounded-lg font-semibold whitespace-nowrap"
+                            style={{ background: '#e8edf8', color: '#254A96' }}
+                            title="Ver detalle completo"
+                          >→</button>
                         </td>
                       </tr>
                     )

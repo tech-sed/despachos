@@ -53,7 +53,7 @@ const DEPOSITOS: Record<string, { lat: number; lng: number }> = {
   'LP520':    { lat: -34.965403, lng: -58.06488 },
   'LP139':    { lat: -34.914872, lng: -58.023912 },
   'Guernica': { lat: -34.91118,  lng: -58.39945 },
-  'Cañuelas': { lat: -35.0001,   lng: -58.44506 },
+  'Cañuelas': { lat: -35.0004012, lng: -58.7474278 },
   'Pinamar':  { lat: -37.207852, lng: -56.972302 },
 }
 

@@ -902,9 +902,14 @@ function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string 
                     .filter(p => p.latitud && p.longitud)
                     .sort((a, b) => (a.orden_entrega ?? 999) - (b.orden_entrega ?? 999))
                   if (paradas.length === 0) return null
-                  const dest = `${paradas[paradas.length - 1].latitud},${paradas[paradas.length - 1].longitud}`
-                  const wps = paradas.slice(0, -1).map(p => `${p.latitud},${p.longitud}`).join('|')
-                  const mapsUrl = `https://www.google.com/maps/dir/?api=1&destination=${dest}&travelmode=driving${wps ? `&waypoints=${wps}` : ''}`
+                  const camionData = datos.find(d => d.camion_codigo === modalVuelta.camion)
+                  const depot = camionData ? (DEPOSITOS[camionData.sucursal] ?? null) : null
+                  const depotStr = depot ? `${depot.lat},${depot.lng}` : ''
+                  // Ruta: depósito → paradas en orden → vuelta al depósito
+                  const wps = paradas.map(p => `${p.latitud},${p.longitud}`).join('|')
+                  const mapsUrl = depotStr
+                    ? `https://www.google.com/maps/dir/?api=1&origin=${depotStr}&destination=${depotStr}&travelmode=driving&waypoints=${wps}`
+                    : `https://www.google.com/maps/dir/?api=1&destination=${paradas[paradas.length-1].latitud},${paradas[paradas.length-1].longitud}&travelmode=driving${paradas.length > 1 ? `&waypoints=${paradas.slice(0,-1).map(p=>`${p.latitud},${p.longitud}`).join('|')}` : ''}`
                   return (
                     <a href={mapsUrl} target="_blank" rel="noopener noreferrer"
                       className="text-xs px-3 py-1.5 rounded-lg font-semibold whitespace-nowrap"

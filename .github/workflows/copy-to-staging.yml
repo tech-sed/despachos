@@ -30,3 +30,10 @@ jobs:
 
       - name: Ejecutar copia producción → staging
         run: node scripts/copy-to-staging.mjs
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          STAGING_REF: ${{ secrets.STAGING_REF }}
+          PROD_SUPABASE_URL: ${{ secrets.PROD_SUPABASE_URL }}
+          PROD_SERVICE_KEY: ${{ secrets.PROD_SERVICE_KEY }}
+          STAGING_SUPABASE_URL: ${{ secrets.STAGING_SUPABASE_URL }}
+          STAGING_SERVICE_KEY: ${{ secrets.STAGING_SERVICE_KEY }}

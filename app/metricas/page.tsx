@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useRef } from 'react'
 import { supabase } from '../supabase'
 import { useRouter } from 'next/navigation'
 import { tieneAcceso } from '../lib/permisos'
@@ -53,7 +53,7 @@ const DEPOSITOS: Record<string, { lat: number; lng: number }> = {
   'LP520':    { lat: -34.965403, lng: -58.06488 },
   'LP139':    { lat: -34.914872, lng: -58.023912 },
   'Guernica': { lat: -34.91118,  lng: -58.39945 },
-  'Cañuelas': { lat: -35.0001,   lng: -58.44506 },
+  'Cañuelas': { lat: -35.0004012, lng: -58.7474278 },
   'Pinamar':  { lat: -37.207852, lng: -56.972302 },
 }
 
@@ -85,9 +85,14 @@ interface PedidoDetalle {
   direccion: string
   sucursal: string
   estado: string
+  estado_pago: string | null
+  notas: string | null
+  tipo: string | null
   peso_total_kg: number
   volumen_total_m3: number
   orden_entrega: number | null
+  latitud: number | null
+  longitud: number | null
 }
 
 interface DatosVuelta {
@@ -98,6 +103,7 @@ interface DatosVuelta {
   pctPos: number
   pctKg: number
   distanciaKm: number
+  kmReal: boolean          // true = calculado por OSRM, false = estimado en línea recta
   pedidosConUbicacion: number
   detalle: PedidoDetalle[]
 }
@@ -148,6 +154,11 @@ export default function MetricasPage() {
   const [datosDia, setDatosDia] = useState<DatosCamionDia[]>([])
   const [datosMes, setDatosMes] = useState<DatosCamionMes[]>([])
   const [toast, setToast] = useState<string | null>(null)
+  const [chatAbierto, setChatAbierto] = useState(false)
+  const [exportando, setExportando] = useState(false)
+  const primerDiaMes = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-01` }
+  const [fechaExportDesde, setFechaExportDesde] = useState(primerDiaMes)
+  const [fechaExportHasta, setFechaExportHasta] = useState(hoy)
 
   const showToast = (msg: string) => { setToast(msg); setTimeout(() => setToast(null), 3000) }
 
@@ -173,6 +184,119 @@ export default function MetricasPage() {
     else cargarMensual()
   }
 
+  async function exportarExcel() {
+    if (!fechaExportDesde || !fechaExportHasta) { showToast('Seleccioná el intervalo de fechas'); return }
+    if (fechaExportDesde > fechaExportHasta) { showToast('La fecha de inicio debe ser anterior al fin'); return }
+    setExportando(true)
+    try {
+      const XLSX = await import('xlsx')
+      const wb = XLSX.utils.book_new()
+
+      // Queries paralelas: pedidos + flota + camiones para el intervalo
+      let pedQ = supabase.from('pedidos')
+        .select('nv, id_despacho, cliente, direccion, sucursal, fecha_entrega, vuelta, camion_id, estado, estado_pago, peso_total_kg, volumen_total_m3, notas, tipo')
+        .gte('fecha_entrega', fechaExportDesde).lte('fecha_entrega', fechaExportHasta)
+        .neq('estado', 'cancelado').order('fecha_entrega').order('sucursal').order('cliente')
+      let flotQ = supabase.from('flota_dia')
+        .select('fecha, camion_codigo, sucursal, km_ruta')
+        .gte('fecha', fechaExportDesde).lte('fecha', fechaExportHasta).eq('activo', true)
+      if (filtroSucursal) { pedQ = pedQ.eq('sucursal', filtroSucursal); flotQ = flotQ.eq('sucursal', filtroSucursal) }
+
+      const [{ data: pedidosData }, { data: flotaData }, { data: camionesData }] = await Promise.all([
+        pedQ, flotQ,
+        supabase.from('camiones_flota').select('codigo, tipo_unidad, sucursal, posiciones_total, tonelaje_max_kg'),
+      ])
+
+      const camionMap: Record<string, any> = {}
+      for (const c of camionesData ?? []) camionMap[c.codigo] = c
+
+      // Hoja 1: Pedidos detalle
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
+        (pedidosData ?? []).map(p => ({
+          'NV': p.nv, 'SD': p.id_despacho ?? '', 'Tipo': p.tipo === 'retiro' ? 'Retiro' : 'Entrega',
+          'Cliente': p.cliente, 'Dirección': p.direccion, 'Sucursal': p.sucursal,
+          'Fecha': p.fecha_entrega,
+          'Día': new Date(p.fecha_entrega + 'T12:00:00').toLocaleDateString('es-AR', { weekday: 'long' }),
+          'Vuelta': p.vuelta === 0 ? 'Sin asignar' : `V${p.vuelta}`,
+          'Camión': p.camion_id ?? '', 'Estado': p.estado, 'Pago': p.estado_pago ?? '',
+          'Kg': p.peso_total_kg ?? 0, 'Posiciones': p.volumen_total_m3 ?? 0, 'Notas': p.notas ?? '',
+        }))
+      ), 'Pedidos')
+
+      // Hoja 2: Resumen por día
+      const byDia: Record<string, { pedidos: number; kg: number; pos: number; entregados: number; rechazados: number }> = {}
+      for (const p of pedidosData ?? []) {
+        if (!byDia[p.fecha_entrega]) byDia[p.fecha_entrega] = { pedidos: 0, kg: 0, pos: 0, entregados: 0, rechazados: 0 }
+        byDia[p.fecha_entrega].pedidos++
+        byDia[p.fecha_entrega].kg += p.peso_total_kg ?? 0
+        byDia[p.fecha_entrega].pos += p.volumen_total_m3 ?? 0
+        if (p.estado === 'entregado' || p.estado === 'entregado_parcial') byDia[p.fecha_entrega].entregados++
+        if (p.estado === 'rechazado') byDia[p.fecha_entrega].rechazados++
+      }
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
+        Object.entries(byDia).sort((a, b) => a[0].localeCompare(b[0])).map(([f, d]) => ({
+          'Fecha': f,
+          'Día': new Date(f + 'T12:00:00').toLocaleDateString('es-AR', { weekday: 'long' }),
+          'Pedidos': d.pedidos, 'Entregados': d.entregados, 'Rechazados': d.rechazados,
+          '% Entrega': d.pedidos > 0 ? Math.round(d.entregados / d.pedidos * 100) : 0,
+          'Kg totales': Math.round(d.kg), 'Posiciones': Math.round(d.pos),
+        }))
+      ), 'Por día')
+
+      // Hoja 3: Resumen por camión
+      const byTruck: Record<string, { diasActivo: number; pedidos: number; kg: number; pos: number; km: number; capKg: number; capPos: number }> = {}
+      for (const f of flotaData ?? []) {
+        if (!byTruck[f.camion_codigo]) byTruck[f.camion_codigo] = { diasActivo: 0, pedidos: 0, kg: 0, pos: 0, km: 0, capKg: 0, capPos: 0 }
+        byTruck[f.camion_codigo].diasActivo++; byTruck[f.camion_codigo].km += f.km_ruta ?? 0
+        const c = camionMap[f.camion_codigo]
+        if (c) { byTruck[f.camion_codigo].capKg += c.tonelaje_max_kg; byTruck[f.camion_codigo].capPos += c.posiciones_total }
+      }
+      for (const p of pedidosData ?? []) {
+        if (!p.camion_id) continue
+        if (!byTruck[p.camion_id]) byTruck[p.camion_id] = { diasActivo: 0, pedidos: 0, kg: 0, pos: 0, km: 0, capKg: 0, capPos: 0 }
+        byTruck[p.camion_id].pedidos++; byTruck[p.camion_id].kg += p.peso_total_kg ?? 0; byTruck[p.camion_id].pos += p.volumen_total_m3 ?? 0
+      }
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
+        Object.entries(byTruck).sort((a, b) => b[1].kg - a[1].kg).map(([cod, d]) => {
+          const c = camionMap[cod]
+          return {
+            'Camión': cod, 'Tipo': c?.tipo_unidad ?? '', 'Sucursal': c?.sucursal ?? '',
+            'Días activo': d.diasActivo, 'Pedidos': d.pedidos,
+            'Kg totales': Math.round(d.kg), 'Avg Ocup. Kg %': d.capKg > 0 ? Math.round(d.kg / d.capKg * 100) : 0,
+            'Pos totales': Math.round(d.pos), 'Avg Ocup. Pos %': d.capPos > 0 ? Math.round(d.pos / d.capPos * 100) : 0,
+            'Km totales': Math.round(d.km),
+          }
+        })
+      ), 'Por camión')
+
+      // Hoja 4: Por sucursal
+      const bySuc: Record<string, { pedidos: number; kg: number; pos: number; entregados: number; rechazados: number }> = {}
+      for (const p of pedidosData ?? []) {
+        if (!bySuc[p.sucursal]) bySuc[p.sucursal] = { pedidos: 0, kg: 0, pos: 0, entregados: 0, rechazados: 0 }
+        bySuc[p.sucursal].pedidos++; bySuc[p.sucursal].kg += p.peso_total_kg ?? 0; bySuc[p.sucursal].pos += p.volumen_total_m3 ?? 0
+        if (p.estado === 'entregado' || p.estado === 'entregado_parcial') bySuc[p.sucursal].entregados++
+        if (p.estado === 'rechazado') bySuc[p.sucursal].rechazados++
+      }
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
+        Object.entries(bySuc).sort((a, b) => b[1].pedidos - a[1].pedidos).map(([s, d]) => ({
+          'Sucursal': s, 'Pedidos': d.pedidos, 'Entregados': d.entregados, 'Rechazados': d.rechazados,
+          '% Entrega': d.pedidos > 0 ? Math.round(d.entregados / d.pedidos * 100) : 0,
+          'Kg totales': Math.round(d.kg), 'Posiciones': Math.round(d.pos),
+        }))
+      ), 'Por sucursal')
+
+      const suf = filtroSucursal ? `-${filtroSucursal}` : ''
+      const nombre = fechaExportDesde === fechaExportHasta
+        ? `despachos-app-${fechaExportDesde}${suf}.xlsx`
+        : `despachos-app-${fechaExportDesde}-${fechaExportHasta}${suf}.xlsx`
+      XLSX.writeFile(wb, nombre)
+      showToast(`Excel descargado (${(pedidosData ?? []).length} pedidos)`)
+    } catch (e: any) {
+      showToast(`Error: ${e.message}`)
+    }
+    setExportando(false)
+  }
+
   const cargarDiaria = async (sucursalParam?: string) => {
     setLoading(true)
     const sucursal = sucursalParam !== undefined ? sucursalParam : filtroSucursal
@@ -180,7 +304,7 @@ export default function MetricasPage() {
     const [{ data: flotaDia }, { data: pedidosData }, { data: camionesData }] = await Promise.all([
       supabase.from('flota_dia').select('camion_codigo, chofer_id, hora_inicio, hora_fin, km_ruta').eq('fecha', fecha).eq('activo', true),
       supabase.from('pedidos')
-        .select('id, nv, cliente, direccion, sucursal, estado, camion_id, peso_total_kg, volumen_total_m3, vuelta, orden_entrega, latitud, longitud')
+        .select('id, nv, cliente, direccion, sucursal, estado, estado_pago, notas, tipo, camion_id, peso_total_kg, volumen_total_m3, vuelta, orden_entrega, latitud, longitud')
         .eq('fecha_entrega', fecha).neq('estado', 'cancelado').not('camion_id', 'is', null),
       supabase.from('camiones_flota').select('codigo, tipo_unidad, sucursal, posiciones_total, tonelaje_max_kg'),
     ])
@@ -232,14 +356,17 @@ export default function MetricasPage() {
           pctKg: pct(kg, camion.tonelaje_max_kg),
           pctPos: pct(pos, camion.posiciones_total),
           distanciaKm: dist,
+          kmReal: false,
           pedidosConUbicacion: pv.filter((p: any) => p.latitud && p.longitud).length,
           detalle: pv
             .sort((a: any, b: any) => (a.orden_entrega ?? 999) - (b.orden_entrega ?? 999))
             .map((p: any) => ({
               id: p.id, nv: p.nv, cliente: p.cliente, direccion: p.direccion,
               sucursal: p.sucursal, estado: p.estado,
+              estado_pago: p.estado_pago ?? null, notas: p.notas ?? null, tipo: p.tipo ?? null,
               peso_total_kg: p.peso_total_kg ?? 0, volumen_total_m3: p.volumen_total_m3 ?? 0,
               orden_entrega: p.orden_entrega,
+              latitud: p.latitud ?? null, longitud: p.longitud ?? null,
             })),
         }
       })
@@ -275,8 +402,63 @@ export default function MetricasPage() {
       .map(buildCamionData)
       .filter(Boolean) as DatosCamionDia[]
 
-    setDatosDia(datos.sort((a, b) => b.pctKg - a.pctKg))
+    const sorted = datos.sort((a, b) => b.pctKg - a.pctKg)
+    setDatosDia(sorted)
     setLoading(false)
+    calcularKmReales(sorted)   // actualiza km en background con OSRM
+  }
+
+  // Calcula km reales de ruta usando OSRM (open source, gratis, sin API key)
+  async function calcularKmReales(datos: DatosCamionDia[]) {
+    type Req = { camionCodigo: string; vueltaIdx: number; coords: string }
+    const reqs: Req[] = []
+
+    for (const d of datos) {
+      const depot = DEPOSITOS[d.sucursal] ?? { lat: -34.9205, lng: -57.9536 }
+      d.vueltas.forEach((v, vueltaIdx) => {
+        const stops = v.detalle
+          .filter(p => p.latitud && p.longitud)
+          .sort((a, b) => (a.orden_entrega ?? 999) - (b.orden_entrega ?? 999))
+        if (stops.length === 0) return
+        // OSRM: longitud,latitud (al revés de lo habitual)
+        const pts = [
+          `${depot.lng},${depot.lat}`,
+          ...stops.map(p => `${p.longitud},${p.latitud}`),
+          `${depot.lng},${depot.lat}`,
+        ].join(';')
+        reqs.push({ camionCodigo: d.camion_codigo, vueltaIdx, coords: pts })
+      })
+    }
+
+    if (reqs.length === 0) return
+
+    // Secuencial para no saturar el servidor OSRM demo con N pedidos paralelos.
+    // Cada resultado actualiza la UI en cuanto llega (km en tiempo real).
+    for (const r of reqs) {
+      try {
+        const res = await fetch(`/api/km-ruta?coords=${encodeURIComponent(r.coords)}`)
+        if (!res.ok) continue
+        const json = await res.json()
+        const distM: number | null = json.distanciaM ?? null
+        if (!distM) continue
+
+        setDatosDia(prev => {
+          const next = prev.map(d => ({
+            ...d,
+            vueltas: d.vueltas.map(v => ({ ...v })),
+          }))
+          const ci = next.findIndex(d => d.camion_codigo === r.camionCodigo)
+          if (ci !== -1 && next[ci].vueltas[r.vueltaIdx]) {
+            next[ci].vueltas[r.vueltaIdx].distanciaKm = Math.round(distM / 1000)
+            next[ci].vueltas[r.vueltaIdx].kmReal = true
+            next[ci].distanciaTotalKm = next[ci].vueltas.reduce((a, v) => a + v.distanciaKm, 0)
+          }
+          return next
+        })
+      } catch {
+        // ignorar fallos individuales, la estimación ~km permanece
+      }
+    }
   }
 
   const cargarMensual = async (sucursalParam?: string) => {
@@ -372,7 +554,8 @@ export default function MetricasPage() {
       <main className="max-w-[1400px] mx-auto px-4 md:px-6 py-6">
 
         {/* Filtros */}
-        <div className="bg-white rounded-xl shadow-sm p-4 mb-6">
+        <div className="bg-white rounded-xl shadow-sm p-4 mb-6 space-y-3">
+          {/* Fila 1: vista */}
           <div className="flex flex-wrap gap-3 items-end">
             {vista === 'diaria' ? (
               <div>
@@ -405,6 +588,36 @@ export default function MetricasPage() {
               Buscar
             </button>
           </div>
+
+          {/* Fila 2: exportar por rango */}
+          <div className="flex flex-wrap gap-3 items-end pt-3" style={{ borderTop: '1px solid #f0f0f0' }}>
+            <span className="text-xs font-semibold self-center" style={{ color: '#B9BBB7' }}>📊 EXPORTAR</span>
+            <div>
+              <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>Desde</label>
+              <input type="date" value={fechaExportDesde} onChange={e => setFechaExportDesde(e.target.value)}
+                className="border rounded-lg px-3 py-2 text-sm focus:outline-none"
+                style={{ borderColor: '#e8edf8' }} />
+            </div>
+            <div>
+              <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>Hasta</label>
+              <input type="date" value={fechaExportHasta} onChange={e => setFechaExportHasta(e.target.value)}
+                className="border rounded-lg px-3 py-2 text-sm focus:outline-none"
+                style={{ borderColor: '#e8edf8' }} />
+            </div>
+            <button onClick={exportarExcel} disabled={exportando}
+              className="px-4 py-2 rounded-lg text-sm font-semibold disabled:opacity-50"
+              style={{ background: '#f4f4f3', color: '#254A96', border: '1px solid #e8edf8' }}>
+              {exportando ? 'Exportando...' : '⬇️ Excel'}
+            </button>
+            {fechaExportDesde && fechaExportHasta && (
+              <span className="text-xs self-center" style={{ color: '#B9BBB7' }}>
+                {fechaExportDesde === fechaExportHasta
+                  ? `1 día${filtroSucursal ? ` · ${filtroSucursal}` : ''}`
+                  : `${fechaExportDesde} → ${fechaExportHasta}${filtroSucursal ? ` · ${filtroSucursal}` : ''}`
+                }
+              </span>
+            )}
+          </div>
         </div>
 
         {loading ? (
@@ -418,6 +631,30 @@ export default function MetricasPage() {
           <VistaMensual datos={datosMes} mes={mes} />
         )}
       </main>
+
+      {/* Botón flotante chat IA */}
+      <button
+        onClick={() => setChatAbierto(v => !v)}
+        className="fixed bottom-6 right-6 z-40 flex items-center gap-2 px-4 py-3 rounded-2xl text-sm font-semibold text-white shadow-xl"
+        style={{ background: chatAbierto ? '#1a3a7a' : '#254A96' }}>
+        🤖 {chatAbierto ? 'Cerrar IA' : 'Analizar con IA'}
+      </button>
+
+      {/* Panel chat IA */}
+      {chatAbierto && (
+        <div className="fixed top-0 right-0 bottom-0 z-50 flex flex-col bg-white shadow-2xl" style={{ width: 400 }}>
+          <div className="px-4 py-3 flex items-center justify-between shrink-0" style={{ background: '#254A96' }}>
+            <div>
+              <p className="font-bold text-sm text-white">🤖 Análisis IA</p>
+              <p className="text-xs" style={{ color: 'rgba(255,255,255,0.7)' }}>
+                Últimos 30 días · {filtroSucursal || 'Todas las sucursales'}
+              </p>
+            </div>
+            <button onClick={() => setChatAbierto(false)} className="text-white text-2xl leading-none opacity-70 hover:opacity-100 px-1">×</button>
+          </div>
+          <ChatBot sucursal={filtroSucursal} />
+        </div>
+      )}
     </div>
   )
 }
@@ -435,6 +672,7 @@ const ESTADO_COLOR: Record<string, { bg: string; color: string }> = {
 }
 
 function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string }) {
+  const router = useRouter()
   const [filtroFlota, setFiltroFlota] = useState<'todos' | 'con_pedidos' | 'sin_pedidos'>('todos')
   const [modalVuelta, setModalVuelta] = useState<{ camion: string; vuelta: DatosVuelta } | null>(null)
 
@@ -518,7 +756,7 @@ function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string 
                   </div>
                   <p className="text-xs mt-0.5" style={{ color: '#B9BBB7' }}>
                     👤 {d.chofer_nombre} · 📦 {d.pedidos} pedidos
-                    {d.distanciaTotalKm > 0 && <> · 📍 ~{d.distanciaTotalKm} km estimados</>}
+                    {d.distanciaTotalKm > 0 && <> · 📍 {d.vueltas.every(v => v.kmReal) ? `${d.distanciaTotalKm} km` : `~${d.distanciaTotalKm} km`}</>}
                   </p>
                 </div>
               </div>
@@ -598,7 +836,7 @@ function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string 
                         {/* Distancia */}
                         <div className="flex items-center justify-between text-xs pt-1" style={{ borderTop: '1px solid #e8edf8' }}>
                           <span style={{ color: '#B9BBB7' }}>
-                            📍 {v.distanciaKm > 0 ? `~${v.distanciaKm} km` : 'Sin coordenadas'}
+                            📍 {v.distanciaKm > 0 ? (v.kmReal ? `${v.distanciaKm} km` : `~${v.distanciaKm} km`) : 'Sin coordenadas'}
                           </span>
                           {v.pedidosConUbicacion < v.pedidos && v.distanciaKm > 0 && (
                             <span style={{ color: '#f59e0b' }}>({v.pedidosConUbicacion}/{v.pedidos} con ubic.)</span>
@@ -640,7 +878,7 @@ function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string 
         >
           <div
             className="bg-white rounded-2xl shadow-2xl w-full overflow-hidden"
-            style={{ maxWidth: 680, maxHeight: '85vh', display: 'flex', flexDirection: 'column' }}
+            style={{ maxWidth: 820, maxHeight: '85vh', display: 'flex', flexDirection: 'column' }}
             onClick={e => e.stopPropagation()}
           >
             {/* Header */}
@@ -653,22 +891,47 @@ function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string 
                   {modalVuelta.vuelta.pedidos} pedido{modalVuelta.vuelta.pedidos !== 1 ? 's' : ''} ·
                   {' '}{Math.round(modalVuelta.vuelta.kgUsados).toLocaleString('es-AR')} kg ·
                   {' '}{Math.round(modalVuelta.vuelta.posicionesUsadas)} pos
-                  {modalVuelta.vuelta.distanciaKm > 0 && <> · ~{modalVuelta.vuelta.distanciaKm} km</>}
+                  {modalVuelta.vuelta.distanciaKm > 0 && <>
+                    {' '}· {modalVuelta.vuelta.kmReal ? `${modalVuelta.vuelta.distanciaKm} km` : `~${modalVuelta.vuelta.distanciaKm} km est.`}
+                  </>}
                 </p>
               </div>
-              <button
-                onClick={() => setModalVuelta(null)}
-                className="text-xl leading-none px-2"
-                style={{ color: '#B9BBB7' }}
-              >×</button>
+              <div className="flex items-center gap-2">
+                {(() => {
+                  const paradas = modalVuelta.vuelta.detalle
+                    .filter(p => p.latitud && p.longitud)
+                    .sort((a, b) => (a.orden_entrega ?? 999) - (b.orden_entrega ?? 999))
+                  if (paradas.length === 0) return null
+                  const camionData = datos.find(d => d.camion_codigo === modalVuelta.camion)
+                  const depot = camionData ? (DEPOSITOS[camionData.sucursal] ?? null) : null
+                  const depotStr = depot ? `${depot.lat},${depot.lng}` : ''
+                  // Ruta: depósito → paradas en orden → vuelta al depósito
+                  const wps = paradas.map(p => `${p.latitud},${p.longitud}`).join('|')
+                  const mapsUrl = depotStr
+                    ? `https://www.google.com/maps/dir/?api=1&origin=${depotStr}&destination=${depotStr}&travelmode=driving&waypoints=${wps}`
+                    : `https://www.google.com/maps/dir/?api=1&destination=${paradas[paradas.length-1].latitud},${paradas[paradas.length-1].longitud}&travelmode=driving${paradas.length > 1 ? `&waypoints=${paradas.slice(0,-1).map(p=>`${p.latitud},${p.longitud}`).join('|')}` : ''}`
+                  return (
+                    <a href={mapsUrl} target="_blank" rel="noopener noreferrer"
+                      className="text-xs px-3 py-1.5 rounded-lg font-semibold whitespace-nowrap"
+                      style={{ background: '#254A96', color: 'white' }}>
+                      🗺️ Ver en Maps
+                    </a>
+                  )
+                })()}
+                <button
+                  onClick={() => setModalVuelta(null)}
+                  className="text-xl leading-none px-2"
+                  style={{ color: '#B9BBB7' }}
+                >×</button>
+              </div>
             </div>
 
             {/* Table */}
-            <div style={{ overflowY: 'auto', flex: 1 }}>
-              <table className="w-full text-sm">
+            <div style={{ overflowY: 'auto', overflowX: 'auto', flex: 1 }}>
+              <table className="w-full text-sm" style={{ minWidth: 700 }}>
                 <thead>
                   <tr style={{ background: '#f9f9f9', borderBottom: '1px solid #f0f0f0' }}>
-                    {['#', 'NV', 'Cliente', 'Destino', 'Kg', 'Pos', 'Estado'].map(h => (
+                    {['#', 'NV', 'Cliente', 'Kg', 'Pos', 'Estado', 'Pago', ''].map(h => (
                       <th key={h} className="text-left px-4 py-2.5 text-xs font-semibold uppercase tracking-wide whitespace-nowrap" style={{ color: '#B9BBB7' }}>{h}</th>
                     ))}
                   </tr>
@@ -676,15 +939,31 @@ function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string 
                 <tbody>
                   {modalVuelta.vuelta.detalle.map((p, i) => {
                     const sem = ESTADO_COLOR[p.estado] ?? { bg: '#f4f4f3', color: '#666' }
+                    const pagoLabel: Record<string, string> = {
+                      cobrado: 'Cobrado', cuenta_corriente: 'Cta. Cte.',
+                      pendiente_cobro: 'Pend.', pago_en_obra: 'En obra',
+                    }
+                    const pagoBg: Record<string, { bg: string; color: string }> = {
+                      cobrado: { bg: '#dcfce7', color: '#166534' },
+                      cuenta_corriente: { bg: '#dbeafe', color: '#1e40af' },
+                      pendiente_cobro: { bg: '#fef9c3', color: '#854d0e' },
+                      pago_en_obra: { bg: '#ffedd5', color: '#9a3412' },
+                    }
+                    const pagoStyle = p.estado_pago ? (pagoBg[p.estado_pago] ?? { bg: '#f4f4f3', color: '#555' }) : null
                     return (
                       <tr key={p.id} style={{ borderBottom: '1px solid #f9f9f9', background: i % 2 === 0 ? 'white' : '#fdfdfd' }}>
                         <td className="px-4 py-2.5 text-xs" style={{ color: '#B9BBB7' }}>{p.orden_entrega ?? i + 1}</td>
-                        <td className="px-4 py-2.5 text-xs font-medium whitespace-nowrap" style={{ color: '#254A96' }}>{p.nv}</td>
+                        <td className="px-4 py-2.5 text-xs font-medium whitespace-nowrap" style={{ color: '#254A96' }}>
+                          {p.tipo === 'retiro'
+                            ? <span className="text-xs px-1.5 py-0.5 rounded font-semibold" style={{ background: '#ccfbf1', color: '#0f766e' }}>🔄 RETIRO</span>
+                            : p.nv
+                          }
+                        </td>
                         <td className="px-4 py-2.5">
                           <p className="text-xs font-medium" style={{ color: '#1a1a1a' }}>{p.cliente}</p>
                           <p className="text-xs" style={{ color: '#B9BBB7' }}>{p.direccion}</p>
+                          {p.notas && <p className="text-xs mt-0.5 italic" style={{ color: '#94a3b8' }}>📝 {p.notas}</p>}
                         </td>
-                        <td className="px-4 py-2.5 text-xs whitespace-nowrap" style={{ color: '#B9BBB7' }}>{p.sucursal}</td>
                         <td className="px-4 py-2.5 text-xs whitespace-nowrap" style={{ color: '#1a1a1a' }}>
                           {Math.round(p.peso_total_kg).toLocaleString('es-AR')} kg
                         </td>
@@ -696,6 +975,22 @@ function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string 
                             style={{ background: sem.bg, color: sem.color }}>
                             {p.estado}
                           </span>
+                        </td>
+                        <td className="px-4 py-2.5">
+                          {pagoStyle
+                            ? <span className="text-xs px-2 py-0.5 rounded-lg font-medium whitespace-nowrap" style={{ background: pagoStyle.bg, color: pagoStyle.color }}>
+                                {pagoLabel[p.estado_pago!] ?? p.estado_pago}
+                              </span>
+                            : <span style={{ color: '#ddd' }}>—</span>
+                          }
+                        </td>
+                        <td className="px-3 py-2.5">
+                          <button
+                            onClick={() => router.push(`/pedidos?nv=${encodeURIComponent(p.nv)}`)}
+                            className="text-xs px-2 py-1 rounded-lg font-semibold whitespace-nowrap"
+                            style={{ background: '#e8edf8', color: '#254A96' }}
+                            title="Ver detalle completo"
+                          >→</button>
                         </td>
                       </tr>
                     )
@@ -806,6 +1101,144 @@ function VistaMensual({ datos, mes }: { datos: DatosCamionMes[]; mes: string }) 
           </table>
         </div>
       </div>
+    </div>
+  )
+}
+
+// ─── Chat Bot ────────────────────────────────────────────────────────────────────
+
+function ChatBot({ sucursal }: { sucursal: string }) {
+  const [mensajes, setMensajes] = useState<{ rol: 'user' | 'assistant'; texto: string }[]>([])
+  const [input, setInput] = useState('')
+  const [loading, setLoading] = useState(false)
+  const scrollRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    enviar('Dame un resumen ejecutivo de la operación: ocupación promedio de flota, sucursal más activa, tendencias clave y las 2-3 oportunidades de mejora más importantes.', true)
+  }, [])
+
+  async function enviar(texto: string, silencioso = false) {
+    if (loading) return
+    const prevMensajes = silencioso ? [] : [...mensajes, { rol: 'user' as const, texto }]
+    if (!silencioso) setMensajes(prevMensajes)
+    setLoading(true)
+
+    const msgsApi = [...prevMensajes.map(m => ({ role: m.rol, content: m.texto })),
+      ...(silencioso ? [{ role: 'user' as const, content: texto }] : [])
+    ]
+
+    try {
+      const res = await fetch('/api/metricas-chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: msgsApi, sucursal }),
+      })
+      const data = await res.json()
+      const resp = data.respuesta ?? (data.error ? `Error: ${data.error}` : 'Sin respuesta')
+      setMensajes(prev => [...(silencioso ? [] : prev), { rol: 'assistant', texto: resp }])
+    } catch {
+      setMensajes(prev => [...(silencioso ? [] : prev), { rol: 'assistant', texto: 'Error de conexión. Intentá de nuevo.' }])
+    }
+    setLoading(false)
+    setTimeout(() => scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' }), 100)
+  }
+
+  function handleSubmit(e: React.FormEvent) {
+    e.preventDefault()
+    const txt = input.trim()
+    if (!txt || loading) return
+    enviar(txt)
+    setInput('')
+  }
+
+  function renderMarkdown(text: string) {
+    return text.split('\n').map((line, i) => {
+      const html = line
+        .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+        .replace(/^- /, '• ')
+      const isItem = line.startsWith('- ') || line.startsWith('• ')
+      return (
+        <p key={i}
+          className="leading-relaxed"
+          style={{ fontSize: 13, color: '#1a1a1a', paddingLeft: isItem ? 8 : 0, marginBottom: 2 }}
+          dangerouslySetInnerHTML={{ __html: html }} />
+      )
+    })
+  }
+
+  return (
+    <div className="flex flex-col flex-1 min-h-0">
+      {/* Messages */}
+      <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 space-y-3" style={{ fontFamily: 'Barlow, sans-serif' }}>
+        {mensajes.length === 0 && loading && (
+          <div className="flex flex-col items-center justify-center py-12 gap-3">
+            <div className="w-6 h-6 border-2 border-t-transparent rounded-full animate-spin" style={{ borderColor: '#254A96', borderTopColor: 'transparent' }} />
+            <p className="text-xs" style={{ color: '#B9BBB7' }}>Analizando los últimos 30 días...</p>
+          </div>
+        )}
+        {mensajes.map((m, i) => (
+          <div key={i} className={`flex ${m.rol === 'user' ? 'justify-end' : 'justify-start'}`}>
+            <div className="rounded-2xl px-3 py-2.5" style={{
+              maxWidth: '88%',
+              background: m.rol === 'user' ? '#254A96' : '#f4f4f3',
+            }}>
+              {m.rol === 'user'
+                ? <p style={{ fontSize: 13, color: 'white' }}>{m.texto}</p>
+                : <div>{renderMarkdown(m.texto)}</div>
+              }
+            </div>
+          </div>
+        ))}
+        {loading && mensajes.length > 0 && (
+          <div className="flex justify-start">
+            <div className="px-3 py-2.5 rounded-2xl" style={{ background: '#f4f4f3' }}>
+              <div className="flex gap-1 items-center">
+                {[0, 1, 2].map(j => (
+                  <div key={j} className="w-1.5 h-1.5 rounded-full animate-bounce"
+                    style={{ background: '#B9BBB7', animationDelay: `${j * 0.15}s` }} />
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Suggested questions */}
+      {mensajes.length === 1 && !loading && (
+        <div className="px-3 pb-2 flex flex-wrap gap-1.5">
+          {[
+            '¿Qué camiones están ociosos?',
+            '¿Cuál es el día más cargado?',
+            '¿Cómo mejorar la ocupación?',
+            '¿Qué sucursal tiene más rechazos?',
+          ].map(q => (
+            <button key={q} onClick={() => { enviar(q); }}
+              className="text-xs px-2.5 py-1.5 rounded-xl"
+              style={{ background: '#e8edf8', color: '#254A96' }}>
+              {q}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* Input */}
+      <form onSubmit={handleSubmit} className="p-3 border-t shrink-0" style={{ borderColor: '#f0f0f0' }}>
+        <div className="flex gap-2">
+          <input
+            value={input}
+            onChange={e => setInput(e.target.value)}
+            placeholder="Preguntá sobre tus datos..."
+            disabled={loading}
+            className="flex-1 border rounded-xl px-3 py-2 focus:outline-none"
+            style={{ fontSize: 13, borderColor: '#e8edf8' }}
+          />
+          <button type="submit" disabled={loading || !input.trim()}
+            className="px-3 py-2 rounded-xl text-sm font-bold text-white disabled:opacity-40"
+            style={{ background: '#254A96' }}>
+            →
+          </button>
+        </div>
+      </form>
     </div>
   )
 }

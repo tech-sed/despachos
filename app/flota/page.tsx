@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react'
 import { supabase } from '../supabase'
 import { useRouter } from 'next/navigation'
 import { tieneAcceso } from '../lib/permisos'
+import { logAuditoria } from '../lib/auditoria'
 
 // ─── Constantes ────────────────────────────────────────────────────────────────
 
@@ -48,6 +49,8 @@ export default function FlotaDia() {
   const [vista, setVista] = useState<'lista' | 'editar'>('lista')
   const [fechaEditar, setFechaEditar] = useState('')
   const [toast, setToast] = useState<{ msg: string; tipo: 'ok' | 'err' } | null>(null)
+  const [userId, setUserId] = useState('')
+  const [userNombre, setUserNombre] = useState('')
 
   const showToast = (msg: string, tipo: 'ok' | 'err' = 'ok') => {
     setToast({ msg, tipo }); setTimeout(() => setToast(null), 3500)
@@ -56,8 +59,10 @@ export default function FlotaDia() {
   useEffect(() => {
     supabase.auth.getUser().then(async ({ data: { user } }) => {
       if (!user) { router.push('/'); return }
-      const { data } = await supabase.from('usuarios').select('rol, permisos').eq('id', user.id).single()
+      const { data } = await supabase.from('usuarios').select('rol, permisos, nombre').eq('id', user.id).single()
       if (!tieneAcceso(data?.permisos, data?.rol, 'flota')) { router.push('/dashboard'); return }
+      setUserId(user.id)
+      setUserNombre(data?.nombre ?? '')
     })
   }, [])
 
@@ -86,7 +91,7 @@ export default function FlotaDia() {
 
       {vista === 'lista'
         ? <VistaLista onEditar={abrirEditar} onVolver={() => router.push('/dashboard')} showToast={showToast} />
-        : <VistaEditar fecha={fechaEditar} onVolver={volverALista} showToast={showToast} />
+        : <VistaEditar fecha={fechaEditar} onVolver={volverALista} showToast={showToast} userId={userId} userNombre={userNombre} />
       }
     </div>
   )
@@ -101,6 +106,8 @@ interface ResumenFlota {
   sucursales: string[]
   choferes: number
   ultimaModif: string | null
+  revisado: boolean
+  sinConfigurar: boolean  // true = no existe en flota_dia, usa flota base
 }
 
 function VistaLista({ onEditar, onVolver, showToast }: {
@@ -119,27 +126,24 @@ function VistaLista({ onEditar, onVolver, showToast }: {
     setLoading(true)
     const { data, error } = await supabase
       .from('flota_dia')
-      .select('fecha, activo, sucursal, chofer_id, updated_at')
+      .select('fecha, activo, sucursal, chofer_id, updated_at, revisado')
       .order('fecha', { ascending: false })
 
     if (error) { showToast('Error al cargar flotas', 'err'); setLoading(false); return }
 
     // Agrupar por fecha
-    const porFecha: Record<string, typeof data> = {}
+    const porFecha: Record<string, any[]> = {}
     ;(data ?? []).forEach((row: any) => {
       if (!porFecha[row.fecha]) porFecha[row.fecha] = []
       porFecha[row.fecha].push(row)
     })
 
-    const resumen: ResumenFlota[] = Object.entries(porFecha).map(([fecha, rows]) => {
+    const resumenExistente: ResumenFlota[] = Object.entries(porFecha).map(([fecha, rows]) => {
       const activos = rows.filter((r: any) => r.activo && r.sucursal !== 'Fuera de servicio')
       const sucursalesSet = new Set(activos.map((r: any) => r.sucursal).filter(Boolean))
       const choferes = rows.filter((r: any) => r.chofer_id).length
-      const ultimaModif = rows
-        .map((r: any) => r.updated_at)
-        .filter(Boolean)
-        .sort()
-        .at(-1) ?? null
+      const ultimaModif = rows.map((r: any) => r.updated_at).filter(Boolean).sort().at(-1) ?? null
+      const revisado = rows.every((r: any) => r.revisado === true)
       return {
         fecha,
         totalCamiones: rows.length,
@@ -147,10 +151,36 @@ function VistaLista({ onEditar, onVolver, showToast }: {
         sucursales: [...sucursalesSet],
         choferes,
         ultimaModif,
+        revisado,
+        sinConfigurar: false,
       }
     })
 
-    setFlotas(resumen)
+    // Agregar los próximos 30 días aunque no tengan flota_dia configurada (excepto domingos)
+    const fechasExistentes = new Set(resumenExistente.map(r => r.fecha))
+    const proximos: ResumenFlota[] = []
+    for (let i = 0; i < 30; i++) {
+      const d = new Date(); d.setDate(d.getDate() + i)
+      if (d.getDay() === 0) continue  // Saltar domingos
+      const fecha = d.toISOString().split('T')[0]
+      if (!fechasExistentes.has(fecha)) {
+        proximos.push({
+          fecha,
+          totalCamiones: 0,
+          activos: 0,
+          sucursales: [],
+          choferes: 0,
+          ultimaModif: null,
+          revisado: false,
+          sinConfigurar: true,
+        })
+      }
+    }
+
+    const todos = [...resumenExistente, ...proximos]
+      .sort((a, b) => a.fecha.localeCompare(b.fecha))  // ascendente: más cercano primero
+
+    setFlotas(todos)
     setLoading(false)
   }
 
@@ -237,25 +267,17 @@ function VistaLista({ onEditar, onVolver, showToast }: {
           </div>
         )}
 
-        {flotas.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-24 text-center">
-            <div className="text-5xl mb-4">🚛</div>
-            <p className="font-semibold text-base" style={{ color: '#254A96' }}>No hay flotas configuradas</p>
-            <p className="text-sm mt-1" style={{ color: '#B9BBB7' }}>Creá la primera flota usando el botón "Nueva flota"</p>
-          </div>
-        ) : (
-          <div className="space-y-6">
-            {flotasHoy.length > 0 && (
-              <Section titulo="Hoy" flotas={flotasHoy} onEditar={onEditar} destacar />
-            )}
-            {flotasFuturas.length > 0 && (
-              <Section titulo="Próximos días" flotas={flotasFuturas} onEditar={onEditar} />
-            )}
-            {flotasPasadas.length > 0 && (
-              <Section titulo="Días anteriores" flotas={flotasPasadas} onEditar={onEditar} opaco />
-            )}
-          </div>
-        )}
+        <div className="space-y-6">
+          {flotasHoy.length > 0 && (
+            <Section titulo="Hoy" flotas={flotasHoy} onEditar={onEditar} destacar />
+          )}
+          {flotasFuturas.length > 0 && (
+            <Section titulo="Próximos días" flotas={flotasFuturas} onEditar={onEditar} />
+          )}
+          {flotasPasadas.length > 0 && (
+            <Section titulo="Días anteriores" flotas={[...flotasPasadas].reverse()} onEditar={onEditar} opaco />
+          )}
+        </div>
       </main>
     </>
   )
@@ -319,13 +341,24 @@ function CardFlota({ flota, onEditar, destacar, opaco }: {
             <span className="text-xs px-2 py-0.5 rounded-full font-semibold"
               style={{ background: '#254A96', color: 'white' }}>Hoy</span>
           )}
+          {!flota.revisado && !opaco && (
+            <span className="text-xs px-2 py-0.5 rounded-full font-semibold"
+              style={{ background: '#fef3c7', color: '#92400e' }}>⚠️ Sin revisar</span>
+          )}
+          {flota.revisado && (
+            <span className="text-xs px-2 py-0.5 rounded-full font-semibold"
+              style={{ background: '#d1fae5', color: '#065f46' }}>✓ Revisada</span>
+          )}
         </div>
         <div className="flex items-center gap-4 text-xs flex-wrap" style={{ color: '#B9BBB7' }}>
-          <span>🚛 {flota.activos} camión{flota.activos !== 1 ? 'es' : ''} activo{flota.activos !== 1 ? 's' : ''}</span>
-          <span>👤 {flota.choferes} chofer{flota.choferes !== 1 ? 'es' : ''}</span>
-          {flota.sucursales.length > 0 && (
-            <span>📍 {flota.sucursales.join(', ')}</span>
-          )}
+          {flota.sinConfigurar
+            ? <span style={{ color: '#92400e' }}>Usando flota base — hacé clic para revisar y confirmar</span>
+            : <>
+                <span>🚛 {flota.activos} camión{flota.activos !== 1 ? 'es' : ''} activo{flota.activos !== 1 ? 's' : ''}</span>
+                <span>👤 {flota.choferes} chofer{flota.choferes !== 1 ? 'es' : ''}</span>
+                {flota.sucursales.length > 0 && <span>📍 {flota.sucursales.join(', ')}</span>}
+              </>
+          }
         </div>
         {flota.ultimaModif && (
           <p className="text-xs mt-1" style={{ color: '#B9BBB7' }}>
@@ -341,18 +374,22 @@ function CardFlota({ flota, onEditar, destacar, opaco }: {
 
 // ─── Vista Editar ───────────────────────────────────────────────────────────────
 
-function VistaEditar({ fecha, onVolver, showToast }: {
+function VistaEditar({ fecha, onVolver, showToast, userId, userNombre }: {
   fecha: string
   onVolver: () => void
   showToast: (msg: string, tipo?: 'ok' | 'err') => void
+  userId: string
+  userNombre: string
 }) {
   const [camiones, setCamiones] = useState<any[]>([])
+  const [camionesOriginal, setCamionesOriginal] = useState<any[]>([])
   const [choferes, setChoferes] = useState<{ id: string; nombre: string }[]>([])
   const [loading, setLoading] = useState(true)
   const [guardando, setGuardando] = useState(false)
   const [dragging, setDragging] = useState<string | null>(null)
   const [dragOver, setDragOver] = useState<string | null>(null)
   const [ultimaModif, setUltimaModif] = useState<string | null>(null)
+  const [sinRevisar, setSinRevisar] = useState(false)
 
   useEffect(() => { cargarFlota() }, [fecha])
 
@@ -363,6 +400,7 @@ function VistaEditar({ fecha, onVolver, showToast }: {
       supabase.from('flota_dia').select('*').eq('fecha', fecha),
       supabase.from('usuarios').select('id, nombre').eq('rol', 'chofer').order('nombre'),
     ])
+    setSinRevisar((flotaDia ?? []).length === 0 || (flotaDia ?? []).some((d: any) => d.revisado === false))
 
     setChoferes(choferesData ?? [])
 
@@ -370,16 +408,19 @@ function VistaEditar({ fecha, onVolver, showToast }: {
     const fechas = (flotaDia ?? []).map((d: any) => d.updated_at).filter(Boolean).sort()
     setUltimaModif(fechas.at(-1) ?? null)
 
-    setCamiones((flotaBase ?? []).map((c: any) => {
+    const mapped = (flotaBase ?? []).map((c: any) => {
       const diaConfig = (flotaDia ?? []).find((d: any) => d.camion_codigo === c.codigo)
       return {
         ...c,
         sucursal_dia: diaConfig ? diaConfig.sucursal : c.sucursal,
         activo_dia: diaConfig ? diaConfig.activo : true,
-        // Si ya hay config del día usarla; si no, pre-cargar chofer habitual de la flota base
         chofer_id: diaConfig?.chofer_id ?? c.chofer_id_default ?? '',
+        sucursal_extra: diaConfig?.sucursal_extra ?? '',
+        sucursal_extra_desde_vuelta: diaConfig?.sucursal_extra_desde_vuelta ?? 2,
       }
-    }))
+    })
+    setCamiones(mapped)
+    setCamionesOriginal(JSON.parse(JSON.stringify(mapped)))
     setLoading(false)
   }
 
@@ -413,6 +454,9 @@ function VistaEditar({ fecha, onVolver, showToast }: {
               sucursal: c.sucursal_dia,
               activo: c.activo_dia,
               chofer_id: c.chofer_id || null,
+              revisado: true,
+              sucursal_extra: c.sucursal_extra || null,
+              sucursal_extra_desde_vuelta: c.sucursal_extra ? (c.sucursal_extra_desde_vuelta ?? 2) : null,
             },
             { onConflict: 'fecha,camion_codigo' }
           )
@@ -426,6 +470,21 @@ function VistaEditar({ fecha, onVolver, showToast }: {
         showToast(`Error: ${msg}`, 'err')
       } else {
         showToast('Flota guardada correctamente')
+        // Audit: log per-camion changes
+        if (userId) {
+          for (const c of camiones) {
+            const orig = camionesOriginal.find((o: any) => o.codigo === c.codigo)
+            if (!orig) continue
+            if (orig.activo_dia !== c.activo_dia) {
+              logAuditoria(userId, userNombre, c.activo_dia ? 'Activó camión en flota' : 'Desactivó camión', 'Flota', { fecha, camion_codigo: c.codigo, sucursal: c.sucursal_dia })
+            } else if (orig.chofer_id !== c.chofer_id && c.chofer_id) {
+              const chofer = choferes.find(ch => ch.id === c.chofer_id)
+              logAuditoria(userId, userNombre, 'Asignó chofer', 'Flota', { fecha, camion_codigo: c.codigo, chofer_nombre: chofer?.nombre ?? c.chofer_id, sucursal: c.sucursal_dia })
+            } else if (orig.sucursal_extra !== c.sucursal_extra && c.sucursal_extra) {
+              logAuditoria(userId, userNombre, 'Asignó camión a sucursal extra', 'Flota', { camion_codigo: c.codigo, sucursal_extra: c.sucursal_extra })
+            }
+          }
+        }
         await cargarFlota()
       }
     } catch (e: any) {
@@ -479,6 +538,16 @@ function VistaEditar({ fecha, onVolver, showToast }: {
       </nav>
 
       <main className="max-w-screen-xl mx-auto px-4 md:px-6 py-6">
+        {sinRevisar && (
+          <div className="mb-5 rounded-xl px-5 py-4 flex items-start gap-3 text-sm"
+            style={{ background: '#fef3c7', border: '1px solid #fde68a', color: '#92400e' }}>
+            <span className="text-lg leading-none mt-0.5">⚠️</span>
+            <div>
+              <p className="font-semibold">Flota sin revisar</p>
+              <p className="text-xs mt-0.5">Esta flota todavía no fue confirmada para este día. Revisá la asignación de camiones y choferes, y guardá para marcarla como revisada.</p>
+            </div>
+          </div>
+        )}
         <p className="text-sm mb-5" style={{ color: '#B9BBB7' }}>
           Arrastrá los camiones entre sucursales. Asigná un chofer a cada camión activo.
         </p>
@@ -544,7 +613,7 @@ function VistaEditar({ fecha, onVolver, showToast }: {
                       )}
 
                       {sucursal !== 'Fuera de servicio' && c.activo_dia && (
-                        <div onMouseDown={e => e.stopPropagation()}>
+                        <div onMouseDown={e => e.stopPropagation()} className="space-y-1.5">
                           <select
                             value={c.chofer_id ?? ''}
                             onChange={e => asignarChofer(c.codigo, e.target.value)}
@@ -562,6 +631,38 @@ function VistaEditar({ fecha, onVolver, showToast }: {
                               </option>
                             ))}
                           </select>
+
+                          {/* Segunda sucursal */}
+                          <select
+                            value={c.sucursal_extra ?? ''}
+                            onChange={e => setCamiones(prev => prev.map(x =>
+                              x.codigo === c.codigo ? { ...x, sucursal_extra: e.target.value, sucursal_extra_desde_vuelta: 2 } : x
+                            ))}
+                            className="w-full text-xs border rounded-lg px-2 py-1 focus:outline-none"
+                            style={{
+                              borderColor: c.sucursal_extra ? '#7c3aed' : '#e8edf8',
+                              color: c.sucursal_extra ? '#7c3aed' : '#B9BBB7',
+                              background: c.sucursal_extra ? '#f5f3ff' : 'white',
+                            }}>
+                            <option value="">🔀 Sin 2ª sucursal</option>
+                            {SUCURSALES.filter(s => s !== sucursal && s !== 'Fuera de servicio').map(s => (
+                              <option key={s} value={s}>{s}</option>
+                            ))}
+                          </select>
+
+                          {/* Desde qué vuelta está disponible en la 2ª sucursal */}
+                          {c.sucursal_extra && (
+                            <select
+                              value={c.sucursal_extra_desde_vuelta ?? 2}
+                              onChange={e => setCamiones(prev => prev.map(x =>
+                                x.codigo === c.codigo ? { ...x, sucursal_extra_desde_vuelta: parseInt(e.target.value) } : x
+                              ))}
+                              className="w-full text-xs border rounded-lg px-2 py-1 focus:outline-none"
+                              style={{ borderColor: '#e8edf8', color: '#7c3aed', background: '#f5f3ff' }}>
+                              <option value={2}>Disponible desde V2</option>
+                              <option value={3}>Disponible desde V3</option>
+                            </select>
+                          )}
                         </div>
                       )}
                     </div>

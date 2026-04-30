@@ -4,6 +4,7 @@ import { useEffect, useState, useMemo } from 'react'
 import { supabase } from '../supabase'
 import { useRouter } from 'next/navigation'
 import { puedeEditar, tieneAcceso } from '../lib/permisos'
+import { logAuditoria } from '../lib/auditoria'
 
 const SUCURSALES = ['LP520', 'LP139', 'Guernica', 'Cañuelas', 'Pinamar']
 const ESTADOS = ['pendiente', 'programado', 'en_camino', 'entregado', 'entregado_parcial', 'rechazado', 'cancelado']
@@ -112,6 +113,8 @@ export default function PedidosPage() {
   const [puedeEditarPedidos, setPuedeEditarPedidos] = useState(false)
   const [userEmail, setUserEmail] = useState('')
   const [userRol, setUserRol] = useState('')
+  const [userId, setUserId] = useState('')
+  const [userNombre, setUserNombre] = useState('')
 
   // Modal revertir entrega
   const [modalRevertir, setModalRevertir] = useState<Pedido | null>(null)
@@ -165,22 +168,31 @@ export default function PedidosPage() {
     supabase.auth.getUser().then(({ data: { user } }) => {
       if (!user) { router.push('/'); return }
       setUserEmail(user.email ?? '')
-      supabase.from('usuarios').select('rol, permisos, sucursal').eq('id', user.id).single().then(({ data }) => {
+      setUserId(user.id)
+      supabase.from('usuarios').select('rol, permisos, sucursal, nombre').eq('id', user.id).single().then(({ data }) => {
         if (!tieneAcceso(data?.permisos, data?.rol, 'pedidos')) {
           router.push('/dashboard'); return
         }
         setPuedeEditarPedidos(puedeEditar(data?.permisos, data?.rol, 'pedidos'))
         setUserRol(data?.rol ?? '')
+        setUserNombre(data?.nombre ?? '')
         if (data?.sucursal) setFiltroSucursal(data.sucursal)
+        // Auto-search if navigated from métricas with a NV param
+        const nvParam = new URLSearchParams(window.location.search).get('nv')
+        if (nvParam) {
+          setFiltroTexto(nvParam)
+          buscar(nvParam)
+        }
       })
     })
   }, [])
 
-  async function buscar() {
+  async function buscar(textoOverride?: string) {
     setCargando(true)
     setCategoriasMap({})
     setItemsMap({})
     setExpandidos(new Set())
+    const textoFinal = textoOverride !== undefined ? textoOverride : filtroTexto
     let q = supabase
       .from('pedidos')
       .select('id, nv, id_despacho, cliente, direccion, sucursal, fecha_entrega, vuelta, estado, estado_pago, peso_total_kg, volumen_total_m3, notas, camion_id, tipo, created_at, vendedor_id', { count: 'exact' })
@@ -191,8 +203,8 @@ export default function PedidosPage() {
     if (filtroFecha) q = q.eq('fecha_entrega', filtroFecha)
     if (filtroSucursal) q = q.eq('sucursal', filtroSucursal)
     if (filtroEstado) q = q.eq('estado', filtroEstado)
-    if (filtroTexto) {
-      const txt = `%${filtroTexto}%`
+    if (textoFinal) {
+      const txt = `%${textoFinal}%`
       q = q.or(`cliente.ilike.${txt},nv.ilike.${txt},direccion.ilike.${txt}`)
     }
 
@@ -225,6 +237,9 @@ export default function PedidosPage() {
       supabase.from('pedido_fotos').select('pedido_id, url, label').in('pedido_id', ids).order('created_at'),
     ])
 
+    // Pre-normalizar materiales UNA sola vez (evita repetir normalizar() por cada item×material)
+    const matsNorm = (mats ?? []).map((m: any) => ({ ...m, _n: normalizar(m.nombre) }))
+
     // Items + categorías
     const newItemsMap: Record<string, Item[]> = {}
     // catKey = "tipo_carga|categoria" para deduplicar manteniendo ambos datos
@@ -232,10 +247,7 @@ export default function PedidosPage() {
 
     for (const item of rawItems ?? []) {
       const nItem = normalizar(item.nombre)
-      const mat = (mats ?? []).find((m: any) => {
-        const nMat = normalizar(m.nombre)
-        return nMat === nItem || nMat.includes(nItem) || nItem.includes(nMat)
-      })
+      const mat = matsNorm.find((m: any) => m._n === nItem || m._n.includes(nItem) || nItem.includes(m._n))
       const tipo = mat?.tipo_carga ?? 'otros'
       const categoria = mat?.categoria ?? null
       const subcategoria = mat?.subcategoria ?? null
@@ -290,12 +302,16 @@ export default function PedidosPage() {
   async function guardar() {
     if (!editando) return
     setGuardando(true)
+    const pedidoOriginal = pedidos.find(p => p.id === editando.id)
+    const sucursalCambio = pedidoOriginal && pedidoOriginal.sucursal !== editando.sucursal
     const updates: Record<string, any> = { id: editando.id, sucursal: editando.sucursal }
     if (editando.peso !== '') updates.peso_total_kg = Math.round(parseFloat(editando.peso) || 0)
     if (editando.posiciones !== '') updates.volumen_total_m3 = parseFloat(editando.posiciones) || 0
     if (editando.estado_pago !== '') updates.estado_pago = editando.estado_pago
     if (editando.fecha_entrega !== '') updates.fecha_entrega = editando.fecha_entrega
     updates.vuelta = editando.vuelta
+    // Si cambió la sucursal, desasignar el camión — no puede quedar asignado a un camión de otra sucursal
+    if (sucursalCambio) { updates.camion_id = null; updates.orden_entrega = null }
 
     const res = await fetch('/api/pedidos', {
       method: 'PATCH',
@@ -306,6 +322,7 @@ export default function PedidosPage() {
     if (data.error) {
       showToast(data.error, 'err')
     } else {
+      const pedidoActualizado = pedidos.find(p => p.id === editando.id)
       setPedidos(prev => prev.map(p => p.id === editando.id ? {
         ...p,
         sucursal: editando.sucursal,
@@ -314,8 +331,20 @@ export default function PedidosPage() {
         estado_pago: updates.estado_pago ?? p.estado_pago,
         fecha_entrega: updates.fecha_entrega ?? p.fecha_entrega,
         vuelta: updates.vuelta ?? p.vuelta,
+        ...(sucursalCambio ? { camion_id: null, orden_entrega: null } : {}),
       } : p))
       showToast('Pedido actualizado')
+      // Audit: compute changed fields
+      if (userId && pedidoOriginal) {
+        const cambios: Record<string, { de: any; a: any }> = {}
+        if (pedidoOriginal.sucursal !== editando.sucursal) cambios.sucursal = { de: pedidoOriginal.sucursal, a: editando.sucursal }
+        if (updates.peso_total_kg != null && updates.peso_total_kg !== pedidoOriginal.peso_total_kg) cambios.peso_total_kg = { de: pedidoOriginal.peso_total_kg, a: updates.peso_total_kg }
+        if (updates.volumen_total_m3 != null && updates.volumen_total_m3 !== pedidoOriginal.volumen_total_m3) cambios.volumen_total_m3 = { de: pedidoOriginal.volumen_total_m3, a: updates.volumen_total_m3 }
+        if (updates.estado_pago != null && updates.estado_pago !== pedidoOriginal.estado_pago) cambios.estado_pago = { de: pedidoOriginal.estado_pago, a: updates.estado_pago }
+        if (updates.fecha_entrega != null && updates.fecha_entrega !== pedidoOriginal.fecha_entrega) cambios.fecha_entrega = { de: pedidoOriginal.fecha_entrega, a: updates.fecha_entrega }
+        if (updates.vuelta !== pedidoOriginal.vuelta) cambios.vuelta = { de: pedidoOriginal.vuelta, a: updates.vuelta }
+        logAuditoria(userId, userNombre, 'Editó pedido', 'Pedidos', { nv: pedidoOriginal.nv, id_despacho: pedidoOriginal.id_despacho, cliente: pedidoOriginal.cliente, cambios })
+      }
       setEditando(null)
     }
     setGuardando(false)
@@ -394,6 +423,7 @@ export default function PedidosPage() {
         : p
       ))
       showToast(`NV ${modalRevertir.nv} revertido a Programado`)
+      if (userId) logAuditoria(userId, userNombre, 'Revirtió entrega a programado', 'Pedidos', { nv: modalRevertir.nv, camion_id: modalRevertir.camion_id, notas: notaFinal })
       setModalRevertir(null)
     }
     setRevertiendo(false)
@@ -680,7 +710,7 @@ export default function PedidosPage() {
                 style={{ borderColor: '#e8edf8' }} />
             </div>
           </div>
-          <button onClick={buscar} disabled={cargando}
+          <button onClick={() => buscar()} disabled={cargando}
             className="px-5 py-2 rounded-xl text-sm font-semibold text-white disabled:opacity-50"
             style={{ background: '#254A96' }}>
             {cargando ? 'Buscando...' : 'Buscar'}

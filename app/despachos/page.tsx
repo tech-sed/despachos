@@ -5,6 +5,7 @@ import { supabase } from '../supabase'
 import { useRouter } from 'next/navigation'
 import { puedeEditar } from '../lib/permisos'
 import { FRANJAS, vultaCerrada, vueltasCerradasPara } from '../lib/franjas'
+import { logAuditoria } from '../lib/auditoria'
 
 function detectarSucursal(sucursalObra: string, deposito: string): string {
   const obra = sucursalObra?.toUpperCase() || ''
@@ -56,6 +57,7 @@ export default function NuevoDespacho() {
   const [cuposDisponibles, setCuposDisponibles] = useState<number[]>([])
   const [vueltasSinCupoConFlota, setVueltasSinCupoConFlota] = useState<number[]>([])
   const [vueltasCerradas, setVueltasCerradas] = useState<number[]>([])
+  const [flotaSinRevisar, setFlotaSinRevisar] = useState(false)
   const [maxCamionPosiciones, setMaxCamionPosiciones] = useState(0)
   const [pedidoGrande, setPedidoGrande] = useState(false)
   const [verificando, setVerificando] = useState(false)
@@ -67,6 +69,7 @@ export default function NuevoDespacho() {
   const [toastState, setToastState] = useState<{ msg: string; tipo: 'ok' | 'err' } | null>(null)
   const [form, setForm] = useState(FORM_INICIAL)
   const [userId, setUserId] = useState<string | null>(null)
+  const [userNombre, setUserNombre] = useState('')
   const [misPedidos, setMisPedidos] = useState<any[]>([])
   const [cargandoPedidos, setCargandoPedidos] = useState(false)
   const [pedidoReprog, setPedidoReprog] = useState<any | null>(null)
@@ -99,8 +102,11 @@ export default function NuevoDespacho() {
     supabase.auth.getUser().then(({ data: { user } }) => {
       if (!user) { router.push('/'); return }
       setUserId(user.id)
-      supabase.from('usuarios').select('rol, permisos').eq('id', user.id).single().then(({ data }) => {
-        if (data) setPuedeEditarDespachos(puedeEditar(data.permisos, data.rol, 'despachos'))
+      supabase.from('usuarios').select('rol, permisos, nombre').eq('id', user.id).single().then(({ data }) => {
+        if (data) {
+          setPuedeEditarDespachos(puedeEditar(data.permisos, data.rol, 'despachos'))
+          setUserNombre(data.nombre ?? '')
+        }
       })
     })
   }, [])
@@ -131,12 +137,14 @@ export default function NuevoDespacho() {
   }
 
   async function handleCancelarPedido(id: string, cliente: string) {
+    const pedido = misPedidos.find(p => p.id === id)
     try {
       const res = await fetch('/api/pedidos', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error ?? 'Error desconocido')
       await cargarMisPedidos()
       toast(`Pedido de ${cliente} eliminado`)
+      if (userId) logAuditoria(userId, userNombre, 'Canceló pedido', 'Despachos', { nv: pedido?.nv, cliente, sucursal: pedido?.sucursal })
     } catch (e: any) { toast(`Error: ${e.message}`, 'err') }
   }
 
@@ -156,6 +164,7 @@ export default function NuevoDespacho() {
       setPedidoReprog(null)
       await cargarMisPedidos()
       toast(`Pedido de ${pedido.cliente} reprogramado para el ${fecha}`)
+      if (userId) logAuditoria(userId, userNombre, 'Reprogramó pedido', 'Despachos', { nv: pedido.nv, cliente: pedido.cliente, fecha_nueva: fecha, vuelta_nueva: vuelta, motivo })
     } catch (e: any) { toast(`Error: ${e.message}`, 'err') }
   }
 
@@ -179,10 +188,22 @@ export default function NuevoDespacho() {
     }
 
     const { data: flotaData } = await supabase
-      .from('flota_dia').select('camion_codigo')
+      .from('flota_dia').select('camion_codigo, revisado')
       .eq('fecha', form.fecha_entrega).eq('sucursal', form.sucursal).eq('activo', true)
 
-    const codigos = (flotaData ?? []).map((f: any) => f.camion_codigo)
+    let codigos = (flotaData ?? []).map((f: any) => f.camion_codigo)
+    let sinRevisar = (flotaData ?? []).length === 0 || (flotaData ?? []).some((f: any) => f.revisado === false)
+
+    // Fallback a flota base si no hay flota_dia configurada para este día
+    if (codigos.length === 0) {
+      const { data: baseData } = await supabase
+        .from('camiones_flota').select('codigo')
+        .eq('sucursal', form.sucursal).eq('activo', true)
+      codigos = (baseData ?? []).map((b: any) => b.codigo)
+      sinRevisar = true
+    }
+
+    setFlotaSinRevisar(sinRevisar)
 
     if (codigos.length === 0) {
       setCuposDisponibles([])
@@ -331,7 +352,8 @@ export default function NuevoDespacho() {
     }
 
     // "fuera_prog" = pedido sin vuelta asignada, el ruteador la asigna después
-    const vueltaFinal = form.vuelta === 'fuera_prog' ? null : parseInt(form.vuelta)
+    // vuelta 0 = fuera de programación (columna NOT NULL, no puede ser null)
+    const vueltaFinal = form.vuelta === 'fuera_prog' ? 0 : parseInt(form.vuelta)
 
     const { data: pedidoInsertado, error } = await supabase.from('pedidos').insert({
       nv: form.nv,
@@ -372,6 +394,7 @@ export default function NuevoDespacho() {
     }
 
     toast('Solicitud de despacho guardada correctamente')
+    if (userId) logAuditoria(userId, userNombre, 'Creó pedido', 'Despachos', { nv: form.nv, id_despacho: form.id_despacho, cliente: form.cliente, sucursal: form.sucursal, fecha_entrega: form.fecha_entrega, peso_total_kg: pesoTotal })
     setExito(true); setLoading(false)
   }
 
@@ -688,10 +711,10 @@ export default function NuevoDespacho() {
         {/* Subir PDF */}
         <div className="bg-white rounded-xl shadow-sm p-6">
           <h2 className="font-semibold text-sm mb-1" style={{ color: '#254A96' }}>📄 Solicitud de Despacho</h2>
-          <p className="text-xs mb-4" style={{ color: '#B9BBB7' }}>El sistema completará los datos automáticamente desde el PDF.</p>
+          <p className="text-xs mb-4" style={{ color: '#B9BBB7' }}>El sistema completará los datos automáticamente desde el PDF o foto.</p>
           <label className="block w-full border-2 border-dashed rounded-xl px-4 py-6 text-center cursor-pointer transition-colors"
             style={{ borderColor: leyendoPDF ? '#254A96' : '#e8edf8', background: leyendoPDF ? '#e8edf8' : '#fafafa' }}>
-            <input type="file" accept=".pdf" onChange={handlePDF} className="hidden" />
+            <input type="file" accept=".pdf,image/jpeg,image/png,image/webp" onChange={handlePDF} className="hidden" />
             {leyendoPDF ? (
               <div className="flex flex-col items-center gap-2">
                 <div className="w-6 h-6 border-2 border-t-transparent rounded-full animate-spin" style={{ borderColor: '#254A96', borderTopColor: 'transparent' }} />
@@ -706,8 +729,8 @@ export default function NuevoDespacho() {
             ) : (
               <div className="flex flex-col items-center gap-2">
                 <span className="text-3xl">📄</span>
-                <span className="text-sm font-medium" style={{ color: '#254A96' }}>Seleccionar PDF</span>
-                <span className="text-xs" style={{ color: '#B9BBB7' }}>Arrastrá o hacé click para subir</span>
+                <span className="text-sm font-medium" style={{ color: '#254A96' }}>Seleccionar PDF o foto</span>
+                <span className="text-xs" style={{ color: '#B9BBB7' }}>PDF, JPG o PNG — arrastrá o hacé click</span>
               </div>
             )}
           </label>
@@ -792,8 +815,15 @@ export default function NuevoDespacho() {
               </div>
               {form.latitud && form.longitud && (
                 <div>
-                  <p className="text-xs mb-1" style={{ color: '#B9BBB7' }}>Coordenadas</p>
-                  <p className="font-medium text-sm" style={{ color: '#1a1a1a' }}>{form.latitud}, {form.longitud}</p>
+                  <p className="text-xs mb-1" style={{ color: '#B9BBB7' }}>Ubicación de entrega</p>
+                  <div className="rounded-xl overflow-hidden border" style={{ borderColor: '#e8edf8', height: 220 }}>
+                    <iframe
+                      src={`https://www.openstreetmap.org/export/embed.html?bbox=${form.longitud! - 0.015},${form.latitud! - 0.015},${form.longitud! + 0.015},${form.latitud! + 0.015}&layer=mapnik&marker=${form.latitud},${form.longitud}`}
+                      width="100%" height="220" style={{ border: 0, display: 'block' }}
+                      loading="lazy"
+                    />
+                  </div>
+                  <p className="text-xs mt-1" style={{ color: '#B9BBB7' }}>{form.latitud}, {form.longitud}</p>
                 </div>
               )}
               <div>

@@ -4,6 +4,7 @@ import { useRouter, useSearchParams } from 'next/navigation'
 import { useEffect, useState, useRef, Suspense } from 'react'
 import { supabase } from '@/app/supabase'
 import { puedeEditar } from '@/app/lib/permisos'
+import { logAuditoria } from '@/app/lib/auditoria'
 
 interface Pedido {
   id: string; nv: string; cliente: string; direccion: string; sucursal: string
@@ -12,6 +13,7 @@ interface Pedido {
   notas: string | null; camion_id: string | null; orden_entrega: number | null
   latitud: number | null; longitud: number | null; barrio_cerrado?: boolean; prioridad?: boolean
   requiere_volcador?: boolean
+  localidad?: string
   items?: { nombre: string; cantidad: number; unidad: string }[]
 }
 interface Camion {
@@ -60,6 +62,40 @@ function pesoColumna(ps: Pedido[]) { return ps.reduce((a, p) => a + (p.peso_tota
 function posColumna(ps: Pedido[]) { return ps.reduce((a, p) => a + (p.volumen_total_m3 ?? 0), 0) }
 function pct(peso: number, max: number) { return max === 0 ? 0 : Math.min(100, Math.round(peso / max * 100)) }
 function colorBarra(p: number) { return p >= 90 ? '#E52322' : p >= 70 ? '#f59e0b' : '#10b981' }
+
+function localidadDeDireccion(dir: string): string {
+  if (!dir) return ''
+  const skip = ['buenos aires', 'b.a.', 'argentina', 'provincia', 'pba', 'prov.']
+  const isSkip = (s: string) => skip.some(w => s.toLowerCase().includes(w))
+
+  // Intento 1: dividir por comas (ej: "Calle 50 1234, La Plata, Bs As")
+  const parts = dir.split(',').map(s => s.trim()).filter(Boolean)
+  if (parts.length >= 2) {
+    for (let i = parts.length - 1; i >= 1; i--) {
+      const p = parts[i]
+      if (/^\d+$/.test(p)) continue       // solo números
+      if (isSkip(p)) continue              // provincia / país
+      if (p.length > 1 && p.length < 50) return p
+    }
+  }
+
+  // Intento 2: últimas palabras del final que no sean números ni abreviaturas de calle
+  // ej: "Av Mitre 456 Guernica" → "Guernica"
+  //     "Calle 13 e/ 60 y 61 La Plata" → "La Plata"
+  const STOP = /^(n°|nro|nro\.|km|bis|piso|dpto|depto|pb|pp|s\/n|esq\.?|e\/|y|entre|av\.?|calle|ruta|cno|camino|diagonal|diag\.?)$/i
+  const words = dir.replace(/,/g, ' ').split(/\s+/).filter(Boolean)
+  const cityWords: string[] = []
+  for (let i = words.length - 1; i >= 0 && cityWords.length < 3; i--) {
+    const w = words[i]
+    if (/^\d/.test(w)) break        // encontró un número → parar
+    if (STOP.test(w)) break         // abreviatura de calle → parar
+    cityWords.unshift(w)
+  }
+  const candidate = cityWords.join(' ')
+  if (candidate.length > 2 && !isSkip(candidate)) return candidate
+
+  return ''
+}
 
 function sugerirAsignacion(sin: Pedido[], camiones: Camion[], ya: Pedido[], sucursal: string): Record<string, string | null> {
   const deposito = DEPOSITOS[sucursal] ?? { lat: -34.9205, lng: -57.9536 }
@@ -253,7 +289,13 @@ function PedidoCard({ pedido, onDragStart, onCancelar, onCambiarVuelta, onReprog
           )}
         </div>
       </div>
-      <p className="text-xs mb-1.5 leading-tight" style={{ color: '#B9BBB7' }}>{pedido.direccion}</p>
+      <p className="text-xs leading-tight" style={{ color: '#B9BBB7' }}>{pedido.direccion}</p>
+      {pedido.localidad && (
+        <span className="inline-block text-xs font-semibold rounded px-1.5 py-0.5 mt-0.5 mb-1"
+          style={{ background: '#dbeafe', color: '#1e40af', fontSize: 10 }}>
+          📍 {pedido.localidad}
+        </span>
+      )}
       <div className="flex justify-between items-center">
         <span className="text-xs" style={{ color: '#B9BBB7' }}>NV {pedido.nv}</span>
         <div className="flex items-center gap-1.5">
@@ -652,6 +694,12 @@ function ColumnaCamion({ columna, sinAsignar = false, onDrop, onDragOver, onDrag
             <div className="flex justify-between items-center mb-1">
               <span className="font-bold text-sm" style={{ color: '#254A96' }}>{camion.codigo}</span>
               <div className="flex gap-1 items-center">
+                {(camion as any)._desde_sucursal && (
+                  <span className="text-xs px-1.5 py-0.5 rounded-full font-medium" style={{ background: '#f5f3ff', color: '#7c3aed' }}
+                    title={`Viene de ${(camion as any)._desde_sucursal}, disponible desde V${(camion as any)._disponible_desde_vuelta ?? 2}`}>
+                    🔀 {(camion as any)._desde_sucursal} V{(camion as any)._disponible_desde_vuelta ?? 2}+
+                  </span>
+                )}
                 {camion.grua_hidraulica && <span className="text-xs px-1.5 py-0.5 rounded-full" style={{ background: '#e8edf8', color: '#254A96' }}>Grúa</span>}
                 {camion.volcador && <span className="text-xs px-1.5 py-0.5 rounded-full" style={{ background: '#fef3c7', color: '#d97706' }}>Volc.</span>}
                 <button onClick={() => setManualExpanded(e => !e)} className="text-xs px-1.5 py-0.5 rounded ml-1" style={{ color: '#B9BBB7', background: '#f0f0f0' }} title={isExpanded ? 'Contraer' : 'Expandir'}>
@@ -705,7 +753,7 @@ const DEPOSITOS: Record<string, { lat: number; lng: number }> = {
   'LP520':    { lat: -34.965403, lng: -58.06488 },
   'LP139':    { lat: -34.914872, lng: -58.023912 },
   'Guernica': { lat: -34.91118,  lng: -58.39945 },
-  'Cañuelas': { lat: -35.0001,   lng: -58.44506 },
+  'Cañuelas': { lat: -35.0004012, lng: -58.7474278 },
   'Pinamar':  { lat: -37.207852, lng: -56.972302 },
 }
 
@@ -774,17 +822,24 @@ function ProgramacionInner() {
   const [camionParaReprog, setCamionParaReprog] = useState<string | null>(null)
   const [overflowPedidos, setOverflowPedidos] = useState<Pedido[]>([])
   const [bannerGrandeDismissed, setBannerGrandeDismissed] = useState(false)
+  const [flotaSinRevisar, setFlotaSinRevisar] = useState(false)
   const [contadorSinVuelta, setContadorSinVuelta] = useState(0)
+  const [modalRutas, setModalRutas] = useState(false)
+  const enrichGenRef = useRef(0)
 
   const showToast = (msg: string, tipo: 'ok' | 'err' = 'ok') => { setToast({ msg, tipo }); setTimeout(() => setToast(null), 3000) }
 
   const [puedeEditarProg, setPuedeEditarProg] = useState(false)
+  const [userId, setUserId] = useState('')
+  const [userNombre, setUserNombre] = useState('')
   useEffect(() => {
     supabase.auth.getUser().then(({ data: { user } }) => {
       if (!user) return
-      supabase.from('usuarios').select('rol, permisos, sucursal').eq('id', user.id).single().then(({ data }) => {
+      setUserId(user.id)
+      supabase.from('usuarios').select('rol, permisos, sucursal, nombre').eq('id', user.id).single().then(({ data }) => {
         if (!data) return
         setPuedeEditarProg(puedeEditar(data.permisos, data.rol, 'programacion'))
+        setUserNombre(data.nombre ?? '')
         // Pre-seleccionar sucursal del usuario si no viene por URL param
         if (data.sucursal && !params.get('sucursal')) setSucursal(data.sucursal)
       })
@@ -827,24 +882,89 @@ function ProgramacionInner() {
         }
       } catch { /* si falla, mostrar pedidos sin items */ }
     }
-    const { data: fd } = await supabase.from('flota_dia').select('camion_codigo').eq('fecha', fecha).eq('sucursal', sucursal).eq('activo', true)
-    const codigos = (fd ?? []).map((f: any) => f.camion_codigo)
-    const { data: cd } = codigos.length > 0 ? await supabase.from('camiones_flota').select('*').in('codigo', codigos).eq('activo', true) : { data: [] }
-    const cams = cd ?? []
-
-    // Contador de pedidos sin vuelta asignada (para badge del tab)
-    const { count: cSinVuelta } = await supabase.from('pedidos')
-      .select('id', { count: 'exact', head: true })
-      .eq('fecha_entrega', fecha).eq('sucursal', sucursal)
-      .is('vuelta', null).in('estado', ['pendiente', 'programado'])
+    // Una sola consulta cubre flota propia + camiones de otras sucursales;
+    // el contador de sin-vuelta corre en paralelo para no bloquear
+    const [{ data: allFd }, { count: cSinVuelta }] = await Promise.all([
+      supabase.from('flota_dia')
+        .select('camion_codigo, sucursal, revisado, sucursal_extra, sucursal_extra_desde_vuelta')
+        .eq('fecha', fecha).eq('activo', true)
+        .or(`sucursal.eq.${sucursal},sucursal_extra.eq.${sucursal}`),
+      supabase.from('pedidos')
+        .select('id', { count: 'exact', head: true })
+        .eq('fecha_entrega', fecha).eq('sucursal', sucursal)
+        .eq('vuelta', 0).in('estado', ['pendiente', 'programado']),
+    ])
+    const fd = (allFd ?? []).filter((f: any) => f.sucursal === sucursal)
+    const fdExtra = (allFd ?? []).filter((f: any) => f.sucursal_extra === sucursal)
     setContadorSinVuelta(cSinVuelta ?? 0)
 
-    setPedidos(todosConItems); setCamiones(cams); construirColumnas(todosConItems, cams); setCargando(false)
+    let codigos = fd.map((f: any) => f.camion_codigo)
+    let flotaSinRevisar = fd.length === 0 || fd.some((f: any) => f.revisado === false)
+
+    // Fallback a flota base si no hay flota_dia para este día
+    if (codigos.length === 0) {
+      const { data: baseData } = await supabase.from('camiones_flota').select('codigo').eq('sucursal', sucursal).eq('activo', true)
+      codigos = (baseData ?? []).map((b: any) => b.codigo)
+      flotaSinRevisar = true
+    }
+
+    // Agregar camiones de otras sucursales que operan también acá
+    const codigosExtra = fdExtra.map((f: any) => f.camion_codigo)
+    const todosCodigos = [...new Set([...codigos, ...codigosExtra])]
+
+    const { data: cd } = todosCodigos.length > 0 ? await supabase.from('camiones_flota').select('*').in('codigo', todosCodigos).eq('activo', true) : { data: [] }
+
+    // Enriquecer con metadata de sucursal extra
+    const cams = (cd ?? []).map((c: any) => {
+      const extra = fdExtra.find((f: any) => f.camion_codigo === c.codigo)
+      return extra
+        ? { ...c, _desde_sucursal: extra.sucursal, _disponible_desde_vuelta: extra.sucursal_extra_desde_vuelta ?? 2 }
+        : c
+    })
+    setFlotaSinRevisar(flotaSinRevisar)
+
+    const conLocalidad = todosConItems.map((p: any) => ({ ...p, localidad: localidadDeDireccion(p.direccion) }))
+    setPedidos(conLocalidad); setCamiones(cams); construirColumnas(conLocalidad, cams); setCargando(false)
+    enrichLocalidades(conLocalidad)
   }
 
   function construirColumnas(todos: Pedido[], cams: Camion[]) {
+    const camCodigos = new Set(cams.map(c => c.codigo))
     setColumnas(cams.map(c => { const ps = todos.filter(p => p.camion_id === c.codigo); return { camion: c, pedidos: ps, pesoTotal: pesoColumna(ps), posTotal: posColumna(ps) } }))
-    setSinAsignar(todos.filter(p => !p.camion_id))
+    // Pedidos sin camión asignado + pedidos cuyo camión no pertenece a esta sucursal (ej: asignado a camión de otra sucursal)
+    setSinAsignar(todos.filter(p => !p.camion_id || !camCodigos.has(p.camion_id)))
+  }
+
+  async function enrichLocalidades(peds: Pedido[]) {
+    const gen = ++enrichGenRef.current
+    const conCoords = peds.filter(p => p.latitud && p.longitud)
+    if (conCoords.length === 0) return
+    const buckets = new Map<string, { lat: number; lng: number; ids: string[] }>()
+    for (const p of conCoords) {
+      const key = `${p.latitud!.toFixed(2)},${p.longitud!.toFixed(2)}`
+      if (!buckets.has(key)) buckets.set(key, { lat: p.latitud!, lng: p.longitud!, ids: [] })
+      buckets.get(key)!.ids.push(p.id)
+    }
+    for (const [, { lat, lng, ids }] of buckets) {
+      if (enrichGenRef.current !== gen) return
+      await new Promise<void>(r => setTimeout(r, 1100))
+      if (enrichGenRef.current !== gen) return
+      try {
+        const res = await fetch(
+          `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}`,
+          { headers: { 'User-Agent': 'despachos-app' } }
+        )
+        const data = await res.json()
+        const loc: string = data.address?.city || data.address?.town || data.address?.village || data.address?.suburb || ''
+        if (!loc || enrichGenRef.current !== gen) continue
+        setPedidos(prev => prev.map(p => ids.includes(p.id) ? { ...p, localidad: loc } : p))
+        setColumnas(prev => prev.map(col => ({
+          ...col,
+          pedidos: col.pedidos.map(p => ids.includes(p.id) ? { ...p, localidad: loc } : p),
+        })))
+        setSinAsignar(prev => prev.map(p => ids.includes(p.id) ? { ...p, localidad: loc } : p))
+      } catch { /* nominatim fail silently */ }
+    }
   }
 
   function handleSugerir() {
@@ -873,9 +993,15 @@ function ProgramacionInner() {
   function handleDrop(e: React.DragEvent, cod: string | null) {
     e.preventDefault(); setDragOver(null)
     if (!dragPedido.current) return
-    const id = dragPedido.current.id; dragPedido.current = null
+    const dropped = dragPedido.current
+    const camionAnterior = dropped.camion_id
+    const id = dropped.id; dragPedido.current = null
     const act = pedidos.map(p => p.id === id ? { ...p, camion_id: cod } : p)
     setPedidos(act); construirColumnas(act, camiones)
+    if (userId) {
+      const accion = cod ? 'Asignó camión' : 'Desasignó camión'
+      logAuditoria(userId, userNombre, accion, 'Programación', { pedido_nv: dropped.nv, cliente: dropped.cliente, camion_anterior: camionAnterior, camion_nuevo: cod })
+    }
   }
 
   async function handleConfirmar() {
@@ -921,6 +1047,7 @@ function ProgramacionInner() {
       } else {
         setConfirmado(true)
         showToast('Programación confirmada')
+        if (userId) logAuditoria(userId, userNombre, 'Confirmó programación', 'Programación', { fecha, sucursal, vuelta: vueltaActiva, total_pedidos: pedidos.length, total_camiones: Object.keys(columnas.reduce((acc, col) => { if (col.pedidos.length > 0) acc[col.camion.codigo] = true; return acc }, {} as Record<string, boolean>)).length })
       }
     } catch (e: any) {
       showToast(`Error inesperado: ${e.message}`, 'err')
@@ -940,11 +1067,13 @@ function ProgramacionInner() {
   }
 
   async function handleEditarPeso(id: string, peso: number, posiciones: number) {
+    const pedido = pedidos.find(p => p.id === id)
     try {
       await patchPedido(id, { peso_total_kg: peso, volumen_total_m3: posiciones, pedido_grande: false })
       const act = pedidos.map(p => p.id === id ? { ...p, peso_total_kg: peso, volumen_total_m3: posiciones, pedido_grande: false } : p)
       setPedidos(act); construirColumnas(act, camiones)
       showToast('Peso y posiciones actualizados')
+      if (userId && pedido) logAuditoria(userId, userNombre, 'Editó peso/posiciones', 'Programación', { nv: pedido.nv, cliente: pedido.cliente, peso_anterior: pedido.peso_total_kg, peso_nuevo: peso, pos_anterior: pedido.volumen_total_m3, pos_nuevo: posiciones })
     } catch { showToast('Error al actualizar', 'err') }
   }
 
@@ -955,10 +1084,12 @@ function ProgramacionInner() {
   }
 
   async function handleToggleVolcador(id: string, valor: boolean) {
+    const pedido = pedidos.find(p => p.id === id)
     try {
       await patchPedido(id, { requiere_volcador: valor })
       const act = pedidos.map(p => p.id === id ? { ...p, requiere_volcador: valor } : p)
       setPedidos(act); construirColumnas(act, camiones)
+      if (userId && pedido) logAuditoria(userId, userNombre, valor ? 'Marcó requiere volcador' : 'Quitó requiere volcador', 'Programación', { nv: pedido.nv, cliente: pedido.cliente })
     } catch { showToast('Error al actualizar tipo de camión', 'err') }
   }
 
@@ -983,12 +1114,14 @@ function ProgramacionInner() {
   }
 
   async function handleMoverSucursal(id: string, nuevaSucursal: string) {
+    const pedido = pedidos.find(p => p.id === id)
     try {
       await patchPedido(id, { sucursal: nuevaSucursal, camion_id: null, orden_entrega: null })
       // El pedido desaparece de esta vista (era de otra sucursal)
       const act = pedidos.filter(p => p.id !== id)
       setPedidos(act); construirColumnas(act, camiones)
       showToast(`Pedido movido a ${nuevaSucursal}`)
+      if (userId && pedido) logAuditoria(userId, userNombre, 'Movió pedido a sucursal', 'Programación', { nv: pedido.nv, cliente: pedido.cliente, sucursal_anterior: pedido.sucursal, sucursal_nueva: nuevaSucursal })
     } catch { showToast('Error al mover sucursal', 'err') }
   }
 
@@ -1007,6 +1140,7 @@ function ProgramacionInner() {
   }
 
   async function handleCancelar(id: string) {
+    const pedido = pedidos.find(p => p.id === id)
     try {
       const res = await fetch('/api/pedidos', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) })
       const data = await res.json()
@@ -1014,15 +1148,18 @@ function ProgramacionInner() {
       const act = pedidos.filter(p => p.id !== id)
       setPedidos(act); construirColumnas(act, camiones)
       showToast('Pedido eliminado')
+      if (userId && pedido) logAuditoria(userId, userNombre, 'Canceló pedido', 'Programación', { nv: pedido.nv, cliente: pedido.cliente, sucursal: pedido.sucursal })
     } catch (e: any) { showToast(`Error: ${e.message}`, 'err') }
   }
 
   async function handleCambiarVuelta(id: string, nuevaVuelta: number) {
+    const pedido = pedidos.find(p => p.id === id)
     try {
       await patchPedido(id, { vuelta: nuevaVuelta, camion_id: null, estado: 'pendiente' })
       const act = pedidos.filter(p => p.id !== id)
       setPedidos(act); construirColumnas(act, camiones)
       showToast(`Pedido movido a Vuelta ${nuevaVuelta}`)
+      if (userId && pedido) logAuditoria(userId, userNombre, 'Cambió vuelta', 'Programación', { nv: pedido.nv, cliente: pedido.cliente, vuelta_anterior: pedido.vuelta, vuelta_nueva: nuevaVuelta })
     } catch (e: any) { showToast(`Error: ${e.message}`, 'err') }
   }
 
@@ -1043,6 +1180,7 @@ function ProgramacionInner() {
       ))
       setModalReprogVuelta(false)
       showToast(`${aReprogramar.length} pedidos reprogramados`)
+      if (userId) logAuditoria(userId, userNombre, 'Reprogramó vuelta completa', 'Programación', { fecha, vuelta: vueltaActiva, pedidos_count: aReprogramar.length, fecha_destino: reprogVueltaFecha })
       cargarDatos()
     } catch (e: any) { showToast(`Error: ${e.message}`, 'err') }
     setGuardando(false)
@@ -1058,6 +1196,7 @@ function ProgramacionInner() {
       const act = pedidos.filter(p => p.id !== id)
       setPedidos(act); construirColumnas(act, camiones)
       showToast(`Pedido de ${pedido.cliente} reprogramado para el ${fecha}`)
+      if (userId) logAuditoria(userId, userNombre, 'Reprogramó pedido', 'Programación', { nv: pedido.nv, cliente: pedido.cliente, fecha_nueva: fecha, vuelta_nueva: vuelta, motivo })
     } catch (e: any) { showToast(`Error: ${e.message}`, 'err') }
   }
 
@@ -1181,6 +1320,11 @@ function ProgramacionInner() {
             <span>Sin asignar: <strong style={{ color: totalSin > 0 ? '#E52322' : '#B9BBB7' }}>{totalSin}</strong></span>
           </div>
           <div className="flex items-center gap-2">
+            <button onClick={() => setModalRutas(true)} disabled={cargando || pedidos.length === 0}
+              className="px-3 py-2 text-sm font-medium rounded-lg border transition-colors disabled:opacity-40"
+              style={{ borderColor: '#e8edf8', color: '#254A96', background: '#f4f4f3' }}>
+              🗺️ Ver rutas
+            </button>
             {puedeEditarProg && vueltaActiva !== VUELTA_FUERA && <>
               <button onClick={() => { const l = pedidos.map(p => ({ ...p, camion_id: null })); setPedidos(l); construirColumnas(l, camiones); setConfirmado(false) }}
                 disabled={cargando || guardando}
@@ -1210,6 +1354,17 @@ function ProgramacionInner() {
 
       {/* Kanban — ocupa todo el alto restante */}
       <div className="flex-1 overflow-hidden flex flex-col px-3 pt-2 pb-3">
+
+        {/* Banner flota sin revisar */}
+        {flotaSinRevisar && (
+          <div className="mb-2 rounded-xl px-4 py-3 flex items-center gap-3"
+            style={{ background: '#fef3c7', border: '1px solid #fde68a', color: '#92400e' }}>
+            <span className="text-lg">⚠️</span>
+            <p className="text-sm flex-1">
+              <strong>Flota sin revisar</strong> — El admin de flota todavía no confirmó los camiones para este día. Los cupos son estimados en base a la flota habitual.
+            </p>
+          </div>
+        )}
 
         {/* Banner pedidos grandes */}
         {pedidos.some(p => p.pedido_grande) && !bannerGrandeDismissed && (
@@ -1373,6 +1528,167 @@ function ProgramacionInner() {
           </div>
         )}
       </div>
+
+      {modalRutas && (
+        <ModalRutas
+          columnas={columnas}
+          sinAsignar={sinAsignar}
+          sucursal={sucursal}
+          onClose={() => setModalRutas(false)}
+        />
+      )}
+    </div>
+  )
+}
+
+// ─── Modal Previsualización de Rutas ────────────────────────────────────────────
+
+const TRUCK_COLORS = ['#254A96', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#0ea5e9', '#ec4899', '#14b8a6', '#f97316', '#84cc16']
+
+function ModalRutas({ columnas, sinAsignar, sucursal, onClose }: {
+  columnas: ColumnaKanban[]
+  sinAsignar: Pedido[]
+  sucursal: string
+  onClose: () => void
+}) {
+  const mapRef = useRef<HTMLDivElement>(null)
+  const leafletRef = useRef<any>(null)
+
+  useEffect(() => {
+    // Inject Leaflet CSS once
+    if (!document.getElementById('leaflet-css')) {
+      const link = document.createElement('link')
+      link.id = 'leaflet-css'
+      link.rel = 'stylesheet'
+      link.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'
+      document.head.appendChild(link)
+    }
+
+    function initMap() {
+      if (!mapRef.current) return
+      const L = (window as any).L
+
+      if (leafletRef.current) { leafletRef.current.remove(); leafletRef.current = null }
+
+      const depot = DEPOSITOS[sucursal] ?? { lat: -34.9205, lng: -57.9536 }
+      const map = L.map(mapRef.current).setView([depot.lat, depot.lng], 12)
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+        maxZoom: 18,
+      }).addTo(map)
+
+      // Depot marker
+      L.marker([depot.lat, depot.lng], {
+        icon: L.divIcon({
+          html: `<div style="background:#1a1a1a;color:white;padding:3px 7px;border-radius:6px;font-size:11px;font-weight:bold;white-space:nowrap;box-shadow:0 2px 6px rgba(0,0,0,0.4)">🏭 ${sucursal}</div>`,
+          className: '',
+          iconSize: [90, 24],
+          iconAnchor: [45, 12],
+        })
+      }).addTo(map)
+
+      const boundsPoints: [number, number][] = [[depot.lat, depot.lng]]
+
+      // Routes per truck
+      columnas.forEach((col, idx) => {
+        const color = TRUCK_COLORS[idx % TRUCK_COLORS.length]
+        const peds = col.pedidos
+          .filter(p => p.latitud && p.longitud)
+          .sort((a, b) => (a.orden_entrega ?? 999) - (b.orden_entrega ?? 999))
+        if (peds.length === 0) return
+
+        // Dashed polyline: depot → stops → depot
+        L.polyline(
+          [[depot.lat, depot.lng], ...peds.map(p => [p.latitud!, p.longitud!] as [number, number]), [depot.lat, depot.lng]],
+          { color, weight: 3, opacity: 0.85, dashArray: '8,5' }
+        ).addTo(map)
+
+        // Numbered markers
+        peds.forEach((p, i) => {
+          L.marker([p.latitud!, p.longitud!], {
+            icon: L.divIcon({
+              html: `<div style="background:${color};color:white;width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:bold;border:2px solid white;box-shadow:0 1px 5px rgba(0,0,0,0.35)">${i + 1}</div>`,
+              className: '',
+              iconSize: [26, 26],
+              iconAnchor: [13, 13],
+            })
+          })
+            .bindPopup(`<b style="color:${color}">${col.camion.codigo}</b><br><b>${p.cliente}</b><br><small style="color:#666">${p.direccion}</small>${p.localidad ? `<br><small style="color:#1e40af">📍 ${p.localidad}</small>` : ''}<br><small>${p.peso_total_kg ?? '?'} kg · ${p.volumen_total_m3 ?? '?'} pos</small>`)
+            .addTo(map)
+          boundsPoints.push([p.latitud!, p.longitud!])
+        })
+      })
+
+      // Sin asignar — gray markers
+      sinAsignar.filter(p => p.latitud && p.longitud).forEach(p => {
+        L.marker([p.latitud!, p.longitud!], {
+          icon: L.divIcon({
+            html: `<div style="background:#9ca3af;color:white;width:22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:bold;border:2px solid white;box-shadow:0 1px 4px rgba(0,0,0,0.3)">?</div>`,
+            className: '',
+            iconSize: [22, 22],
+            iconAnchor: [11, 11],
+          })
+        })
+          .bindPopup(`<b>Sin asignar</b><br>${p.cliente}<br><small style="color:#666">${p.direccion}</small>`)
+          .addTo(map)
+        boundsPoints.push([p.latitud!, p.longitud!])
+      })
+
+      if (boundsPoints.length > 1) map.fitBounds(boundsPoints, { padding: [30, 30] })
+      leafletRef.current = map
+    }
+
+    if ((window as any).L) {
+      setTimeout(initMap, 50)
+    } else {
+      const script = document.createElement('script')
+      script.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'
+      script.onload = () => setTimeout(initMap, 50)
+      document.body.appendChild(script)
+    }
+
+    return () => {
+      if (leafletRef.current) { leafletRef.current.remove(); leafletRef.current = null }
+    }
+  }, [columnas, sinAsignar, sucursal])
+
+  const colsConPedidos = columnas.filter(c => c.pedidos.filter(p => p.latitud && p.longitud).length > 0)
+  const sinAsignarConCoords = sinAsignar.filter(p => p.latitud && p.longitud)
+  const totalConCoords = columnas.reduce((a, c) => a + c.pedidos.filter(p => p.latitud && p.longitud).length, 0) + sinAsignarConCoords.length
+
+  return (
+    <div className="fixed inset-0 z-50 flex flex-col bg-white" style={{ fontFamily: 'Barlow, sans-serif' }}>
+      {/* Header */}
+      <div className="px-5 py-3 flex items-center justify-between gap-4 shrink-0 border-b" style={{ borderColor: '#f0f0f0' }}>
+        <div>
+          <p className="font-bold text-sm" style={{ color: '#254A96' }}>🗺️ Previsualización de rutas</p>
+          <p className="text-xs mt-0.5" style={{ color: '#B9BBB7' }}>
+            {totalConCoords} paradas con ubicación · líneas de puntos = ruta en orden de entrega
+          </p>
+        </div>
+        {/* Legend */}
+        <div className="flex flex-wrap gap-x-4 gap-y-1.5 flex-1 justify-center">
+          {colsConPedidos.map((col, idx) => (
+            <div key={col.camion.codigo} className="flex items-center gap-1.5">
+              <div className="w-3.5 h-3.5 rounded-full shrink-0" style={{ background: TRUCK_COLORS[idx % TRUCK_COLORS.length] }} />
+              <span className="text-xs font-semibold" style={{ color: '#1a1a1a' }}>{col.camion.codigo}</span>
+              <span className="text-xs" style={{ color: '#B9BBB7' }}>
+                ({col.pedidos.filter(p => p.latitud && p.longitud).length} ubic. / {col.pedidos.length} ped.)
+              </span>
+            </div>
+          ))}
+          {sinAsignarConCoords.length > 0 && (
+            <div className="flex items-center gap-1.5">
+              <div className="w-3.5 h-3.5 rounded-full shrink-0" style={{ background: '#9ca3af' }} />
+              <span className="text-xs font-semibold" style={{ color: '#1a1a1a' }}>Sin asignar</span>
+              <span className="text-xs" style={{ color: '#B9BBB7' }}>({sinAsignarConCoords.length})</span>
+            </div>
+          )}
+        </div>
+        <button onClick={onClose} className="text-2xl leading-none px-2 shrink-0" style={{ color: '#B9BBB7' }}>×</button>
+      </div>
+      {/* Map container */}
+      <div ref={mapRef} style={{ flex: 1, minHeight: 0 }} />
     </div>
   )
 }

@@ -3,11 +3,13 @@
 import { useEffect, useRef, useState } from 'react'
 import { supabase } from '../supabase'
 import { useRouter } from 'next/navigation'
+import Link from 'next/link'
 import NotificacionBell from '../components/NotificacionBell'
 import { FRANJAS, vultaCerrada, vueltasCerradasPara } from '../lib/franjas'
 
 const TODAS_LAS_CARDS = [
   { href: '/despachos',      icon: '📦', titulo: 'Nuevo pedido',       descripcion: 'Cargar solicitud de despacho',              disponible: true, roles: ['gerencia','ruteador','comercial'] },
+  { href: '/materiales',     icon: '🏷️', titulo: 'Materiales',         descripcion: 'Maestro de productos y posiciones',          disponible: true, roles: ['gerencia','ruteador','admin_flota','deposito'] },
   { href: '/flota-base',     icon: '⚙️', titulo: 'Flota base',         descripcion: 'Camiones, posiciones y choferes habituales', disponible: true, roles: ['gerencia','admin_flota'] },
   { href: '/flota',          icon: '🚛', titulo: 'Flota del día',      descripcion: 'Configurar camiones y choferes',             disponible: true, roles: ['gerencia','admin_flota'] },
   { href: '/pedidos',        icon: '📋', titulo: 'Pedidos',             descripcion: 'Ver y editar todos los pedidos',             disponible: true, roles: ['gerencia','ruteador','admin_flota'] },
@@ -38,7 +40,7 @@ const ESTADO_LABEL: Record<string, string> = {
 }
  
 interface PedidoReciente {
-  id: string; nv: string; cliente: string; sucursal: string; estado: string; fecha_entrega: string; vuelta: number
+  id: string; nv: string; id_despacho: string | null; cliente: string; sucursal: string; estado: string; fecha_entrega: string; vuelta: number
 }
  
 export default function Dashboard() {
@@ -56,6 +58,9 @@ export default function Dashboard() {
   const [toastPass, setToastPass] = useState<{ msg: string; tipo: 'ok' | 'err' } | null>(null)
   const [vistaActiva, setVistaActiva] = useState<'reciente' | 'misPedidos'>('reciente')
   const [misPedidosPropio, setMisPedidosPropio] = useState<PedidoReciente[]>([])
+  const [misPedidosFiltroTexto, setMisPedidosFiltroTexto] = useState('')
+  const [misPedidosFiltroFecha, setMisPedidosFiltroFecha] = useState('')
+  const [misPedidosCargando, setMisPedidosCargando] = useState(false)
   const [pedidoReprogDash, setPedidoReprogDash] = useState<PedidoReciente | null>(null)
   const [reprogFechaDash, setReprogFechaDash] = useState('')
   const [reprogVueltaDash, setReprogVueltaDash] = useState(1)
@@ -117,13 +122,18 @@ export default function Dashboard() {
     return () => { if (intervalRef.current) clearInterval(intervalRef.current) }
   }, [])
 
-  const cargarMisPedidosPropio = async (uid: string) => {
-    const { data } = await supabase.from('pedidos')
-      .select('id,nv,cliente,sucursal,estado,fecha_entrega,vuelta')
+  const cargarMisPedidosPropio = async (uid: string, texto?: string, fecha?: string) => {
+    setMisPedidosCargando(true)
+    let q = supabase.from('pedidos')
+      .select('id,nv,id_despacho,cliente,sucursal,estado,fecha_entrega,vuelta')
       .eq('vendedor_id', uid)
-      .order('created_at', { ascending: false })
-      .limit(50)
+      .order('fecha_entrega', { ascending: false })
+    if (fecha) q = q.eq('fecha_entrega', fecha)
+    if (texto) q = q.or(`cliente.ilike.%${texto}%,nv.ilike.%${texto}%`)
+    if (!fecha && !texto) q = q.limit(100)
+    const { data } = await q
     setMisPedidosPropio(data ?? [])
+    setMisPedidosCargando(false)
   }
 
   const handleReprogramarDashboard = async (p: PedidoReciente, fecha: string, vuelta: number, motivo: string) => {
@@ -227,7 +237,11 @@ export default function Dashboard() {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
           <div className="bg-white rounded-2xl shadow-xl p-6 w-full max-w-sm" style={{ fontFamily: 'Barlow, sans-serif' }}>
             <h3 className="font-semibold text-sm mb-1" style={{ color: '#254A96' }}>📅 Reprogramar entrega</h3>
-            <p className="text-xs mb-4" style={{ color: '#B9BBB7' }}>{pedidoReprogDash.cliente}</p>
+            <p className="text-xs mb-4" style={{ color: '#B9BBB7' }}>
+              {pedidoReprogDash.cliente}
+              {pedidoReprogDash.nv ? ` · NV ${pedidoReprogDash.nv}` : ''}
+              {pedidoReprogDash.id_despacho ? ` · SD ${pedidoReprogDash.id_despacho}` : ''}
+            </p>
             <div className="space-y-3">
               <div>
                 <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>Nueva fecha</label>
@@ -388,33 +402,47 @@ export default function Dashboard() {
           <div>
             <p className="text-xs font-semibold uppercase tracking-widest mb-3" style={{ color: '#B9BBB7' }}>Módulos</p>
             <div className="space-y-2">
-              {cards.map(card => (
-                <button key={card.href} onClick={() => card.disponible && router.push(card.href)}
-                  disabled={!card.disponible}
-                  className="w-full bg-white rounded-xl p-4 flex items-center gap-4 shadow-sm text-left transition-all disabled:opacity-50"
-                  style={{ borderLeft: `4px solid ${card.disponible ? '#254A96' : '#B9BBB7'}` }}
-                  onMouseEnter={e => { if (card.disponible) (e.currentTarget as HTMLElement).style.transform = 'translateX(2px)' }}
-                  onMouseLeave={e => { (e.currentTarget as HTMLElement).style.transform = 'translateX(0)' }}
-                >
-                  <span className="text-2xl">{card.icon}</span>
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <span className="font-semibold text-sm" style={{ color: '#254A96' }}>{card.titulo}</span>
-                      {!card.disponible && (
-                        <span className="text-xs px-1.5 py-0.5 rounded-full bg-gray-100" style={{ color: '#B9BBB7' }}>Próximamente</span>
-                      )}
-                      {card.href === '/programacion' && pedidosGrandes > 0 && (
-                        <span className="text-xs px-2 py-0.5 rounded-full font-semibold"
-                          style={{ background: '#fde68a', color: '#92400e' }}>
-                          ⚠️ {pedidosGrandes} pedido{pedidosGrandes !== 1 ? 's' : ''} grande{pedidosGrandes !== 1 ? 's' : ''}
-                        </span>
-                      )}
+              {cards.map(card => {
+                const cardInner = (
+                  <>
+                    <span className="text-2xl">{card.icon}</span>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="font-semibold text-sm" style={{ color: '#254A96' }}>{card.titulo}</span>
+                        {!card.disponible && (
+                          <span className="text-xs px-1.5 py-0.5 rounded-full bg-gray-100" style={{ color: '#B9BBB7' }}>Próximamente</span>
+                        )}
+                        {card.href === '/programacion' && pedidosGrandes > 0 && (
+                          <span className="text-xs px-2 py-0.5 rounded-full font-semibold"
+                            style={{ background: '#fde68a', color: '#92400e' }}>
+                            ⚠️ {pedidosGrandes} pedido{pedidosGrandes !== 1 ? 's' : ''} grande{pedidosGrandes !== 1 ? 's' : ''}
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-xs mt-0.5" style={{ color: '#B9BBB7' }}>{card.descripcion}</p>
                     </div>
-                    <p className="text-xs mt-0.5" style={{ color: '#B9BBB7' }}>{card.descripcion}</p>
-                  </div>
-                  {card.disponible && <span className="text-lg" style={{ color: '#B9BBB7' }}>›</span>}
-                </button>
-              ))}
+                    {card.disponible && <span className="text-lg" style={{ color: '#B9BBB7' }}>›</span>}
+                  </>
+                )
+                const sharedStyle = { borderLeft: `4px solid ${card.disponible ? '#254A96' : '#B9BBB7'}` }
+                const sharedClass = "w-full bg-white rounded-xl p-4 flex items-center gap-4 shadow-sm text-left transition-all"
+                const hoverHandlers = {
+                  onMouseEnter: (e: React.MouseEvent<HTMLElement>) => { (e.currentTarget as HTMLElement).style.transform = 'translateX(2px)' },
+                  onMouseLeave: (e: React.MouseEvent<HTMLElement>) => { (e.currentTarget as HTMLElement).style.transform = 'translateX(0)' },
+                }
+                return card.disponible
+                  ? (
+                    <Link key={card.href} href={card.href}
+                      className={sharedClass} style={sharedStyle} {...hoverHandlers}>
+                      {cardInner}
+                    </Link>
+                  ) : (
+                    <div key={card.href}
+                      className={sharedClass + ' opacity-50 cursor-default'} style={sharedStyle}>
+                      {cardInner}
+                    </div>
+                  )
+              })}
             </div>
           </div>
  
@@ -471,17 +499,60 @@ export default function Dashboard() {
               </div>
             ) : (
               <div className="bg-white rounded-xl shadow-sm overflow-hidden">
-                {misPedidosPropio.length === 0 ? (
+                {/* Filtros */}
+                <div className="px-4 py-3 flex gap-2 flex-wrap" style={{ borderBottom: '1px solid #f0f0f0', background: '#fafbff' }}>
+                  <input
+                    type="text"
+                    placeholder="Buscar por NV o cliente…"
+                    value={misPedidosFiltroTexto}
+                    onChange={e => setMisPedidosFiltroTexto(e.target.value)}
+                    onKeyDown={e => { if (e.key === 'Enter') cargarMisPedidosPropio(usuario?.id, misPedidosFiltroTexto, misPedidosFiltroFecha) }}
+                    className="border rounded-lg px-2.5 py-1.5 text-sm focus:outline-none flex-1 min-w-[160px]"
+                    style={{ borderColor: '#e8edf8' }}
+                  />
+                  <input
+                    type="date"
+                    value={misPedidosFiltroFecha}
+                    onChange={e => setMisPedidosFiltroFecha(e.target.value)}
+                    className="border rounded-lg px-2.5 py-1.5 text-sm focus:outline-none"
+                    style={{ borderColor: '#e8edf8' }}
+                  />
+                  <button
+                    onClick={() => cargarMisPedidosPropio(usuario?.id, misPedidosFiltroTexto, misPedidosFiltroFecha)}
+                    disabled={misPedidosCargando}
+                    className="px-3 py-1.5 rounded-lg text-sm font-semibold text-white disabled:opacity-50"
+                    style={{ background: '#254A96' }}>
+                    {misPedidosCargando ? '…' : '🔍'}
+                  </button>
+                  {(misPedidosFiltroTexto || misPedidosFiltroFecha) && (
+                    <button
+                      onClick={() => { setMisPedidosFiltroTexto(''); setMisPedidosFiltroFecha(''); cargarMisPedidosPropio(usuario?.id) }}
+                      className="px-2.5 py-1.5 rounded-lg text-xs"
+                      style={{ color: '#B9BBB7', border: '1px solid #e0e0e0' }}>
+                      ✕ limpiar
+                    </button>
+                  )}
+                </div>
+                {misPedidosCargando ? (
+                  <div className="flex justify-center py-12">
+                    <div className="w-5 h-5 border-2 border-t-transparent rounded-full animate-spin" style={{ borderColor: '#254A96', borderTopColor: 'transparent' }} />
+                  </div>
+                ) : misPedidosPropio.length === 0 ? (
                   <div className="p-12 text-center">
                     <div className="text-4xl mb-3">📭</div>
-                    <p className="text-sm" style={{ color: '#B9BBB7' }}>No cargaste pedidos todavía</p>
+                    <p className="text-sm" style={{ color: '#B9BBB7' }}>No se encontraron pedidos</p>
                   </div>
                 ) : (
                   <div className="divide-y" style={{ borderColor: '#f9f9f9' }}>
                     {misPedidosPropio.map(p => (
                       <div key={p.id} className="flex items-center justify-between gap-3 px-4 py-3">
                         <div className="min-w-0">
-                          <p className="font-medium text-sm truncate" style={{ color: '#1a1a1a' }}>{p.cliente}</p>
+                          <div className="flex items-baseline gap-2">
+                            <p className="font-medium text-sm truncate" style={{ color: '#1a1a1a' }}>{p.cliente}</p>
+                            <span className="text-xs shrink-0" style={{ color: '#888' }}>
+                              NV {p.nv || '—'}{p.id_despacho ? ` · SD ${p.id_despacho}` : ''}
+                            </span>
+                          </div>
                           <p className="text-xs mt-0.5" style={{ color: '#B9BBB7' }}>
                             {new Date(p.fecha_entrega + 'T00:00:00').toLocaleDateString('es-AR', { day: '2-digit', month: '2-digit' })} · {p.vuelta === 0 ? 'Sin asig.' : `V${p.vuelta}`} · {p.sucursal}
                           </p>

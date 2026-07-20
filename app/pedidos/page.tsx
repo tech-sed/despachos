@@ -3,6 +3,7 @@
 import { useEffect, useState, useMemo } from 'react'
 import { supabase } from '../supabase'
 import { useRouter } from 'next/navigation'
+import Link from 'next/link'
 import { puedeEditar, tieneAcceso } from '../lib/permisos'
 import { logAuditoria } from '../lib/auditoria'
 
@@ -46,10 +47,27 @@ const normalizar = (s: string) =>
 
 interface Pedido {
   id: string; nv: string; id_despacho: string | null; cliente: string; direccion: string
+  telefono: string | null
   sucursal: string; fecha_entrega: string; vuelta: number
   estado: string; estado_pago: string | null; peso_total_kg: number | null; volumen_total_m3: number | null
   notas: string | null; camion_id: string | null; tipo?: string; created_at?: string
   vendedor_id?: string | null
+  latitud?: number | null; longitud?: number | null
+}
+
+// Extrae lat/lng de un link de Google Maps
+function extractCoordsFromMapsUrl(url: string): { lat: number; lng: number } | null {
+  const clean = url.trim()
+  // @lat,lng,zoom — formato más común al compartir
+  const atMatch = clean.match(/\/@(-?\d+\.?\d+),(-?\d+\.?\d+)/)
+  if (atMatch) return { lat: parseFloat(atMatch[1]), lng: parseFloat(atMatch[2]) }
+  // ?q=lat,lng  o  &q=lat,lng
+  const qMatch = clean.match(/[?&]q=(-?\d+\.?\d+),(-?\d+\.?\d+)/)
+  if (qMatch) return { lat: parseFloat(qMatch[1]), lng: parseFloat(qMatch[2]) }
+  // /place/name/@lat,lng  alternativa
+  const placeMatch = clean.match(/place\/[^/@]+\/@(-?\d+\.?\d+),(-?\d+\.?\d+)/)
+  if (placeMatch) return { lat: parseFloat(placeMatch[1]), lng: parseFloat(placeMatch[2]) }
+  return null
 }
 
 const PAGO_COLOR: Record<string, { bg: string; text: string }> = {
@@ -76,6 +94,8 @@ interface Foto {
 interface EditState {
   id: string; sucursal: string; peso: string; posiciones: string; estado_pago: string
   fecha_entrega: string; vuelta: number
+  direccion: string; telefono: string
+  mapsLink: string
 }
 
 export default function PedidosPage() {
@@ -83,12 +103,15 @@ export default function PedidosPage() {
   const [pedidos, setPedidos] = useState<Pedido[]>([])
   const [cargando, setCargando] = useState(false)
   const [total, setTotal] = useState(0)
+  const [paginaOffset, setPaginaOffset] = useState(0)
+  const PAGE_SIZE = 200
 
   // Categorías, items y fotos por pedido
   const [categoriasMap, setCategoriasMap] = useState<Record<string, { label: string; tipo: string }[]>>({})
   const [itemsMap, setItemsMap] = useState<Record<string, Item[]>>({})
   const [fotosMap, setFotosMap] = useState<Record<string, Foto[]>>({})
   const [vendedoresMap, setVendedoresMap] = useState<Record<string, string>>({}) // vendedor_id → nombre
+  const [detalleCargando, setDetalleCargando] = useState(false)
 
   // Filas expandidas (múltiples a la vez)
   const [expandidos, setExpandidos] = useState<Set<string>>(new Set())
@@ -104,6 +127,13 @@ export default function PedidosPage() {
   // Edición
   const [editando, setEditando] = useState<EditState | null>(null)
   const [guardando, setGuardando] = useState(false)
+  const [recalculando, setRecalculando] = useState(false)
+  const [recalculandoTodos, setRecalculandoTodos] = useState(false)
+
+  // Comentario rápido
+  const [modalComentario, setModalComentario] = useState<Pedido | null>(null)
+  const [comentarioTexto, setComentarioTexto] = useState('')
+  const [guardandoComentario, setGuardandoComentario] = useState(false)
 
   const [toast, setToast] = useState<{ msg: string; tipo: 'ok' | 'err' } | null>(null)
   const showToast = (msg: string, tipo: 'ok' | 'err' = 'ok') => {
@@ -187,18 +217,23 @@ export default function PedidosPage() {
     })
   }, [])
 
-  async function buscar(textoOverride?: string) {
+  async function buscar(textoOverride?: string, append = false) {
     setCargando(true)
-    setCategoriasMap({})
-    setItemsMap({})
-    setExpandidos(new Set())
+    const currentOffset = append ? paginaOffset : 0
+    if (!append) {
+      setCategoriasMap({})
+      setItemsMap({})
+      setFotosMap({})
+      setExpandidos(new Set())
+      setPaginaOffset(0)
+    }
     const textoFinal = textoOverride !== undefined ? textoOverride : filtroTexto
     let q = supabase
       .from('pedidos')
-      .select('id, nv, id_despacho, cliente, direccion, sucursal, fecha_entrega, vuelta, estado, estado_pago, peso_total_kg, volumen_total_m3, notas, camion_id, tipo, created_at, vendedor_id', { count: 'exact' })
+      .select('id, nv, id_despacho, cliente, direccion, telefono, sucursal, fecha_entrega, vuelta, estado, estado_pago, peso_total_kg, volumen_total_m3, notas, camion_id, tipo, created_at, vendedor_id, latitud, longitud', { count: 'exact' })
       .order('fecha_entrega', { ascending: false })
       .order('cliente')
-      .limit(200)
+      .range(currentOffset, currentOffset + PAGE_SIZE - 1)
 
     if (filtroFecha) q = q.eq('fecha_entrega', filtroFecha)
     if (filtroSucursal) q = q.eq('sucursal', filtroSucursal)
@@ -212,7 +247,13 @@ export default function PedidosPage() {
     if (error) { showToast(error.message, 'err'); setCargando(false); return }
 
     const pedidosList = data ?? []
-    setPedidos(pedidosList)
+    if (append) {
+      setPedidos(prev => [...prev, ...pedidosList])
+      setPaginaOffset(currentOffset + pedidosList.length)
+    } else {
+      setPedidos(pedidosList)
+      setPaginaOffset(pedidosList.length)
+    }
     setTotal(count ?? 0)
     setCargando(false)
 
@@ -225,17 +266,20 @@ export default function PedidosPage() {
           .from('usuarios').select('id, nombre').in('id', vendedorIds)
         const map: Record<string, string> = {}
         for (const v of vData ?? []) map[v.id] = v.nombre
-        setVendedoresMap(map)
+        setVendedoresMap(prev => append ? { ...prev, ...map } : map)
       }
     }
   }
 
   async function cargarDetalle(ids: string[]) {
-    const [{ data: rawItems }, { data: mats }, { data: rawFotos }] = await Promise.all([
+    setDetalleCargando(true)
+    try {
+    const [{ data: rawItems, error: itemsErr }, { data: mats }, { data: rawFotos }] = await Promise.all([
       supabase.from('pedido_items').select('pedido_id, nombre, cantidad, unidad').in('pedido_id', ids),
       supabase.from('materiales').select('id, nombre, tipo_carga, categoria, subcategoria'),
       supabase.from('pedido_fotos').select('pedido_id, url, label').in('pedido_id', ids).order('created_at'),
     ])
+    if (itemsErr) console.error('[cargarDetalle] pedido_items error:', itemsErr)
 
     // Pre-normalizar materiales UNA sola vez (evita repetir normalizar() por cada item×material)
     const matsNorm = (mats ?? []).map((m: any) => ({ ...m, _n: normalizar(m.nombre) }))
@@ -273,9 +317,14 @@ export default function PedidosPage() {
       newFotosMap[f.pedido_id].push({ url: f.url, label: f.label, publicUrl: pub.publicUrl })
     }
 
-    setItemsMap(newItemsMap)
-    setCategoriasMap(newCatResult)
-    setFotosMap(newFotosMap)
+    setItemsMap(prev => ({ ...prev, ...newItemsMap }))
+    setCategoriasMap(prev => ({ ...prev, ...newCatResult }))
+    setFotosMap(prev => ({ ...prev, ...newFotosMap }))
+    } catch (e) {
+      console.error('[cargarDetalle] error inesperado:', e)
+    } finally {
+      setDetalleCargando(false)
+    }
   }
 
   function toggleExpandir(id: string) {
@@ -287,15 +336,41 @@ export default function PedidosPage() {
     })
   }
 
+  async function guardarComentario() {
+    if (!modalComentario || !comentarioTexto.trim()) return
+    setGuardandoComentario(true)
+    const fecha = new Date().toLocaleDateString('es-AR', { day: '2-digit', month: '2-digit' })
+    const nuevaNota = `[${userNombre} · ${fecha}]: ${comentarioTexto.trim()}`
+    const notaFinal = modalComentario.notas ? `${modalComentario.notas} | ${nuevaNota}` : nuevaNota
+    const res = await fetch('/api/pedidos', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: modalComentario.id, notas: notaFinal }),
+    })
+    if (res.ok) {
+      setPedidos(prev => prev.map(p => p.id === modalComentario.id ? { ...p, notas: notaFinal } : p))
+      if (userId) logAuditoria(userId, userNombre, 'Agregó comentario', 'Pedidos', { nv: modalComentario.nv, cliente: modalComentario.cliente, comentario: comentarioTexto.trim() })
+      showToast('Comentario guardado')
+      setModalComentario(null)
+      setComentarioTexto('')
+    } else {
+      showToast('Error al guardar el comentario', 'err')
+    }
+    setGuardandoComentario(false)
+  }
+
   function iniciarEdicion(p: Pedido) {
     setEditando({
       id: p.id,
       sucursal: p.sucursal,
       peso: p.peso_total_kg != null ? String(p.peso_total_kg) : '',
       posiciones: p.volumen_total_m3 != null ? String(p.volumen_total_m3) : '',
+      mapsLink: '',
       estado_pago: p.estado_pago ?? '',
       fecha_entrega: p.fecha_entrega ?? '',
       vuelta: p.vuelta ?? 1,
+      direccion: p.direccion ?? '',
+      telefono: p.telefono ?? '',
     })
   }
 
@@ -310,6 +385,13 @@ export default function PedidosPage() {
     if (editando.estado_pago !== '') updates.estado_pago = editando.estado_pago
     if (editando.fecha_entrega !== '') updates.fecha_entrega = editando.fecha_entrega
     updates.vuelta = editando.vuelta
+    updates.direccion = editando.direccion.trim() || null
+    updates.telefono = editando.telefono.trim() || null
+    // Coordenadas desde link de Google Maps
+    if (editando.mapsLink.trim()) {
+      const coords = extractCoordsFromMapsUrl(editando.mapsLink)
+      if (coords) { updates.latitud = coords.lat; updates.longitud = coords.lng }
+    }
     // Si cambió la sucursal, desasignar el camión — no puede quedar asignado a un camión de otra sucursal
     if (sucursalCambio) { updates.camion_id = null; updates.orden_entrega = null }
 
@@ -331,9 +413,22 @@ export default function PedidosPage() {
         estado_pago: updates.estado_pago ?? p.estado_pago,
         fecha_entrega: updates.fecha_entrega ?? p.fecha_entrega,
         vuelta: updates.vuelta ?? p.vuelta,
+        direccion: updates.direccion ?? p.direccion,
+        telefono: updates.telefono ?? p.telefono,
+        latitud: updates.latitud !== undefined ? updates.latitud : p.latitud,
+        longitud: updates.longitud !== undefined ? updates.longitud : p.longitud,
         ...(sucursalCambio ? { camion_id: null, orden_entrega: null } : {}),
       } : p))
       showToast('Pedido actualizado')
+      // Si cambió la dirección/coordenadas y el pedido tiene camión asignado, recalcular orden de entrega
+      const pedidoConCamion = pedidos.find(p => p.id === editando.id)
+      if ((updates.latitud !== undefined || updates.direccion !== undefined) && pedidoConCamion?.camion_id && !sucursalCambio) {
+        fetch('/api/recalcular-orden', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pedido_id: editando.id }),
+        }).catch(() => {}) // silencioso — no es crítico
+      }
       // Audit: compute changed fields
       if (userId && pedidoOriginal) {
         const cambios: Record<string, { de: any; a: any }> = {}
@@ -343,11 +438,68 @@ export default function PedidosPage() {
         if (updates.estado_pago != null && updates.estado_pago !== pedidoOriginal.estado_pago) cambios.estado_pago = { de: pedidoOriginal.estado_pago, a: updates.estado_pago }
         if (updates.fecha_entrega != null && updates.fecha_entrega !== pedidoOriginal.fecha_entrega) cambios.fecha_entrega = { de: pedidoOriginal.fecha_entrega, a: updates.fecha_entrega }
         if (updates.vuelta !== pedidoOriginal.vuelta) cambios.vuelta = { de: pedidoOriginal.vuelta, a: updates.vuelta }
+        if (updates.direccion !== (pedidoOriginal.direccion ?? null)) cambios.direccion = { de: pedidoOriginal.direccion, a: updates.direccion }
+        if (updates.telefono !== (pedidoOriginal.telefono ?? null)) cambios.telefono = { de: pedidoOriginal.telefono, a: updates.telefono }
         logAuditoria(userId, userNombre, 'Editó pedido', 'Pedidos', { nv: pedidoOriginal.nv, id_despacho: pedidoOriginal.id_despacho, cliente: pedidoOriginal.cliente, cambios })
       }
       setEditando(null)
     }
     setGuardando(false)
+  }
+
+  async function recalcularPosiciones(pedidoId: string) {
+    setRecalculando(true)
+    const res = await fetch('/api/recalcular-posiciones', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pedido_id: pedidoId }),
+    })
+    const data = await res.json()
+    if (data.error) {
+      showToast(`Error al recalcular: ${data.error}`, 'err')
+    } else {
+      const r = data.resultados?.[0]
+      if (r) {
+        setPedidos(prev => prev.map(p => p.id === pedidoId
+          ? { ...p, volumen_total_m3: r.posiciones, peso_total_kg: r.peso_kg }
+          : p
+        ))
+        const sinMatch = r.items_sin_match ?? []
+        if (sinMatch.length > 0) {
+          showToast(`Recalculado: ${r.posiciones} pos · ${sinMatch.length} sin match: ${sinMatch.slice(0,2).join(', ')}${sinMatch.length > 2 ? '…' : ''}`, 'err')
+        } else {
+          showToast(`Posiciones recalculadas: ${r.posiciones} pos · ${(r.peso_kg / 1000).toFixed(1)} tn`)
+        }
+        if (userId) logAuditoria(userId, userNombre, 'Recalculó posiciones', 'Pedidos', { pedido_id: pedidoId, posiciones: r.posiciones, items_sin_match: sinMatch })
+      }
+      setEditando(null)
+    }
+    setRecalculando(false)
+  }
+
+  async function recalcularTodos() {
+    if (pedidos.length === 0) return
+    setRecalculandoTodos(true)
+    const ids = pedidos.map(p => p.id)
+    const res = await fetch('/api/recalcular-posiciones', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pedido_ids: ids }),
+    })
+    const data = await res.json()
+    if (data.error) {
+      showToast(`Error: ${data.error}`, 'err')
+    } else {
+      const resultados: { id: string; posiciones: number; peso_kg: number; items_sin_match: string[] }[] = data.resultados ?? []
+      setPedidos(prev => prev.map(p => {
+        const r = resultados.find(r => r.id === p.id)
+        return r ? { ...p, peso_total_kg: r.peso_kg, volumen_total_m3: r.posiciones } : p
+      }))
+      const sinMatch = resultados.filter(r => r.items_sin_match?.length > 0).length
+      showToast(`↺ ${resultados.length} pedidos recalculados${sinMatch > 0 ? ` · ${sinMatch} con items sin match` : ''}`)
+      if (userId) logAuditoria(userId, userNombre, 'Recalculó posiciones (masivo)', 'Pedidos', { cantidad: resultados.length, sin_match: sinMatch })
+    }
+    setRecalculandoTodos(false)
   }
 
   function abrirTransferencia(p: Pedido) {
@@ -439,6 +591,50 @@ export default function PedidosPage() {
         <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 px-5 py-3 rounded-xl shadow-lg text-sm font-medium text-white flex items-center gap-2"
           style={{ background: toast.tipo === 'ok' ? '#254A96' : '#E52322' }}>
           {toast.tipo === 'ok' ? '✓' : '✕'} {toast.msg}
+        </div>
+      )}
+
+      {/* Modal comentario rápido */}
+      {modalComentario && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
+          <div className="bg-white rounded-2xl shadow-xl p-6 w-full max-w-sm space-y-4" style={{ fontFamily: 'Barlow, sans-serif' }}>
+            <div>
+              <h3 className="font-semibold text-sm" style={{ color: '#254A96' }}>💬 Agregar comentario</h3>
+              <p className="text-xs mt-1" style={{ color: '#B9BBB7' }}>
+                {modalComentario.cliente}{modalComentario.nv ? ` · NV ${modalComentario.nv}` : ''}
+              </p>
+            </div>
+            {modalComentario.notas && (
+              <div className="rounded-lg px-3 py-2 text-xs" style={{ background: '#f4f4f3', color: '#666' }}>
+                <p className="font-medium mb-1" style={{ color: '#B9BBB7' }}>Notas actuales:</p>
+                <p>{modalComentario.notas}</p>
+              </div>
+            )}
+            <textarea
+              value={comentarioTexto}
+              onChange={e => setComentarioTexto(e.target.value)}
+              placeholder="Ej: el cliente puso una lona verde en la entrada, tocar el timbre del costado..."
+              rows={3}
+              className="w-full border rounded-xl px-3 py-2 text-sm focus:outline-none resize-none"
+              style={{ borderColor: '#e8edf8' }}
+              autoFocus
+            />
+            <div className="flex gap-2">
+              <button
+                disabled={!comentarioTexto.trim() || guardandoComentario}
+                onClick={guardarComentario}
+                className="flex-1 py-2.5 rounded-xl text-sm font-semibold text-white disabled:opacity-40"
+                style={{ background: '#0f766e' }}>
+                {guardandoComentario ? 'Guardando...' : 'Guardar comentario'}
+              </button>
+              <button
+                onClick={() => { setModalComentario(null); setComentarioTexto('') }}
+                className="px-4 py-2.5 rounded-xl text-sm font-medium"
+                style={{ background: '#f4f4f3', color: '#666' }}>
+                Cancelar
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
@@ -548,9 +744,56 @@ export default function PedidosPage() {
                   ))}
                 </select>
               </div>
+              <div>
+                <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>Dirección</label>
+                <input type="text" value={editando.direccion}
+                  onChange={e => setEditando(prev => prev ? { ...prev, direccion: e.target.value } : prev)}
+                  className="w-full border rounded-xl px-3 py-2 text-sm focus:outline-none"
+                  style={{ borderColor: '#e8edf8' }} placeholder="Calle y número…" />
+              </div>
+              <div>
+                <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>Teléfono</label>
+                <input type="text" value={editando.telefono}
+                  onChange={e => setEditando(prev => prev ? { ...prev, telefono: e.target.value } : prev)}
+                  className="w-full border rounded-xl px-3 py-2 text-sm focus:outline-none"
+                  style={{ borderColor: '#e8edf8' }} placeholder="Ej: 11 1234-5678" />
+              </div>
             </div>
+
+            {/* Geolocalización desde link de Google Maps */}
+            {puedeEditarPedidos && (() => {
+              const coords = editando.mapsLink.trim() ? extractCoordsFromMapsUrl(editando.mapsLink) : null
+              const tieneCoords = coords !== null
+              const linkInvalido = editando.mapsLink.trim() && !tieneCoords
+              return (
+                <div className="mt-3">
+                  <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>
+                    📍 Corregir geolocalización (pegar link de Google Maps)
+                  </label>
+                  <input
+                    type="text"
+                    value={editando.mapsLink}
+                    onChange={e => setEditando(prev => prev ? { ...prev, mapsLink: e.target.value } : prev)}
+                    className="w-full border rounded-xl px-3 py-2 text-sm focus:outline-none"
+                    style={{ borderColor: linkInvalido ? '#fca5a5' : tieneCoords ? '#86efac' : '#e8edf8' }}
+                    placeholder="https://www.google.com/maps/place/.../@-34.965,-58.064,15z"
+                  />
+                  {tieneCoords && (
+                    <p className="text-xs mt-1 font-medium" style={{ color: '#065f46' }}>
+                      ✓ Lat: {coords.lat.toFixed(6)} · Lng: {coords.lng.toFixed(6)}
+                    </p>
+                  )}
+                  {linkInvalido && (
+                    <p className="text-xs mt-1" style={{ color: '#E52322' }}>
+                      No se pudieron extraer coordenadas. Usá el link completo (no el acortado goo.gl).
+                    </p>
+                  )}
+                </div>
+              )
+            })()}
+
             <div className="flex gap-2 mt-5">
-              <button onClick={guardar} disabled={guardando}
+              <button onClick={guardar} disabled={guardando || recalculando}
                 className="flex-1 py-2.5 rounded-xl text-sm font-semibold text-white disabled:opacity-50"
                 style={{ background: '#254A96' }}>
                 {guardando ? 'Guardando...' : 'Guardar'}
@@ -561,6 +804,14 @@ export default function PedidosPage() {
                 Cancelar
               </button>
             </div>
+            <button
+              onClick={() => recalcularPosiciones(editando.id)}
+              disabled={recalculando || guardando}
+              className="w-full mt-2 py-2 rounded-xl text-xs font-medium disabled:opacity-50"
+              style={{ background: '#f0fdf4', color: '#065f46', border: '1px solid #bbf7d0' }}
+              title="Vuelve a calcular posiciones y peso desde los productos registrados en el pedido">
+              {recalculando ? '⏳ Recalculando...' : '♻️ Recalcular posiciones desde productos'}
+            </button>
           </div>
         </div>
       )}
@@ -657,13 +908,13 @@ export default function PedidosPage() {
 
       {/* Navbar */}
       <nav className="bg-white border-b sticky top-0 z-40" style={{ borderColor: '#e8edf8' }}>
-        <div className="max-w-[1400px] mx-auto px-4 h-14 flex items-center">
+        <div className="max-w-[2000px] mx-auto px-3 h-14 flex items-center">
           <div className="flex items-center gap-3">
-            <button onClick={() => router.push('/dashboard')}
+            <Link href="/dashboard"
               className="text-xs px-2 py-1.5 rounded-lg font-medium"
               style={{ background: '#e8edf8', color: '#254A96' }}>
               ← Volver
-            </button>
+            </Link>
             <img src="/logo.png" alt="Construyo al Costo" className="h-7 w-auto rounded-lg hidden sm:block" />
             <div>
               <span className="font-bold text-sm" style={{ color: '#254A96' }}>Pedidos</span>
@@ -673,7 +924,7 @@ export default function PedidosPage() {
         </div>
       </nav>
 
-      <main className="max-w-[1400px] mx-auto px-4 py-5">
+      <main className="max-w-[2000px] mx-auto px-3 py-5">
 
         {/* Filtros */}
         <div className="bg-white rounded-xl shadow-sm p-4 mb-4">
@@ -710,11 +961,21 @@ export default function PedidosPage() {
                 style={{ borderColor: '#e8edf8' }} />
             </div>
           </div>
-          <button onClick={() => buscar()} disabled={cargando}
-            className="px-5 py-2 rounded-xl text-sm font-semibold text-white disabled:opacity-50"
-            style={{ background: '#254A96' }}>
-            {cargando ? 'Buscando...' : 'Buscar'}
-          </button>
+          <div className="flex items-center gap-2 flex-wrap">
+            <button onClick={() => buscar()} disabled={cargando}
+              className="px-5 py-2 rounded-xl text-sm font-semibold text-white disabled:opacity-50"
+              style={{ background: '#254A96' }}>
+              {cargando ? 'Buscando...' : 'Buscar'}
+            </button>
+            {puedeEditarPedidos && pedidos.length > 0 && (
+              <button onClick={recalcularTodos} disabled={recalculandoTodos || cargando}
+                className="px-5 py-2 rounded-xl text-sm font-semibold disabled:opacity-50"
+                style={{ background: '#f0fdf4', color: '#065f46', border: '1px solid #bbf7d0' }}
+                title="Recalcula posiciones y peso de todos los pedidos del resultado actual">
+                {recalculandoTodos ? `⏳ Recalculando ${pedidos.length}...` : `♻️ Recalcular ${pedidos.length} pedidos`}
+              </button>
+            )}
+          </div>
         </div>
 
         {/* Tabla */}
@@ -850,18 +1111,24 @@ export default function PedidosPage() {
                             }
                           </div>
                         </td>
-                        <td className="px-4 py-2.5">
-                          <div className="flex gap-1.5 items-center">
+                        <td className="px-4 py-2.5 whitespace-nowrap">
+                          <div className="flex gap-1.5 items-center flex-nowrap">
+                            <button onClick={() => { setModalComentario(p); setComentarioTexto('') }}
+                              className="text-xs px-2.5 py-1 rounded-lg font-medium shrink-0"
+                              style={{ background: '#f0fdfa', color: '#0f766e' }}
+                              title="Agregar comentario">
+                              💬
+                            </button>
                             {puedeEditarPedidos && (
                               <button onClick={() => iniciarEdicion(p)}
-                                className="text-xs px-2.5 py-1 rounded-lg font-medium"
+                                className="text-xs px-2.5 py-1 rounded-lg font-medium shrink-0"
                                 style={{ background: '#f4f4f3', color: '#254A96' }}>
                                 ✏️
                               </button>
                             )}
                             {userRol === 'gerencia' && (p.estado === 'entregado' || p.estado === 'rechazado' || p.estado === 'entregado_parcial') && (
                               <button onClick={() => setModalRevertir(p)}
-                                className="text-xs px-2.5 py-1 rounded-lg font-medium"
+                                className="text-xs px-2.5 py-1 rounded-lg font-medium shrink-0"
                                 style={{ background: '#fde8e8', color: '#E52322' }}
                                 title="Revertir entrega">
                                 ↩
@@ -887,7 +1154,9 @@ export default function PedidosPage() {
                                 </div>
 
                                 {/* Items */}
-                                {!items || items.length === 0 ? (
+                                {detalleCargando && !items ? (
+                                  <p className="px-4 py-3 text-xs" style={{ color: '#B9BBB7' }}>Cargando productos…</p>
+                                ) : !items || items.length === 0 ? (
                                   <p className="px-4 py-3 text-xs" style={{ color: '#B9BBB7' }}>Sin productos registrados</p>
                                 ) : (
                                   <table className="w-full text-xs">
@@ -933,7 +1202,7 @@ export default function PedidosPage() {
                                 )}
 
                                 {/* Acción transferencia */}
-                                {puedeEditarPedidos && p.tipo !== 'retiro' && (
+                                {(puedeEditarPedidos || userRol === 'deposito') && p.tipo !== 'retiro' && (
                                   <div className="px-4 py-3 border-t flex items-center gap-3" style={{ borderColor: '#e8edf8', background: '#f8faff' }}>
                                     <button onClick={() => abrirTransferencia(p)}
                                       className="px-4 py-2 text-xs font-semibold rounded-lg flex items-center gap-1.5"
@@ -980,10 +1249,19 @@ export default function PedidosPage() {
                 })}
               </tbody>
             </table>
-            {total > 200 && (
-              <p className="text-xs text-center py-3" style={{ color: '#B9BBB7' }}>
-                Mostrando los primeros 200 de {total} resultados. Refiná los filtros para ver más.
-              </p>
+            {total > pedidos.length && (
+              <div className="flex flex-col items-center gap-1.5 py-4">
+                <button
+                  onClick={() => buscar(undefined, true)}
+                  disabled={cargando}
+                  className="px-6 py-2.5 rounded-xl text-sm font-semibold text-white disabled:opacity-50"
+                  style={{ background: '#254A96' }}>
+                  {cargando ? 'Cargando...' : `Cargar más resultados`}
+                </button>
+                <span className="text-xs" style={{ color: '#B9BBB7' }}>
+                  Mostrando {pedidos.length} de {total}
+                </span>
+              </div>
             )}
           </div>
         )}

@@ -3,6 +3,7 @@
 import { useEffect, useState, useRef } from 'react'
 import { supabase } from '../supabase'
 import { useRouter } from 'next/navigation'
+import Link from 'next/link'
 import { tieneAcceso } from '../lib/permisos'
 
 function hoy() { return new Date().toISOString().split('T')[0] }
@@ -21,6 +22,51 @@ function colorSemaforo(p: number) {
 
 function colorBarra(p: number) {
   return p >= 90 ? '#E52322' : p >= 70 ? '#10b981' : p >= 40 ? '#f59e0b' : '#B9BBB7'
+}
+
+const VUELTAS_MAX_DEFAULT: Record<string, number> = {
+  'LP520': 4, 'Guernica': 4,
+  'LP139': 3, 'Cañuelas': 3, 'Pinamar': 3,
+}
+
+function maxVueltasPorDistancia(distKm: number): number {
+  if (distKm < 20) return 4
+  if (distKm < 50) return 3
+  if (distKm < 100) return 2
+  return 1
+}
+
+/** Velocidad promedio de traslado para estimación de fallback (cuando Valhalla no responde).
+ *  Pinamar tiene rutas de ruta nacional con poco tráfico; el resto trabaja en ciudad/periferia. */
+const VEL_FALLBACK_KMH: Record<string, number> = {
+  'Pinamar': 40,
+}
+const VEL_FALLBACK_DEFAULT = 25
+function getVelFallback(sucursal: string): number {
+  return VEL_FALLBACK_KMH[sucursal] ?? VEL_FALLBACK_DEFAULT
+}
+
+/** Calcula vueltas_max efectivas según distancia máxima al pedido más lejano y día de semana */
+function calcVueltasMaxEfectivas(sucursal: string, maxDistKm: number, fecha?: string): number {
+  const esSabado = fecha ? new Date(fecha + 'T12:00:00').getDay() === 6 : false
+  const defaultMax = esSabado ? 2 : (VUELTAS_MAX_DEFAULT[sucursal] ?? 3)
+  if (maxDistKm === 0) return defaultMax
+  return Math.min(defaultMax, maxVueltasPorDistancia(maxDistKm))
+}
+
+/** Ocupación diaria estimada (0-100) */
+function calcOcupDiaria(
+  posUsadas: number, kgUsados: number,
+  posTotal: number, tonelajeMax: number,
+  vueltasRealizadas: number, vueltasMaxEfectivas: number,
+): { pctPos: number; pctKg: number } {
+  if (vueltasMaxEfectivas === 0) return { pctPos: 0, pctKg: 0 }
+  const capPosDia = posTotal * vueltasMaxEfectivas
+  const capKgDia  = tonelajeMax * vueltasMaxEfectivas
+  return {
+    pctPos: pct(posUsadas, capPosDia),
+    pctKg:  pct(kgUsados,  capKgDia),
+  }
 }
 
 function formatHora(iso: string | null) {
@@ -78,6 +124,42 @@ function calcularDistanciaRuta(pedidos: { latitud: number | null; longitud: numb
   return Math.round(dist)
 }
 
+function formatMinutos(min: number): string {
+  const h = Math.floor(min / 60)
+  const m = Math.round(min % 60)
+  if (h > 0) return m > 0 ? `${h}h ${m}min` : `${h}h`
+  return `${m}min`
+}
+
+const TIPOS_CARGA_HIERRO = new Set(['hierro_suelto', 'chapa', 'pretensado'])
+const TIPOS_CARGA_GRANEL = new Set(['granel'])
+
+function calcularTiempoDescargaMin(pedidos: PedidoDetalle[], esTrailer: boolean): number {
+  if (pedidos.length === 0) return 0
+  // Hierros (barras, chapas, pretensado): descarga única 20 min para todos los hierros de la vuelta
+  const tieneHierros = pedidos.some(p => p.esHierros)
+  const hierrosMin = tieneHierros ? 20 : 0
+  // Granel (volcador/bolsonería): 5 min por pedido granel (descarga rápida, sin contar posiciones)
+  const granelMin = pedidos.filter(p => p.esGranel).length * 5
+  // Pallets/bolsones: 3 min/pos por pedido, con reglas de barrio cerrado
+  let palletMin = 0
+  for (const p of pedidos.filter(q => !q.esHierros && !q.esGranel)) {
+    const pos = p.volumen_total_m3 ?? 0
+    if (pos <= 0) continue
+    if (p.barrio_cerrado) {
+      const nIngresos = Math.ceil(pos / 3)
+      const esperaPorIngreso = esTrailer ? 15 : 10   // +5 por desenganche si trailer
+      palletMin += nIngresos * esperaPorIngreso + pos * 3
+    } else {
+      palletMin += pos * 3
+    }
+  }
+  // 5 min por parada única (mismo cliente + misma dirección = misma parada)
+  const paradasUnicas = new Set(pedidos.map(p => `${p.cliente}||${p.direccion}`)).size
+  const paradasMin = paradasUnicas * 5
+  return Math.round(hierrosMin + granelMin + palletMin + paradasMin)
+}
+
 interface PedidoDetalle {
   id: string
   nv: string
@@ -93,6 +175,10 @@ interface PedidoDetalle {
   orden_entrega: number | null
   latitud: number | null
   longitud: number | null
+  barrio_cerrado: boolean | null
+  esHierros: boolean
+  esGranel: boolean
+  hora_entregado: string | null
 }
 
 interface DatosVuelta {
@@ -103,7 +189,10 @@ interface DatosVuelta {
   pctPos: number
   pctKg: number
   distanciaKm: number
-  kmReal: boolean          // true = calculado por OSRM, false = estimado en línea recta
+  kmReal: boolean          // true = calculado por Valhalla, false = estimado en línea recta
+  tiempoTrasladoMin: number | null  // duración de ruta según Valhalla (null hasta que se calcule)
+  horaInicioVuelta: string | null   // desde vueltas_tiempos
+  horaFinVuelta: string | null      // desde vueltas_tiempos
   pedidosConUbicacion: number
   detalle: PedidoDetalle[]
 }
@@ -127,6 +216,9 @@ interface DatosCamionDia {
   km_ruta: number | null
   vueltas: DatosVuelta[]
   distanciaTotalKm: number
+  vueltasMaxEfectivas: number
+  ocupDiariaPctPos: number
+  ocupDiariaPctKg: number
 }
 
 interface DatosCamionMes {
@@ -142,11 +234,29 @@ interface DatosCamionMes {
   avgMinKm: string
 }
 
+interface DatosRangoDia {
+  fecha: string
+  diaSemana: string
+  camion_codigo: string
+  tipo_unidad: string
+  sucursal: string
+  chofer_nombre: string
+  pedidos: number
+  kgUsados: number
+  posUsadas: number
+  pctKg: number
+  pctPos: number
+  kmReal: number | null
+  hora_inicio: string | null
+  hora_fin: string | null
+  duracionMin: number | null
+}
+
 const SUCURSALES = ['LP520', 'LP139', 'Guernica', 'Cañuelas', 'Pinamar']
 
 export default function MetricasPage() {
   const router = useRouter()
-  const [vista, setVista] = useState<'diaria' | 'mensual'>('diaria')
+  const [vista, setVista] = useState<'diaria' | 'mensual' | 'rango'>('diaria')
   const [fecha, setFecha] = useState(hoy())
   const [mes, setMes] = useState(mesActual())
   const [filtroSucursal, setFiltroSucursal] = useState('')
@@ -159,6 +269,19 @@ export default function MetricasPage() {
   const primerDiaMes = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-01` }
   const [fechaExportDesde, setFechaExportDesde] = useState(primerDiaMes)
   const [fechaExportHasta, setFechaExportHasta] = useState(hoy)
+  const [exportSucursales, setExportSucursales] = useState<string[]>([])
+  const [camionesNoActivados, setCamionesNoActivados] = useState<{ camion_codigo: string; sucursal: string }[]>([])
+  const [rangoDesde, setRangoDesde] = useState(primerDiaMes)
+  const [rangoHasta, setRangoHasta] = useState(hoy)
+  const [filtroRangoCamiones, setFiltroRangoCamiones] = useState<string[]>([])
+  const [filtroRangoChoferes, setFiltroRangoChoferes] = useState<string[]>([])
+  const [filtroFechasExcluidas, setFiltroFechasExcluidas] = useState<string[]>([])
+  const [ocultarSinActividad, setOcultarSinActividad] = useState(false)
+  const [filtroFlotaRango, setFiltroFlotaRango] = useState<'todos' | 'con_pedidos' | 'sin_pedidos'>('todos')
+  const [filtroTiposUnidad, setFiltroTiposUnidad] = useState<string[]>([])
+  const [datosRangoAll, setDatosRangoAll] = useState<DatosRangoDia[]>([]) // datos sin filtrar
+  const [datosRango, setDatosRango] = useState<DatosRangoDia[]>([])
+  const [loadingRango, setLoadingRango] = useState(false)
 
   const showToast = (msg: string) => { setToast(msg); setTimeout(() => setToast(null), 3000) }
 
@@ -169,6 +292,7 @@ export default function MetricasPage() {
       if (!tieneAcceso(data?.permisos, data?.rol, 'metricas')) { router.push('/dashboard'); return }
       if (data?.sucursal) {
         setFiltroSucursal(data.sucursal)
+        setExportSucursales([data.sucursal])
         // Recargar con la sucursal del usuario (el useEffect inicial usó '')
         if (vista === 'diaria') cargarDiaria(data.sucursal)
         else cargarMensual(data.sucursal)
@@ -179,9 +303,26 @@ export default function MetricasPage() {
   useEffect(() => { if (vista === 'diaria') cargarDiaria() }, [fecha, vista])
   useEffect(() => { if (vista === 'mensual') cargarMensual() }, [mes, vista])
 
+  // Aplicar filtros multi-select sobre datos ya cargados (sin re-buscar)
+  useEffect(() => {
+    let filtered = datosRangoAll
+    if (filtroFlotaRango === 'con_pedidos') filtered = filtered.filter(r => r.pedidos > 0)
+    else if (filtroFlotaRango === 'sin_pedidos') filtered = filtered.filter(r => r.pedidos === 0)
+    if (filtroTiposUnidad.length > 0) filtered = filtered.filter(r => filtroTiposUnidad.includes(r.tipo_unidad))
+    if (filtroRangoCamiones.length > 0) filtered = filtered.filter(r => filtroRangoCamiones.includes(r.camion_codigo))
+    if (filtroRangoChoferes.length > 0) filtered = filtered.filter(r => filtroRangoChoferes.includes(r.chofer_nombre))
+    if (filtroFechasExcluidas.length > 0) filtered = filtered.filter(r => !filtroFechasExcluidas.includes(r.fecha))
+    if (ocultarSinActividad) {
+      const fechasConActividad = new Set(datosRangoAll.filter(r => r.pedidos > 0).map(r => r.fecha))
+      filtered = filtered.filter(r => fechasConActividad.has(r.fecha))
+    }
+    setDatosRango(filtered)
+  }, [datosRangoAll, filtroFlotaRango, filtroTiposUnidad, filtroRangoCamiones, filtroRangoChoferes, filtroFechasExcluidas, ocultarSinActividad])
+
   const buscar = () => {
     if (vista === 'diaria') cargarDiaria()
-    else cargarMensual()
+    else if (vista === 'mensual') cargarMensual()
+    else cargarRango()
   }
 
   async function exportarExcel() {
@@ -192,100 +333,345 @@ export default function MetricasPage() {
       const XLSX = await import('xlsx')
       const wb = XLSX.utils.book_new()
 
-      // Queries paralelas: pedidos + flota + camiones para el intervalo
-      let pedQ = supabase.from('pedidos')
-        .select('nv, id_despacho, cliente, direccion, sucursal, fecha_entrega, vuelta, camion_id, estado, estado_pago, peso_total_kg, volumen_total_m3, notas, tipo')
-        .gte('fecha_entrega', fechaExportDesde).lte('fecha_entrega', fechaExportHasta)
-        .neq('estado', 'cancelado').order('fecha_entrega').order('sucursal').order('cliente')
-      let flotQ = supabase.from('flota_dia')
-        .select('fecha, camion_codigo, sucursal, km_ruta')
-        .gte('fecha', fechaExportDesde).lte('fecha', fechaExportHasta).eq('activo', true)
-      if (filtroSucursal) { pedQ = pedQ.eq('sucursal', filtroSucursal); flotQ = flotQ.eq('sucursal', filtroSucursal) }
+      // Queries paginadas para evitar truncado de PostgREST (max 1000 filas por request)
+      const EX_PAGE = 1000
+      const paginatePedidosEx = async () => {
+        let all: any[] = []; let from = 0
+        while (true) {
+          let q = supabase.from('pedidos')
+            .select('id, nv, id_despacho, cliente, direccion, sucursal, fecha_entrega, vuelta, camion_id, estado, estado_pago, peso_total_kg, volumen_total_m3, notas, tipo, latitud, longitud, barrio_cerrado, orden_entrega, hora_entregado')
+            .gte('fecha_entrega', fechaExportDesde).lte('fecha_entrega', fechaExportHasta)
+            .neq('estado', 'cancelado').order('fecha_entrega').order('sucursal').order('cliente')
+            .range(from, from + EX_PAGE - 1)
+          if (exportSucursales.length > 0) q = q.in('sucursal', exportSucursales)
+          const { data } = await q
+          if (!data || data.length === 0) break
+          all = all.concat(data)
+          if (data.length < EX_PAGE) break
+          from += EX_PAGE
+        }
+        return all
+      }
+      const paginateFlotaEx = async () => {
+        let all: any[] = []; let from = 0
+        while (true) {
+          let q = supabase.from('flota_dia')
+            .select('fecha, camion_codigo, sucursal, km_ruta, hora_inicio, hora_fin')
+            .gte('fecha', fechaExportDesde).lte('fecha', fechaExportHasta).eq('activo', true)
+            .order('fecha').range(from, from + EX_PAGE - 1)
+          if (exportSucursales.length > 0) q = q.in('sucursal', exportSucursales)
+          const { data } = await q
+          if (!data || data.length === 0) break
+          all = all.concat(data)
+          if (data.length < EX_PAGE) break
+          from += EX_PAGE
+        }
+        return all
+      }
+      const paginateVueltasTiemposEx = async () => {
+        let all: any[] = []; let from = 0
+        while (true) {
+          const { data } = await supabase.from('vueltas_tiempos')
+            .select('camion_codigo, fecha, vuelta, hora_inicio, hora_fin')
+            .gte('fecha', fechaExportDesde).lte('fecha', fechaExportHasta)
+            .order('fecha').range(from, from + EX_PAGE - 1)
+          if (!data || data.length === 0) break
+          all = all.concat(data)
+          if (data.length < EX_PAGE) break
+          from += EX_PAGE
+        }
+        return all
+      }
 
-      const [{ data: pedidosData }, { data: flotaData }, { data: camionesData }] = await Promise.all([
-        pedQ, flotQ,
-        supabase.from('camiones_flota').select('codigo, tipo_unidad, sucursal, posiciones_total, tonelaje_max_kg'),
+      const [pedidosData, flotaData, { data: camionesData }, { data: matsExport }, vueltasTiemposExport] = await Promise.all([
+        paginatePedidosEx(), paginateFlotaEx(),
+        supabase.from('camiones_flota').select('codigo, tipo_unidad, sucursal, posiciones_total, tonelaje_max_kg, grua_hidraulica'),
+        supabase.from('materiales').select('nombre, tipo_carga'),
+        paginateVueltasTiemposEx(),
       ])
+
+      // Mapa: "camion|fecha|vuelta" → { hora_inicio, hora_fin }
+      const vueltaTimingExMap: Record<string, { hora_inicio: string | null; hora_fin: string | null }> = {}
+      for (const t of vueltasTiemposExport ?? []) {
+        vueltaTimingExMap[`${t.camion_codigo}|${t.fecha}|${t.vuelta}`] = { hora_inicio: t.hora_inicio ?? null, hora_fin: t.hora_fin ?? null }
+      }
 
       const camionMap: Record<string, any> = {}
       for (const c of camionesData ?? []) camionMap[c.codigo] = c
 
+      // Cargar pedido_items en lotes de 500 (evita truncado de PostgREST a 1000 filas)
+      const pedidoIdsExport = (pedidosData ?? []).map((p: any) => p.id)
+      const allItemsExport: any[] = []
+      for (let i = 0; i < pedidoIdsExport.length; i += 500) {
+        const batch = pedidoIdsExport.slice(i, i + 500)
+        const { data: batchItems } = await supabase.from('pedido_items')
+          .select('pedido_id, nombre').in('pedido_id', batch)
+        if (batchItems) allItemsExport.push(...batchItems)
+      }
+      const itemsExport = allItemsExport
+
+      const matTipoMapEx: Record<string, string> = {}
+      for (const m of matsExport ?? []) matTipoMapEx[m.nombre] = m.tipo_carga
+      const pedidoEsHierrosEx: Record<string, boolean> = {}
+      const pedidoEsGranelEx: Record<string, boolean> = {}
+      for (const item of itemsExport ?? []) {
+        const tipo = matTipoMapEx[item.nombre] ?? ''
+        if (TIPOS_CARGA_HIERRO.has(tipo)) pedidoEsHierrosEx[item.pedido_id] = true
+        if (TIPOS_CARGA_GRANEL.has(tipo)) pedidoEsGranelEx[item.pedido_id] = true
+      }
+
+      // Mapa flota: "camion|fecha" → { hora_inicio, hora_fin, km_ruta }
+      const flotaMapEx: Record<string, any> = {}
+      for (const f of flotaData ?? []) flotaMapEx[`${f.camion_codigo}|${f.fecha}`] = f
+
       // Hoja 1: Pedidos detalle
       XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
-        (pedidosData ?? []).map(p => ({
-          'NV': p.nv, 'SD': p.id_despacho ?? '', 'Tipo': p.tipo === 'retiro' ? 'Retiro' : 'Entrega',
-          'Cliente': p.cliente, 'Dirección': p.direccion, 'Sucursal': p.sucursal,
-          'Fecha': p.fecha_entrega,
-          'Día': new Date(p.fecha_entrega + 'T12:00:00').toLocaleDateString('es-AR', { weekday: 'long' }),
-          'Vuelta': p.vuelta === 0 ? 'Sin asignar' : `V${p.vuelta}`,
-          'Camión': p.camion_id ?? '', 'Estado': p.estado, 'Pago': p.estado_pago ?? '',
-          'Kg': p.peso_total_kg ?? 0, 'Posiciones': p.volumen_total_m3 ?? 0, 'Notas': p.notas ?? '',
-        }))
+        (pedidosData ?? []).map(p => {
+          const latPed = (p as any).latitud ?? null
+          const lngPed = (p as any).longitud ?? null
+
+          // Depósito asignado (sucursal del pedido)
+          const depAsig = DEPOSITOS[p.sucursal] ?? null
+          const distAsig = (latPed && lngPed && depAsig)
+            ? Math.round(distanciaKm(latPed, lngPed, depAsig.lat, depAsig.lng) * 10) / 10
+            : ''
+
+          // Depósito más cercano
+          let depCercNombre = ''; let depCercLat: number | '' = ''; let depCercLng: number | '' = ''; let distCerc: number | '' = ''
+          if (latPed && lngPed) {
+            let minDist = Infinity
+            for (const [nombre, coords] of Object.entries(DEPOSITOS)) {
+              const d = distanciaKm(latPed, lngPed, coords.lat, coords.lng)
+              if (d < minDist) {
+                minDist = d; depCercNombre = nombre
+                depCercLat = coords.lat; depCercLng = coords.lng
+                distCerc = Math.round(d * 10) / 10
+              }
+            }
+          }
+
+          return {
+            'NV': p.nv, 'SD': p.id_despacho ?? '', 'Tipo': p.tipo === 'retiro' ? 'Retiro' : 'Entrega',
+            'Cliente': p.cliente, 'Dirección': p.direccion, 'Sucursal': p.sucursal,
+            'Fecha': p.fecha_entrega,
+            'Día': new Date(p.fecha_entrega + 'T12:00:00').toLocaleDateString('es-AR', { weekday: 'long' }),
+            'Vuelta': p.vuelta === 0 ? 'Sin asignar' : `V${p.vuelta}`,
+            'Camión': p.camion_id ?? '', 'Estado': p.estado, 'Pago': p.estado_pago ?? '',
+            'Kg': p.peso_total_kg ?? 0, 'Posiciones': p.volumen_total_m3 ?? 0, 'Notas': p.notas ?? '',
+            'Barrio cerrado': (p as any).barrio_cerrado ? 'Sí' : 'No',
+            'Lat pedido': latPed ?? '',
+            'Lng pedido': lngPed ?? '',
+            'Lat depósito asignado': depAsig?.lat ?? '',
+            'Lng depósito asignado': depAsig?.lng ?? '',
+            'Dist km dep. asignado': distAsig,
+            'Depósito más cercano': depCercNombre,
+            'Lat dep. cercano': depCercLat,
+            'Lng dep. cercano': depCercLng,
+            'Dist km dep. cercano': distCerc,
+          }
+        })
       ), 'Pedidos')
 
       // Hoja 2: Resumen por día
-      const byDia: Record<string, { pedidos: number; kg: number; pos: number; entregados: number; rechazados: number }> = {}
+      const byDia: Record<string, { pedidos: number; kg: number; pos: number; completos: number; parciales: number; rechazados: number }> = {}
       for (const p of pedidosData ?? []) {
-        if (!byDia[p.fecha_entrega]) byDia[p.fecha_entrega] = { pedidos: 0, kg: 0, pos: 0, entregados: 0, rechazados: 0 }
+        if (!byDia[p.fecha_entrega]) byDia[p.fecha_entrega] = { pedidos: 0, kg: 0, pos: 0, completos: 0, parciales: 0, rechazados: 0 }
         byDia[p.fecha_entrega].pedidos++
         byDia[p.fecha_entrega].kg += p.peso_total_kg ?? 0
         byDia[p.fecha_entrega].pos += p.volumen_total_m3 ?? 0
-        if (p.estado === 'entregado' || p.estado === 'entregado_parcial') byDia[p.fecha_entrega].entregados++
-        if (p.estado === 'rechazado') byDia[p.fecha_entrega].rechazados++
+        if (p.estado === 'entregado') byDia[p.fecha_entrega].completos++
+        else if (p.estado === 'entregado_parcial') byDia[p.fecha_entrega].parciales++
+        else if (p.estado === 'rechazado') byDia[p.fecha_entrega].rechazados++
       }
       XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
-        Object.entries(byDia).sort((a, b) => a[0].localeCompare(b[0])).map(([f, d]) => ({
-          'Fecha': f,
-          'Día': new Date(f + 'T12:00:00').toLocaleDateString('es-AR', { weekday: 'long' }),
-          'Pedidos': d.pedidos, 'Entregados': d.entregados, 'Rechazados': d.rechazados,
-          '% Entrega': d.pedidos > 0 ? Math.round(d.entregados / d.pedidos * 100) : 0,
-          'Kg totales': Math.round(d.kg), 'Posiciones': Math.round(d.pos),
-        }))
+        Object.entries(byDia).sort((a, b) => a[0].localeCompare(b[0])).map(([f, d]) => {
+          const finalizados = d.completos + d.parciales + d.rechazados
+          return {
+            'Fecha': f,
+            'Día': new Date(f + 'T12:00:00').toLocaleDateString('es-AR', { weekday: 'long' }),
+            'Pedidos total': d.pedidos,
+            'Entregados completos': d.completos,
+            'Entregados parciales': d.parciales,
+            'Rechazados': d.rechazados,
+            'Sin finalizar': d.pedidos - finalizados,
+            '% Entrega completa': finalizados > 0 ? Math.round(d.completos / finalizados * 100) : 0,
+            '% Entrega (incl. parcial)': finalizados > 0 ? Math.round((d.completos + d.parciales) / finalizados * 100) : 0,
+            'Kg totales': Math.round(d.kg),
+            'Posiciones': Math.round(d.pos),
+          }
+        })
       ), 'Por día')
 
       // Hoja 3: Resumen por camión
-      const byTruck: Record<string, { diasActivo: number; pedidos: number; kg: number; pos: number; km: number; capKg: number; capPos: number }> = {}
+      // Precalcular vueltas reales por camión/día para capacidad correcta
+      const vueltasPorCamionDia: Record<string, Set<number>> = {}
+      for (const p of pedidosData ?? []) {
+        if (!p.camion_id || !p.vuelta) continue
+        const key = `${p.camion_id}|${p.fecha_entrega}`
+        if (!vueltasPorCamionDia[key]) vueltasPorCamionDia[key] = new Set()
+        vueltasPorCamionDia[key].add(p.vuelta)
+      }
+
+      const byTruck: Record<string, { diasActivo: number; pedidos: number; kg: number; pos: number; km: number; capKg: number; capPos: number; totalVueltas: number }> = {}
       for (const f of flotaData ?? []) {
-        if (!byTruck[f.camion_codigo]) byTruck[f.camion_codigo] = { diasActivo: 0, pedidos: 0, kg: 0, pos: 0, km: 0, capKg: 0, capPos: 0 }
-        byTruck[f.camion_codigo].diasActivo++; byTruck[f.camion_codigo].km += f.km_ruta ?? 0
+        if (!byTruck[f.camion_codigo]) byTruck[f.camion_codigo] = { diasActivo: 0, pedidos: 0, kg: 0, pos: 0, km: 0, capKg: 0, capPos: 0, totalVueltas: 0 }
+        byTruck[f.camion_codigo].diasActivo++
+        byTruck[f.camion_codigo].km += f.km_ruta ?? 0
+        // Vueltas reales del día (mínimo 1 para no dividir por 0)
+        const vueltasEseDia = vueltasPorCamionDia[`${f.camion_codigo}|${f.fecha}`]?.size ?? 1
+        byTruck[f.camion_codigo].totalVueltas += vueltasEseDia
         const c = camionMap[f.camion_codigo]
-        if (c) { byTruck[f.camion_codigo].capKg += c.tonelaje_max_kg; byTruck[f.camion_codigo].capPos += c.posiciones_total }
+        if (c) {
+          byTruck[f.camion_codigo].capKg += c.tonelaje_max_kg * vueltasEseDia
+          byTruck[f.camion_codigo].capPos += c.posiciones_total * vueltasEseDia
+        }
       }
       for (const p of pedidosData ?? []) {
         if (!p.camion_id) continue
-        if (!byTruck[p.camion_id]) byTruck[p.camion_id] = { diasActivo: 0, pedidos: 0, kg: 0, pos: 0, km: 0, capKg: 0, capPos: 0 }
-        byTruck[p.camion_id].pedidos++; byTruck[p.camion_id].kg += p.peso_total_kg ?? 0; byTruck[p.camion_id].pos += p.volumen_total_m3 ?? 0
+        if (!byTruck[p.camion_id]) byTruck[p.camion_id] = { diasActivo: 0, pedidos: 0, kg: 0, pos: 0, km: 0, capKg: 0, capPos: 0, totalVueltas: 0 }
+        byTruck[p.camion_id].pedidos++
+        byTruck[p.camion_id].kg += p.peso_total_kg ?? 0
+        byTruck[p.camion_id].pos += p.volumen_total_m3 ?? 0
       }
       XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
         Object.entries(byTruck).sort((a, b) => b[1].kg - a[1].kg).map(([cod, d]) => {
           const c = camionMap[cod]
+          const avgVueltas = d.diasActivo > 0 ? Math.round(d.totalVueltas / d.diasActivo * 10) / 10 : 0
           return {
             'Camión': cod, 'Tipo': c?.tipo_unidad ?? '', 'Sucursal': c?.sucursal ?? '',
-            'Días activo': d.diasActivo, 'Pedidos': d.pedidos,
-            'Kg totales': Math.round(d.kg), 'Avg Ocup. Kg %': d.capKg > 0 ? Math.round(d.kg / d.capKg * 100) : 0,
-            'Pos totales': Math.round(d.pos), 'Avg Ocup. Pos %': d.capPos > 0 ? Math.round(d.pos / d.capPos * 100) : 0,
+            'Días activo': d.diasActivo,
+            'Vueltas totales': d.totalVueltas,
+            'Avg vueltas/día': avgVueltas,
+            'Pedidos': d.pedidos,
+            'Kg totales': Math.round(d.kg),
+            'Avg Ocup. Kg %': d.capKg > 0 ? Math.round(d.kg / d.capKg * 100) : 0,
+            'Pos totales': Math.round(d.pos),
+            'Avg Ocup. Pos %': d.capPos > 0 ? Math.round(d.pos / d.capPos * 100) : 0,
             'Km totales': Math.round(d.km),
           }
         })
       ), 'Por camión')
 
       // Hoja 4: Por sucursal
-      const bySuc: Record<string, { pedidos: number; kg: number; pos: number; entregados: number; rechazados: number }> = {}
+      const bySuc: Record<string, { pedidos: number; kg: number; pos: number; completos: number; parciales: number; rechazados: number }> = {}
       for (const p of pedidosData ?? []) {
-        if (!bySuc[p.sucursal]) bySuc[p.sucursal] = { pedidos: 0, kg: 0, pos: 0, entregados: 0, rechazados: 0 }
-        bySuc[p.sucursal].pedidos++; bySuc[p.sucursal].kg += p.peso_total_kg ?? 0; bySuc[p.sucursal].pos += p.volumen_total_m3 ?? 0
-        if (p.estado === 'entregado' || p.estado === 'entregado_parcial') bySuc[p.sucursal].entregados++
-        if (p.estado === 'rechazado') bySuc[p.sucursal].rechazados++
+        if (!bySuc[p.sucursal]) bySuc[p.sucursal] = { pedidos: 0, kg: 0, pos: 0, completos: 0, parciales: 0, rechazados: 0 }
+        bySuc[p.sucursal].pedidos++
+        bySuc[p.sucursal].kg += p.peso_total_kg ?? 0
+        bySuc[p.sucursal].pos += p.volumen_total_m3 ?? 0
+        if (p.estado === 'entregado') bySuc[p.sucursal].completos++
+        else if (p.estado === 'entregado_parcial') bySuc[p.sucursal].parciales++
+        else if (p.estado === 'rechazado') bySuc[p.sucursal].rechazados++
       }
       XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
-        Object.entries(bySuc).sort((a, b) => b[1].pedidos - a[1].pedidos).map(([s, d]) => ({
-          'Sucursal': s, 'Pedidos': d.pedidos, 'Entregados': d.entregados, 'Rechazados': d.rechazados,
-          '% Entrega': d.pedidos > 0 ? Math.round(d.entregados / d.pedidos * 100) : 0,
-          'Kg totales': Math.round(d.kg), 'Posiciones': Math.round(d.pos),
-        }))
+        Object.entries(bySuc).sort((a, b) => b[1].pedidos - a[1].pedidos).map(([s, d]) => {
+          const finalizados = d.completos + d.parciales + d.rechazados
+          return {
+            'Sucursal': s,
+            'Pedidos total': d.pedidos,
+            'Entregados completos': d.completos,
+            'Entregados parciales': d.parciales,
+            'Rechazados': d.rechazados,
+            'Sin finalizar': d.pedidos - finalizados,
+            '% Entrega completa': finalizados > 0 ? Math.round(d.completos / finalizados * 100) : 0,
+            '% Entrega (incl. parcial)': finalizados > 0 ? Math.round((d.completos + d.parciales) / finalizados * 100) : 0,
+            'Kg totales': Math.round(d.kg),
+            'Posiciones': Math.round(d.pos),
+          }
+        })
       ), 'Por sucursal')
 
-      const suf = filtroSucursal ? `-${filtroSucursal}` : ''
+      // Hoja 5: Por vuelta — estimación de tiempos
+      const vueltaGroupsEx: Record<string, { camion: string; fecha: string; vuelta: number; peds: any[] }> = {}
+      for (const p of pedidosData ?? []) {
+        if (!p.camion_id) continue
+        const key = `${p.camion_id}|${p.fecha_entrega}|${p.vuelta ?? 0}`
+        if (!vueltaGroupsEx[key]) vueltaGroupsEx[key] = { camion: p.camion_id, fecha: p.fecha_entrega, vuelta: p.vuelta ?? 0, peds: [] }
+        vueltaGroupsEx[key].peds.push(p)
+      }
+      const porVueltaRows = Object.values(vueltaGroupsEx)
+        .sort((a, b) => a.fecha.localeCompare(b.fecha) || a.camion.localeCompare(b.camion) || a.vuelta - b.vuelta)
+        .map(g => {
+          const cam = camionMap[g.camion]
+          const flota = flotaMapEx[`${g.camion}|${g.fecha}`]
+          const esTrailerEx = /trailer|semi/i.test(cam?.tipo_unidad ?? '')
+          const depot = DEPOSITOS[cam?.sucursal ?? ''] ?? { lat: -34.9205, lng: -57.9536 }
+
+          const kg = g.peds.reduce((a: number, p: any) => a + (p.peso_total_kg ?? 0), 0)
+          const pos = g.peds.reduce((a: number, p: any) => a + (p.volumen_total_m3 ?? 0), 0)
+          const distKmEx = calcularDistanciaRuta(
+            g.peds.map((p: any) => ({ latitud: p.latitud, longitud: p.longitud, orden_entrega: p.orden_entrega })),
+            depot
+          )
+
+          const detEx: PedidoDetalle[] = g.peds.map((p: any) => ({
+            id: p.id, nv: p.nv, cliente: p.cliente, direccion: p.direccion,
+            sucursal: p.sucursal, estado: p.estado, estado_pago: p.estado_pago ?? null,
+            notas: p.notas ?? null, tipo: p.tipo ?? null,
+            peso_total_kg: p.peso_total_kg ?? 0, volumen_total_m3: p.volumen_total_m3 ?? 0,
+            orden_entrega: p.orden_entrega ?? null, latitud: p.latitud ?? null, longitud: p.longitud ?? null,
+            barrio_cerrado: p.barrio_cerrado ?? null,
+            esHierros: pedidoEsHierrosEx[p.id] ?? false,
+            esGranel: pedidoEsGranelEx[p.id] ?? false,
+            hora_entregado: p.hora_entregado ?? null,
+          }))
+          const descMin = calcularTiempoDescargaMin(detEx, esTrailerEx)
+          const velKmhEx = getVelFallback(cam?.sucursal ?? '')
+          const trasMin = distKmEx > 0 ? Math.round(distKmEx * 1.3 / velKmhEx * 60) : 0
+          const totalMin = trasMin + descMin
+
+          // Tiempos reales por vuelta (desde vueltas_tiempos)
+          const timingV = vueltaTimingExMap[`${g.camion}|${g.fecha}|${g.vuelta}`]
+          const hInicioV = timingV?.hora_inicio ? new Date(timingV.hora_inicio).toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' }) : ''
+          const hFinV = timingV?.hora_fin ? new Date(timingV.hora_fin).toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' }) : ''
+          const durRealV = timingV?.hora_inicio && timingV?.hora_fin
+            ? Math.round((new Date(timingV.hora_fin).getTime() - new Date(timingV.hora_inicio).getTime()) / 60000)
+            : null
+
+          // Real a nivel día (para referencia)
+          const hInicioDia = flota?.hora_inicio ? new Date(flota.hora_inicio).toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' }) : ''
+          const hFinDia = flota?.hora_fin ? new Date(flota.hora_fin).toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' }) : ''
+          const durRealDia = flota?.hora_inicio && flota?.hora_fin
+            ? Math.round((new Date(flota.hora_fin).getTime() - new Date(flota.hora_inicio).getTime()) / 60000)
+            : null
+
+          const barriosCerrados = g.peds.filter((p: any) => p.barrio_cerrado).length
+          const pedidosHierros = g.peds.filter((p: any) => pedidoEsHierrosEx[p.id]).length
+          const pedidosGranel = g.peds.filter((p: any) => pedidoEsGranelEx[p.id]).length
+          const esGruaEx = !!(cam?.grua_hidraulica)
+
+          return {
+            'Camión': g.camion,
+            'Tipo': cam?.tipo_unidad ?? '',
+            'Grúa hidráulica': esGruaEx ? 'Sí' : 'No',
+            'Sucursal': cam?.sucursal ?? '',
+            'Fecha': g.fecha,
+            'Día': new Date(g.fecha + 'T12:00:00').toLocaleDateString('es-AR', { weekday: 'long' }),
+            'Vuelta': g.vuelta === 0 ? 'Fuera prog.' : `V${g.vuelta}`,
+            'Pedidos': g.peds.length,
+            'Barrios cerrados': barriosCerrados,
+            'Pedidos hierros': pedidosHierros,
+            'Pedidos granel': pedidosGranel,
+            'Kg': Math.round(kg),
+            'Posiciones': Math.round(pos),
+            'Km est. ruta': distKmEx || '',
+            'T. traslado est. (min)': trasMin || '',
+            'T. descarga est. (min)': descMin || '',
+            'T. total est. (min)': totalMin || '',
+            'T. total est.': totalMin > 0 ? formatMinutos(totalMin) : '',
+            'Inicio vuelta (real)': hInicioV,
+            'Fin vuelta (real)': hFinV,
+            'Duración vuelta (min)': durRealV ?? '',
+            'Duración vuelta': durRealV ? formatMinutos(durRealV) : '',
+            'Inicio día (todas las vueltas)': hInicioDia,
+            'Fin día (todas las vueltas)': hFinDia,
+            'Duración día total (min)': durRealDia ?? '',
+            'Km reales día total': flota?.km_ruta ?? '',
+          }
+        })
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(porVueltaRows), 'Por vuelta')
+
+      const suf = exportSucursales.length === 1 ? `-${exportSucursales[0]}` : exportSucursales.length > 1 ? `-${exportSucursales.join('+')}` : ''
       const nombre = fechaExportDesde === fechaExportHasta
         ? `despachos-app-${fechaExportDesde}${suf}.xlsx`
         : `despachos-app-${fechaExportDesde}-${fechaExportHasta}${suf}.xlsx`
@@ -301,18 +687,47 @@ export default function MetricasPage() {
     setLoading(true)
     const sucursal = sucursalParam !== undefined ? sucursalParam : filtroSucursal
 
-    const [{ data: flotaDia }, { data: pedidosData }, { data: camionesData }] = await Promise.all([
+    const [{ data: flotaDia }, { data: pedidosData }, { data: camionesData }, { data: vueltasTiemposData }] = await Promise.all([
       supabase.from('flota_dia').select('camion_codigo, chofer_id, hora_inicio, hora_fin, km_ruta').eq('fecha', fecha).eq('activo', true),
       supabase.from('pedidos')
-        .select('id, nv, cliente, direccion, sucursal, estado, estado_pago, notas, tipo, camion_id, peso_total_kg, volumen_total_m3, vuelta, orden_entrega, latitud, longitud')
+        .select('id, nv, cliente, direccion, sucursal, estado, estado_pago, notas, tipo, camion_id, peso_total_kg, volumen_total_m3, vuelta, orden_entrega, latitud, longitud, barrio_cerrado, hora_entregado')
         .eq('fecha_entrega', fecha).neq('estado', 'cancelado').not('camion_id', 'is', null),
       supabase.from('camiones_flota').select('codigo, tipo_unidad, sucursal, posiciones_total, tonelaje_max_kg'),
+      supabase.from('vueltas_tiempos').select('camion_codigo, vuelta, hora_inicio, hora_fin').eq('fecha', fecha),
     ])
 
+    // Mapa: "camion_codigo|vuelta" → { hora_inicio, hora_fin }
+    const vueltaTimingMap: Record<string, { hora_inicio: string | null; hora_fin: string | null }> = {}
+    for (const t of vueltasTiemposData ?? []) {
+      vueltaTimingMap[`${t.camion_codigo}|${t.vuelta}`] = { hora_inicio: t.hora_inicio ?? null, hora_fin: t.hora_fin ?? null }
+    }
+
     const choferIds = (flotaDia ?? []).filter((f: any) => f.chofer_id).map((f: any) => f.chofer_id)
-    const { data: choferes } = choferIds.length > 0
-      ? await supabase.from('usuarios').select('id, nombre').in('id', choferIds)
-      : { data: [] }
+    const pedidoIds = (pedidosData ?? []).map((p: any) => p.id)
+
+    // Cargar choferes + items de pedidos + catálogo de materiales en paralelo
+    const [
+      { data: choferes },
+      { data: itemsData },
+      { data: materialesData },
+    ] = await Promise.all([
+      choferIds.length > 0 ? supabase.from('usuarios').select('id, nombre').in('id', choferIds) : Promise.resolve({ data: [] as any[] }),
+      pedidoIds.length > 0 ? supabase.from('pedido_items').select('pedido_id, nombre').in('pedido_id', pedidoIds) : Promise.resolve({ data: [] as any[] }),
+      supabase.from('materiales').select('nombre, tipo_carga'),
+    ])
+
+    // Mapa nombre_material → tipo_carga
+    const matTipoMap: Record<string, string> = {}
+    for (const m of materialesData ?? []) matTipoMap[m.nombre] = m.tipo_carga
+
+    // Determinar si cada pedido es de hierros (hierro_suelto, chapa, pretensado) o granel
+    const pedidoEsHierros: Record<string, boolean> = {}
+    const pedidoEsGranel: Record<string, boolean> = {}
+    for (const item of itemsData ?? []) {
+      const tipo = matTipoMap[item.nombre] ?? ''
+      if (TIPOS_CARGA_HIERRO.has(tipo)) pedidoEsHierros[item.pedido_id] = true
+      if (TIPOS_CARGA_GRANEL.has(tipo)) pedidoEsGranel[item.pedido_id] = true
+    }
 
     const choferMap: Record<string, string> = {}
     ;(choferes ?? []).forEach((c: any) => { choferMap[c.id] = c.nombre })
@@ -357,6 +772,9 @@ export default function MetricasPage() {
           pctPos: pct(pos, camion.posiciones_total),
           distanciaKm: dist,
           kmReal: false,
+          tiempoTrasladoMin: null,
+          horaInicioVuelta: vueltaTimingMap[`${camionCodigo}|${v}`]?.hora_inicio ?? null,
+          horaFinVuelta: vueltaTimingMap[`${camionCodigo}|${v}`]?.hora_fin ?? null,
           pedidosConUbicacion: pv.filter((p: any) => p.latitud && p.longitud).length,
           detalle: pv
             .sort((a: any, b: any) => (a.orden_entrega ?? 999) - (b.orden_entrega ?? 999))
@@ -367,6 +785,10 @@ export default function MetricasPage() {
               peso_total_kg: p.peso_total_kg ?? 0, volumen_total_m3: p.volumen_total_m3 ?? 0,
               orden_entrega: p.orden_entrega,
               latitud: p.latitud ?? null, longitud: p.longitud ?? null,
+              barrio_cerrado: p.barrio_cerrado ?? null,
+              esHierros: pedidoEsHierros[p.id] ?? false,
+              esGranel: pedidoEsGranel[p.id] ?? false,
+              hora_entregado: p.hora_entregado ?? null,
             })),
         }
       })
@@ -375,6 +797,17 @@ export default function MetricasPage() {
       const numVueltas = vueltas.length || 1
       const capacidadKgDia = camion.tonelaje_max_kg * numVueltas
       const capacidadPosDia = camion.posiciones_total * numVueltas
+
+      const maxDistKm = pedidosCamion.reduce((max: number, p: any) => {
+        if (!p.latitud || !p.longitud) return max
+        return Math.max(max, distanciaKm(depot.lat, depot.lng, p.latitud, p.longitud))
+      }, 0)
+      const vueltasMaxEfectivas = calcVueltasMaxEfectivas(camion.sucursal, maxDistKm, fecha)
+      const { pctPos: ocupDiariaPctPos, pctKg: ocupDiariaPctKg } = calcOcupDiaria(
+        posicionesUsadas, kgUsados,
+        camion.posiciones_total, camion.tonelaje_max_kg,
+        vueltas.length, vueltasMaxEfectivas,
+      )
 
       return {
         camion_codigo: camionCodigo,
@@ -395,6 +828,9 @@ export default function MetricasPage() {
         km_ruta: f?.km_ruta ?? null,
         vueltas,
         distanciaTotalKm,
+        vueltasMaxEfectivas,
+        ocupDiariaPctPos,
+        ocupDiariaPctKg,
       }
     }
 
@@ -403,6 +839,15 @@ export default function MetricasPage() {
       .filter(Boolean) as DatosCamionDia[]
 
     const sorted = datos.sort((a, b) => b.pctKg - a.pctKg)
+
+    // Camiones activos en flota base que no están en flota_dia hoy
+    const activadosHoy = new Set([...camionCodigosSet])
+    const noActivados = (camionesData ?? [])
+      .filter((c: any) => c.activo && !activadosHoy.has(c.codigo))
+      .filter((c: any) => !sucursal || c.sucursal === sucursal)
+      .map((c: any) => ({ camion_codigo: c.codigo, sucursal: c.sucursal }))
+    setCamionesNoActivados(noActivados)
+
     setDatosDia(sorted)
     setLoading(false)
     calcularKmReales(sorted)   // actualiza km en background con OSRM
@@ -432,32 +877,39 @@ export default function MetricasPage() {
 
     if (reqs.length === 0) return
 
-    // Secuencial para no saturar el servidor OSRM demo con N pedidos paralelos.
-    // Cada resultado actualiza la UI en cuanto llega (km en tiempo real).
+    // Secuencial para no saturar Valhalla. Cada resultado actualiza la UI en cuanto llega.
     for (const r of reqs) {
-      try {
-        const res = await fetch(`/api/km-ruta?coords=${encodeURIComponent(r.coords)}`)
-        if (!res.ok) continue
-        const json = await res.json()
-        const distM: number | null = json.distanciaM ?? null
-        if (!distM) continue
+      let json: any = null
+      // Reintentar una vez si falla (Valhalla puede tener picos de latencia)
+      for (let intento = 0; intento < 2 && json === null; intento++) {
+        try {
+          if (intento > 0) await new Promise(res => setTimeout(res, 3000))
+          const res = await fetch(`/api/km-ruta?coords=${encodeURIComponent(r.coords)}`)
+          if (res.ok) json = await res.json()
+        } catch { /* ignorar, se reintentará */ }
+      }
+      if (!json) continue
 
-        setDatosDia(prev => {
-          const next = prev.map(d => ({
-            ...d,
-            vueltas: d.vueltas.map(v => ({ ...v })),
-          }))
-          const ci = next.findIndex(d => d.camion_codigo === r.camionCodigo)
-          if (ci !== -1 && next[ci].vueltas[r.vueltaIdx]) {
+      const distM: number | null = json.distanciaM ?? null
+      const durMin: number | null = json.duracionMin ?? null
+      if (!distM && durMin === null) continue   // nada útil
+
+      setDatosDia(prev => {
+        const next = prev.map(d => ({
+          ...d,
+          vueltas: d.vueltas.map(v => ({ ...v })),
+        }))
+        const ci = next.findIndex(d => d.camion_codigo === r.camionCodigo)
+        if (ci !== -1 && next[ci].vueltas[r.vueltaIdx]) {
+          if (distM) {
             next[ci].vueltas[r.vueltaIdx].distanciaKm = Math.round(distM / 1000)
             next[ci].vueltas[r.vueltaIdx].kmReal = true
-            next[ci].distanciaTotalKm = next[ci].vueltas.reduce((a, v) => a + v.distanciaKm, 0)
           }
-          return next
-        })
-      } catch {
-        // ignorar fallos individuales, la estimación ~km permanece
-      }
+          if (durMin !== null) next[ci].vueltas[r.vueltaIdx].tiempoTrasladoMin = durMin
+          next[ci].distanciaTotalKm = next[ci].vueltas.reduce((a, v) => a + v.distanciaKm, 0)
+        }
+        return next
+      })
     }
   }
 
@@ -469,7 +921,7 @@ export default function MetricasPage() {
 
     const [{ data: flotaMes }, { data: pedidosMes }, { data: camionesData }] = await Promise.all([
       supabase.from('flota_dia').select('fecha, camion_codigo, hora_inicio, hora_fin, km_ruta').gte('fecha', fechaInicio).lte('fecha', fechaFin).eq('activo', true),
-      supabase.from('pedidos').select('camion_id, fecha_entrega, peso_total_kg, volumen_total_m3').gte('fecha_entrega', fechaInicio).lte('fecha_entrega', fechaFin).neq('estado', 'cancelado').not('camion_id', 'is', null),
+      supabase.from('pedidos').select('camion_id, fecha_entrega, peso_total_kg, volumen_total_m3, vuelta').gte('fecha_entrega', fechaInicio).lte('fecha_entrega', fechaFin).neq('estado', 'cancelado').not('camion_id', 'is', null),
       supabase.from('camiones_flota').select('codigo, tipo_unidad, sucursal, posiciones_total, tonelaje_max_kg'),
     ])
 
@@ -497,8 +949,11 @@ export default function MetricasPage() {
         const pedidosDia = pedidosDias.filter(p => p.fecha_entrega === f.fecha)
         const kg = pedidosDia.reduce((a: number, p: any) => a + (p.peso_total_kg ?? 0), 0)
         const pos = pedidosDia.reduce((a: number, p: any) => a + (p.volumen_total_m3 ?? 0), 0)
-        sumPctKg += pct(kg, camion.tonelaje_max_kg)
-        sumPctPos += pct(pos, camion.posiciones_total)
+        const numVueltasDia = new Set(pedidosDia.map((p: any) => p.vuelta).filter(Boolean)).size || 1
+        const estMaxDistKm = numVueltasDia > 0 ? (f.km_ruta ?? 0) / (numVueltasDia * 2) : 0
+        const vueltasMaxMes = calcVueltasMaxEfectivas(camion.sucursal, estMaxDistKm, f.fecha)
+        sumPctKg += pct(kg, camion.tonelaje_max_kg * vueltasMaxMes)
+        sumPctPos += pct(pos, camion.posiciones_total * vueltasMaxMes)
         if (f.hora_inicio && f.hora_fin && f.km_ruta) {
           const min = (new Date(f.hora_fin).getTime() - new Date(f.hora_inicio).getTime()) / 60000
           sumMinKm += min / f.km_ruta; diasConTiempo++
@@ -518,6 +973,165 @@ export default function MetricasPage() {
     setLoading(false)
   }
 
+  async function cargarRango() {
+    if (!rangoDesde || !rangoHasta) return
+    setLoadingRango(true)
+    setDatosRango([])
+
+    try {
+      // Paginar flota_dia y pedidos para evitar el límite de 1000 filas de PostgREST
+      const PAGE = 1000
+
+      const paginateFlota = async () => {
+        let all: any[] = []; let from = 0
+        while (true) {
+          let q = supabase.from('flota_dia')
+            .select('fecha, camion_codigo, chofer_id, hora_inicio, hora_fin, km_ruta, sucursal')
+            .gte('fecha', rangoDesde).lte('fecha', rangoHasta).eq('activo', true)
+            .order('fecha').range(from, from + PAGE - 1)
+          if (filtroSucursal) q = q.eq('sucursal', filtroSucursal)
+          const { data } = await q
+          if (!data || data.length === 0) break
+          all = all.concat(data)
+          if (data.length < PAGE) break
+          from += PAGE
+        }
+        return all
+      }
+
+      const paginatePedidos = async () => {
+        let all: any[] = []; let from = 0
+        while (true) {
+          let q = supabase.from('pedidos')
+            .select('camion_id, fecha_entrega, peso_total_kg, volumen_total_m3, vuelta')
+            .gte('fecha_entrega', rangoDesde).lte('fecha_entrega', rangoHasta)
+            .neq('estado', 'cancelado').not('camion_id', 'is', null)
+            .order('fecha_entrega').range(from, from + PAGE - 1)
+          if (filtroSucursal) q = q.eq('sucursal', filtroSucursal)
+          const { data } = await q
+          if (!data || data.length === 0) break
+          all = all.concat(data)
+          if (data.length < PAGE) break
+          from += PAGE
+        }
+        return all
+      }
+
+      const [flotaData, pedidosData, camionesRes, chofRes] = await Promise.all([
+        paginateFlota(),
+        paginatePedidos(),
+        supabase.from('camiones_flota').select('codigo, tipo_unidad, sucursal, posiciones_total, tonelaje_max_kg'),
+        supabase.from('usuarios').select('id, nombre'),
+      ])
+
+      if (camionesRes.error) console.error('camiones error:', camionesRes.error)
+      if (chofRes.error) console.error('choferes error:', chofRes.error)
+
+      const camionesData = camionesRes.data ?? []
+      const chofData = chofRes.data ?? []
+
+      const camionMap: Record<string, any> = {}
+      for (const c of camionesData) camionMap[c.codigo] = c
+      const choferMap: Record<string, string> = {}
+      for (const u of chofData) choferMap[u.id] = u.nombre
+
+      const pedGroupMap: Record<string, { pedidos: number; kg: number; pos: number; vueltas: Set<number> }> = {}
+      for (const p of pedidosData) {
+        const k = `${p.camion_id}|${p.fecha_entrega}`
+        if (!pedGroupMap[k]) pedGroupMap[k] = { pedidos: 0, kg: 0, pos: 0, vueltas: new Set() }
+        pedGroupMap[k].pedidos++
+        pedGroupMap[k].kg += p.peso_total_kg ?? 0
+        pedGroupMap[k].pos += p.volumen_total_m3 ?? 0
+        if (p.vuelta) pedGroupMap[k].vueltas.add(p.vuelta)
+      }
+
+      let rows: DatosRangoDia[] = flotaData.map((f: any) => {
+        const cam = camionMap[f.camion_codigo]
+        const pg = pedGroupMap[`${f.camion_codigo}|${f.fecha}`] ?? { pedidos: 0, kg: 0, pos: 0, vueltas: new Set<number>() }
+        const durMin = f.hora_inicio && f.hora_fin
+          ? Math.round((new Date(f.hora_fin).getTime() - new Date(f.hora_inicio).getTime()) / 60000)
+          : null
+        const chofer = f.chofer_id ? (choferMap[f.chofer_id] ?? 'Sin nombre') : 'Sin chofer'
+        return {
+          fecha: f.fecha,
+          diaSemana: new Date(f.fecha + 'T12:00:00').toLocaleDateString('es-AR', { weekday: 'short' }),
+          camion_codigo: f.camion_codigo,
+          tipo_unidad: cam?.tipo_unidad ?? '',
+          sucursal: cam?.sucursal ?? f.sucursal ?? '',
+          chofer_nombre: chofer,
+          pedidos: pg.pedidos,
+          kgUsados: Math.round(pg.kg),
+          posUsadas: Math.round(pg.pos),
+          pctKg: cam?.tonelaje_max_kg ? (() => {
+            const numV = pg.vueltas.size || 1
+            const estDist = numV > 0 ? (f.km_ruta ?? 0) / (numV * 2) : 0
+            const vMax = calcVueltasMaxEfectivas(cam.sucursal, estDist, f.fecha)
+            return pct(pg.kg, cam.tonelaje_max_kg * vMax)
+          })() : 0,
+          pctPos: cam?.posiciones_total ? (() => {
+            const numV = pg.vueltas.size || 1
+            const estDist = numV > 0 ? (f.km_ruta ?? 0) / (numV * 2) : 0
+            const vMax = calcVueltasMaxEfectivas(cam.sucursal, estDist, f.fecha)
+            return pct(pg.pos, cam.posiciones_total * vMax)
+          })() : 0,
+          kmReal: f.km_ruta ?? null,
+          hora_inicio: f.hora_inicio ?? null,
+          hora_fin: f.hora_fin ?? null,
+          duracionMin: durMin,
+        }
+      })
+
+      rows.sort((a, b) => a.fecha.localeCompare(b.fecha) || a.camion_codigo.localeCompare(b.camion_codigo))
+
+      setDatosRangoAll(rows)
+      setFiltroFlotaRango('todos')
+      setFiltroTiposUnidad([])
+      setFiltroRangoCamiones([])
+      setFiltroRangoChoferes([])
+      setFiltroFechasExcluidas([])
+      setOcultarSinActividad(false)
+      setDatosRango(rows)
+    } catch (e: any) {
+      console.error('cargarRango exception:', e)
+      showToast(`Error al cargar período: ${e.message ?? 'error desconocido'}`)
+    } finally {
+      setLoadingRango(false)
+    }
+  }
+
+  async function exportarRango() {
+    if (datosRango.length === 0) { showToast('Primero buscá datos para exportar'); return }
+    try {
+      const XLSX = await import('xlsx')
+      const wb = XLSX.utils.book_new()
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
+        datosRango.map(r => ({
+          'Fecha': r.fecha,
+          'Día': r.diaSemana,
+          'Camión': r.camion_codigo,
+          'Tipo': r.tipo_unidad,
+          'Sucursal': r.sucursal,
+          'Chofer': r.chofer_nombre,
+          'Pedidos': r.pedidos,
+          'Kg': r.kgUsados,
+          'Pos': r.posUsadas,
+          'Ocup.Kg%': r.pctKg,
+          'Ocup.Pos%': r.pctPos,
+          'Km reales': r.kmReal ?? '',
+          'Inicio': r.hora_inicio ? formatHora(r.hora_inicio) : '',
+          'Fin': r.hora_fin ? formatHora(r.hora_fin) : '',
+          'Duración (min)': r.duracionMin ?? '',
+          'Duración': r.duracionMin !== null ? formatMinutos(r.duracionMin) : '',
+        }))
+      ), 'Período')
+      const suf = filtroSucursal ? `-${filtroSucursal}` : ''
+      XLSX.writeFile(wb, `metricas-periodo-${rangoDesde}-${rangoHasta}${suf}.xlsx`)
+      showToast(`Excel descargado (${datosRango.length} filas)`)
+    } catch (e: any) {
+      showToast(`Error: ${e.message}`)
+    }
+  }
+
   return (
     <div className="min-h-screen bg-gray-50" style={{ fontFamily: 'Barlow, sans-serif' }}>
 
@@ -530,9 +1144,9 @@ export default function MetricasPage() {
       <nav className="bg-white border-b sticky top-0 z-40" style={{ borderColor: '#e8edf8' }}>
         <div className="max-w-[1400px] mx-auto px-4 md:px-6 h-14 flex items-center justify-between gap-4">
           <div className="flex items-center gap-4">
-            <button onClick={() => router.push('/dashboard')}
+            <Link href="/dashboard"
               className="flex items-center gap-1.5 text-sm font-medium px-3 py-1.5 rounded-lg"
-              style={{ color: '#254A96', background: '#e8edf8' }}>← Volver</button>
+              style={{ color: '#254A96', background: '#e8edf8' }}>← Volver</Link>
             <img src="/logo.png" alt="Construyo al Costo" className="h-7 w-auto rounded-lg hidden sm:block" />
             <span className="font-semibold text-sm" style={{ color: '#254A96' }}>Métricas de flota</span>
           </div>
@@ -546,6 +1160,11 @@ export default function MetricasPage() {
               className="px-4 py-1.5 rounded-lg text-sm font-medium"
               style={{ background: vista === 'mensual' ? '#254A96' : '#f4f4f3', color: vista === 'mensual' ? 'white' : '#666' }}>
               Mensual
+            </button>
+            <button onClick={() => setVista('rango')}
+              className="px-4 py-1.5 rounded-lg text-sm font-medium"
+              style={{ background: vista === 'rango' ? '#254A96' : '#f4f4f3', color: vista === 'rango' ? 'white' : '#666' }}>
+              Período
             </button>
           </div>
         </div>
@@ -565,13 +1184,194 @@ export default function MetricasPage() {
                   className="border rounded-lg px-3 py-2 text-sm focus:outline-none"
                   style={{ borderColor: '#e8edf8' }} />
               </div>
-            ) : (
+            ) : vista === 'mensual' ? (
               <div>
                 <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>Mes</label>
                 <input type="month" value={mes} onChange={e => setMes(e.target.value)}
                   className="border rounded-lg px-3 py-2 text-sm focus:outline-none"
                   style={{ borderColor: '#e8edf8' }} />
               </div>
+            ) : (
+              <>
+                <div>
+                  <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>Desde</label>
+                  <input type="date" value={rangoDesde} onChange={e => setRangoDesde(e.target.value)}
+                    className="border rounded-lg px-3 py-2 text-sm focus:outline-none"
+                    style={{ borderColor: '#e8edf8' }} />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>Hasta</label>
+                  <input type="date" value={rangoHasta} onChange={e => setRangoHasta(e.target.value)}
+                    className="border rounded-lg px-3 py-2 text-sm focus:outline-none"
+                    style={{ borderColor: '#e8edf8' }} />
+                </div>
+                {/* Filtro con/sin pedidos — aparece después de buscar */}
+                {datosRangoAll.length > 0 && (() => {
+                  const conPed = datosRangoAll.filter(r => r.pedidos > 0).length
+                  const sinPed = datosRangoAll.filter(r => r.pedidos === 0).length
+                  return (
+                    <div>
+                      <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>Flota</label>
+                      <div className="flex gap-1.5">
+                        {([
+                          { key: 'todos' as const, label: `Todos (${datosRangoAll.length})` },
+                          { key: 'con_pedidos' as const, label: `Con pedidos (${conPed})` },
+                          { key: 'sin_pedidos' as const, label: `Sin pedidos (${sinPed})` },
+                        ]).map(f => (
+                          <button key={f.key} onClick={() => setFiltroFlotaRango(f.key)}
+                            className="px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-colors"
+                            style={{
+                              background: filtroFlotaRango === f.key ? '#254A96' : '#f4f4f3',
+                              color: filtroFlotaRango === f.key ? 'white' : '#666',
+                            }}>
+                            {f.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )
+                })()}
+
+                {/* Chips multi-select tipo de unidad */}
+                {datosRangoAll.length > 0 && (() => {
+                  const tipos = [...new Set(datosRangoAll.map(r => r.tipo_unidad).filter(Boolean))].sort()
+                  return (
+                    <div>
+                      <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>
+                        Tipo de unidad {filtroTiposUnidad.length > 0 && <span style={{ color: '#E52322' }}>({filtroTiposUnidad.length})</span>}
+                      </label>
+                      <div className="flex flex-wrap gap-1.5">
+                        {tipos.map(t => {
+                          const sel = filtroTiposUnidad.includes(t)
+                          return (
+                            <button key={t} type="button"
+                              onClick={() => setFiltroTiposUnidad(prev => sel ? prev.filter(x => x !== t) : [...prev, t])}
+                              className="px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-colors"
+                              style={{ borderColor: sel ? '#254A96' : '#e8edf8', background: sel ? '#e8edf8' : 'white', color: sel ? '#254A96' : '#999' }}>
+                              {t}
+                            </button>
+                          )
+                        })}
+                        {filtroTiposUnidad.length > 0 && (
+                          <button type="button" onClick={() => setFiltroTiposUnidad([])}
+                            className="px-2 py-1.5 rounded-lg text-xs border"
+                            style={{ borderColor: '#e8edf8', color: '#B9BBB7' }}>✕</button>
+                        )}
+                      </div>
+                    </div>
+                  )
+                })()}
+
+                {/* Chips multi-select camiones — aparecen después de buscar */}
+                {datosRangoAll.length > 0 && (() => {
+                  const camiones = [...new Set(datosRangoAll.map(r => r.camion_codigo))].sort()
+                  return (
+                    <div>
+                      <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>
+                        Camiones {filtroRangoCamiones.length > 0 && <span style={{ color: '#E52322' }}>({filtroRangoCamiones.length})</span>}
+                      </label>
+                      <div className="flex flex-wrap gap-1.5">
+                        {camiones.map(c => {
+                          const sel = filtroRangoCamiones.includes(c)
+                          return (
+                            <button key={c} type="button"
+                              onClick={() => setFiltroRangoCamiones(prev => sel ? prev.filter(x => x !== c) : [...prev, c])}
+                              className="px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-colors"
+                              style={{ borderColor: sel ? '#254A96' : '#e8edf8', background: sel ? '#e8edf8' : 'white', color: sel ? '#254A96' : '#999' }}>
+                              {c}
+                            </button>
+                          )
+                        })}
+                        {filtroRangoCamiones.length > 0 && (
+                          <button type="button" onClick={() => setFiltroRangoCamiones([])}
+                            className="px-2 py-1.5 rounded-lg text-xs border"
+                            style={{ borderColor: '#e8edf8', color: '#B9BBB7' }}>✕</button>
+                        )}
+                      </div>
+                    </div>
+                  )
+                })()}
+
+                {/* Chips multi-select choferes */}
+                {datosRangoAll.length > 0 && (() => {
+                  const choferes = [...new Set(datosRangoAll.map(r => r.chofer_nombre).filter(n => n && n !== 'Sin chofer'))].sort()
+                  return (
+                    <div>
+                      <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>
+                        Choferes {filtroRangoChoferes.length > 0 && <span style={{ color: '#E52322' }}>({filtroRangoChoferes.length})</span>}
+                      </label>
+                      <div className="flex flex-wrap gap-1.5">
+                        {choferes.map(c => {
+                          const sel = filtroRangoChoferes.includes(c)
+                          return (
+                            <button key={c} type="button"
+                              onClick={() => setFiltroRangoChoferes(prev => sel ? prev.filter(x => x !== c) : [...prev, c])}
+                              className="px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-colors"
+                              style={{ borderColor: sel ? '#254A96' : '#e8edf8', background: sel ? '#e8edf8' : 'white', color: sel ? '#254A96' : '#999' }}>
+                              {c}
+                            </button>
+                          )
+                        })}
+                        {filtroRangoChoferes.length > 0 && (
+                          <button type="button" onClick={() => setFiltroRangoChoferes([])}
+                            className="px-2 py-1.5 rounded-lg text-xs border"
+                            style={{ borderColor: '#e8edf8', color: '#B9BBB7' }}>✕</button>
+                        )}
+                      </div>
+                    </div>
+                  )
+                })()}
+
+                {/* Chips de fechas — deseleccioná feriados o días sin operar */}
+                {datosRangoAll.length > 0 && (() => {
+                  const fechas = [...new Set(datosRangoAll.map(r => r.fecha))].sort()
+                  const excl = filtroFechasExcluidas
+                  return (
+                    <div>
+                      <div className="flex items-center gap-2 mb-1 flex-wrap">
+                        <label className="text-xs font-medium" style={{ color: '#254A96' }}>
+                          Días {excl.length > 0 && <span style={{ color: '#E52322' }}>({excl.length} excluidos)</span>}
+                        </label>
+                        <button type="button"
+                          onClick={() => setOcultarSinActividad(v => !v)}
+                          className="px-2 py-0.5 rounded text-xs font-medium border transition-colors"
+                          style={{ borderColor: ocultarSinActividad ? '#254A96' : '#e8edf8', background: ocultarSinActividad ? '#e8edf8' : 'white', color: ocultarSinActividad ? '#254A96' : '#B9BBB7' }}>
+                          {ocultarSinActividad ? '✓' : ''} Ocultar sin actividad
+                        </button>
+                        {excl.length > 0 && (
+                          <button type="button" onClick={() => setFiltroFechasExcluidas([])}
+                            className="px-2 py-0.5 rounded text-xs border"
+                            style={{ borderColor: '#e8edf8', color: '#B9BBB7' }}>Restaurar todos</button>
+                        )}
+                      </div>
+                      <div className="flex flex-wrap gap-1">
+                        {fechas.map(f => {
+                          const excluida = excl.includes(f)
+                          const d = new Date(f + 'T12:00:00')
+                          const label = d.toLocaleDateString('es-AR', { weekday: 'short', day: '2-digit', month: '2-digit' })
+                          const esFinde = [0, 6].includes(d.getDay())
+                          return (
+                            <button key={f} type="button"
+                              onClick={() => setFiltroFechasExcluidas(prev => excluida ? prev.filter(x => x !== f) : [...prev, f])}
+                              className="px-2 py-1 rounded text-xs border transition-colors"
+                              title={excluida ? 'Click para incluir' : 'Click para excluir'}
+                              style={{
+                                borderColor: excluida ? '#fca5a5' : '#e8edf8',
+                                background: excluida ? '#fde8e8' : 'white',
+                                color: excluida ? '#E52322' : esFinde ? '#b45309' : '#666',
+                                textDecoration: excluida ? 'line-through' : 'none',
+                                opacity: excluida ? 0.7 : 1,
+                              }}>
+                              {label}
+                            </button>
+                          )
+                        })}
+                      </div>
+                    </div>
+                  )
+                })()}
+
+              </>
             )}
             <div>
               <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>Sucursal</label>
@@ -604,6 +1404,36 @@ export default function MetricasPage() {
                 className="border rounded-lg px-3 py-2 text-sm focus:outline-none"
                 style={{ borderColor: '#e8edf8' }} />
             </div>
+            <div>
+              <label className="block text-xs font-medium mb-1" style={{ color: '#254A96' }}>
+                Sucursales {exportSucursales.length === 0 && <span style={{ color: '#B9BBB7', fontWeight: 400 }}>(todas)</span>}
+              </label>
+              <div className="flex gap-1.5 flex-wrap">
+                {SUCURSALES.map(s => {
+                  const sel = exportSucursales.includes(s)
+                  return (
+                    <button key={s} type="button"
+                      onClick={() => setExportSucursales(prev => sel ? prev.filter(x => x !== s) : [...prev, s])}
+                      className="px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-colors"
+                      style={{
+                        borderColor: sel ? '#254A96' : '#e8edf8',
+                        background: sel ? '#e8edf8' : 'white',
+                        color: sel ? '#254A96' : '#999',
+                      }}>
+                      {s}
+                    </button>
+                  )
+                })}
+                {exportSucursales.length > 0 && (
+                  <button type="button" onClick={() => setExportSucursales([])}
+                    className="px-2 py-1.5 rounded-lg text-xs border transition-colors"
+                    style={{ borderColor: '#e8edf8', color: '#B9BBB7', background: 'white' }}
+                    title="Limpiar filtro (exportar todas)">
+                    ✕
+                  </button>
+                )}
+              </div>
+            </div>
             <button onClick={exportarExcel} disabled={exportando}
               className="px-4 py-2 rounded-lg text-sm font-semibold disabled:opacity-50"
               style={{ background: '#f4f4f3', color: '#254A96', border: '1px solid #e8edf8' }}>
@@ -626,7 +1456,9 @@ export default function MetricasPage() {
               style={{ borderColor: '#254A96', borderTopColor: 'transparent' }} />
           </div>
         ) : vista === 'diaria' ? (
-          <VistaDiaria datos={datosDia} fecha={fecha} />
+          <VistaDiaria datos={datosDia} fecha={fecha} camionesNoActivados={camionesNoActivados} />
+        ) : vista === 'rango' ? (
+          <VistaRango datos={datosRango} loading={loadingRango} onExport={exportarRango} />
         ) : (
           <VistaMensual datos={datosMes} mes={mes} />
         )}
@@ -671,10 +1503,36 @@ const ESTADO_COLOR: Record<string, { bg: string; color: string }> = {
   rechazado:    { bg: '#fde8e8', color: '#E52322' },
 }
 
-function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string }) {
+type SortDir = 'asc' | 'desc'
+function SortTh({ label, sortKey, active, dir, onClick, numeric = true }: {
+  label: string; sortKey: string; active: boolean; dir: SortDir; onClick: () => void; numeric?: boolean
+}) {
+  const arrow = active ? (dir === 'desc' ? (numeric ? ' ↓' : ' Z→A') : (numeric ? ' ↑' : ' A→Z')) : ''
+  return (
+    <th onClick={onClick} className="text-left px-3 py-2.5 text-xs font-semibold uppercase tracking-wide whitespace-nowrap cursor-pointer select-none hover:opacity-70 transition-opacity"
+      style={{ color: active ? '#254A96' : '#B9BBB7' }}>
+      {label}{arrow}
+    </th>
+  )
+}
+
+function VistaDiaria({ datos, fecha, camionesNoActivados }: {
+  datos: DatosCamionDia[]
+  fecha: string
+  camionesNoActivados: { camion_codigo: string; sucursal: string }[]
+}) {
   const router = useRouter()
   const [filtroFlota, setFiltroFlota] = useState<'todos' | 'con_pedidos' | 'sin_pedidos'>('todos')
+  const [filtroCamion, setFiltroCamion] = useState('')
+  const [filtroChofer, setFiltroChofer] = useState('')
   const [modalVuelta, setModalVuelta] = useState<{ camion: string; vuelta: DatosVuelta } | null>(null)
+  type SortKeyDia = 'kg' | 'pos' | 'dist' | 'ocup' | 'camion' | 'chofer'
+  const [sortKey, setSortKey] = useState<SortKeyDia>('ocup')
+  const [sortDir, setSortDir] = useState<SortDir>('desc')
+  function toggleSortDia(k: SortKeyDia) {
+    if (sortKey === k) setSortDir(d => d === 'desc' ? 'asc' : 'desc')
+    else { setSortKey(k); setSortDir('desc') }
+  }
 
   if (datos.length === 0) return (
     <div className="flex flex-col items-center justify-center py-24" style={{ color: '#B9BBB7' }}>
@@ -684,13 +1542,30 @@ function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string 
     </div>
   )
 
-  const datosFiltrados = filtroFlota === 'con_pedidos' ? datos.filter(d => d.pedidos > 0)
-    : filtroFlota === 'sin_pedidos' ? datos.filter(d => d.pedidos === 0)
-    : datos
+  const camionesUnicos = [...new Set(datos.map(d => d.camion_codigo))].sort()
+  const choferesUnicos = [...new Set(datos.map(d => d.chofer_nombre).filter(n => n && n !== 'Sin chofer'))].sort()
+
+  const datosFiltrados = datos
+    .filter(d => filtroFlota === 'con_pedidos' ? d.pedidos > 0 : filtroFlota === 'sin_pedidos' ? d.pedidos === 0 : true)
+    .filter(d => !filtroCamion || d.camion_codigo === filtroCamion)
+    .filter(d => !filtroChofer || d.chofer_nombre === filtroChofer)
+
+  const datosSorted = [...datosFiltrados].sort((a, b) => {
+    let v = 0
+    if (sortKey === 'kg') v = a.kgUsados - b.kgUsados
+    else if (sortKey === 'pos') v = a.posicionesUsadas - b.posicionesUsadas
+    else if (sortKey === 'dist') v = a.distanciaTotalKm - b.distanciaTotalKm
+    else if (sortKey === 'ocup') v = Math.max(a.ocupDiariaPctKg, a.ocupDiariaPctPos) - Math.max(b.ocupDiariaPctKg, b.ocupDiariaPctPos)
+    else if (sortKey === 'camion') v = a.camion_codigo.localeCompare(b.camion_codigo)
+    else if (sortKey === 'chofer') v = a.chofer_nombre.localeCompare(b.chofer_nombre)
+    return sortDir === 'desc' ? -v : v
+  })
 
   const totalPedidos = datosFiltrados.reduce((a, d) => a + d.pedidos, 0)
-  const avgPctKg = datosFiltrados.length > 0 ? Math.round(datosFiltrados.reduce((a, d) => a + d.pctKg, 0) / datosFiltrados.length) : 0
-  const avgPctPos = datosFiltrados.length > 0 ? Math.round(datosFiltrados.reduce((a, d) => a + d.pctPos, 0) / datosFiltrados.length) : 0
+  // Usar ocupDiariaPct (tonelaje × vueltasMaxEfectivas) en lugar de pct (tonelaje × vueltas reales)
+  // para que el resumen refleje la eficiencia real contra el potencial del día completo
+  const avgPctKg = datosFiltrados.length > 0 ? Math.round(datosFiltrados.reduce((a, d) => a + d.ocupDiariaPctKg, 0) / datosFiltrados.length) : 0
+  const avgPctPos = datosFiltrados.length > 0 ? Math.round(datosFiltrados.reduce((a, d) => a + d.ocupDiariaPctPos, 0) / datosFiltrados.length) : 0
   const totalDistancia = datosFiltrados.reduce((a, d) => a + d.distanciaTotalKm, 0)
 
   const conPedidos = datos.filter(d => d.pedidos > 0).length
@@ -699,8 +1574,8 @@ function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string 
   return (
     <div className="space-y-4">
 
-      {/* Filtro con/sin pedidos */}
-      <div className="flex items-center gap-2">
+      {/* Filtros */}
+      <div className="flex flex-wrap items-center gap-2">
         {([
           { key: 'todos', label: `Todos (${datos.length})` },
           { key: 'con_pedidos', label: `Con pedidos (${conPedidos})` },
@@ -715,6 +1590,51 @@ function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string 
             {f.label}
           </button>
         ))}
+        <div className="w-px h-4 bg-gray-200 mx-1" />
+        <select value={filtroCamion} onChange={e => setFiltroCamion(e.target.value)}
+          className="border rounded-lg px-2.5 py-1.5 text-xs focus:outline-none"
+          style={{ borderColor: '#e8edf8', color: filtroCamion ? '#254A96' : '#999' }}>
+          <option value="">🚛 Todos los camiones</option>
+          {camionesUnicos.map(c => <option key={c} value={c}>{c}</option>)}
+        </select>
+        <select value={filtroChofer} onChange={e => setFiltroChofer(e.target.value)}
+          className="border rounded-lg px-2.5 py-1.5 text-xs focus:outline-none"
+          style={{ borderColor: '#e8edf8', color: filtroChofer ? '#254A96' : '#999' }}>
+          <option value="">👤 Todos los choferes</option>
+          {choferesUnicos.map(c => <option key={c} value={c}>{c}</option>)}
+        </select>
+        {(filtroCamion || filtroChofer) && (
+          <button onClick={() => { setFiltroCamion(''); setFiltroChofer('') }}
+            className="text-xs px-2 py-1.5 rounded-lg"
+            style={{ color: '#B9BBB7', background: '#f4f4f3' }}>✕ Limpiar</button>
+        )}
+      </div>
+
+      {/* Ordenamiento */}
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className="text-xs font-semibold" style={{ color: '#B9BBB7' }}>Ordenar:</span>
+        {([
+          { key: 'ocup', label: 'Ocupación', numeric: true },
+          { key: 'kg', label: 'Kg', numeric: true },
+          { key: 'pos', label: 'Posiciones', numeric: true },
+          { key: 'dist', label: 'Distancia', numeric: true },
+          { key: 'camion', label: 'Camión', numeric: false },
+          { key: 'chofer', label: 'Chofer', numeric: false },
+        ] as const).map(s => {
+          const active = sortKey === s.key
+          const arrow = active ? (sortDir === 'desc' ? (s.numeric ? ' ↓' : ' Z→A') : (s.numeric ? ' ↑' : ' A→Z')) : ''
+          return (
+            <button key={s.key} onClick={() => toggleSortDia(s.key)}
+              className="px-2.5 py-1 rounded-lg text-xs font-medium transition-colors"
+              style={{
+                background: active ? '#254A96' : '#f4f4f3',
+                color: active ? 'white' : '#666',
+                border: active ? 'none' : '1px solid #e8edf8',
+              }}>
+              {s.label}{arrow}
+            </button>
+          )
+        })}
       </div>
 
       {/* Resumen */}
@@ -736,8 +1656,29 @@ function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string 
         ))}
       </div>
 
+      {/* Panel flota ociosa */}
+      {(() => {
+        const ociosos = datosFiltrados.filter(d => d.vueltas.length > 0 && Math.max(d.ocupDiariaPctKg, d.ocupDiariaPctPos) < 40)
+        if (ociosos.length === 0) return null
+        return (
+          <div className="rounded-xl p-4" style={{ background: '#fef3c7', border: '1px solid #fde68a' }}>
+            <p className="text-sm font-semibold mb-2" style={{ color: '#b45309' }}>
+              ⚠ {ociosos.length} camión{ociosos.length !== 1 ? 'es' : ''} con baja ocupación diaria
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {ociosos.map(d => (
+                <span key={d.camion_codigo} className="text-xs px-2.5 py-1 rounded-full font-medium"
+                  style={{ background: '#fef9c3', color: '#92400e', border: '1px solid #fde68a' }}>
+                  {d.camion_codigo} · {Math.max(d.ocupDiariaPctKg, d.ocupDiariaPctPos)}% · {d.vueltas.length}/{d.vueltasMaxEfectivas}V
+                </span>
+              ))}
+            </div>
+          </div>
+        )
+      })()}
+
       {/* Cards por camión */}
-      {datosFiltrados.map(d => {
+      {datosSorted.map(d => {
         const semaforo = colorSemaforo(Math.max(d.pctKg, d.pctPos))
         return (
           <div key={d.camion_codigo} className="bg-white rounded-xl shadow-sm overflow-hidden" style={{ border: '1px solid #f0f0f0' }}>
@@ -752,6 +1693,15 @@ function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string 
                     <span className="text-xs" style={{ color: '#B9BBB7' }}>📍 {d.sucursal}</span>
                     <span className="text-xs px-2 py-0.5 rounded-full font-semibold" style={{ background: semaforo.bg, color: semaforo.color }}>
                       {Math.max(d.pctKg, d.pctPos)}% ocupación
+                    </span>
+                    {d.vueltas.length > 0 && (
+                      <span className="text-xs px-2 py-0.5 rounded-full font-semibold"
+                        style={{ background: colorSemaforo(Math.max(d.ocupDiariaPctKg, d.ocupDiariaPctPos)).bg, color: colorSemaforo(Math.max(d.ocupDiariaPctKg, d.ocupDiariaPctPos)).color }}>
+                        {Math.max(d.ocupDiariaPctKg, d.ocupDiariaPctPos)}% día est.
+                      </span>
+                    )}
+                    <span className="text-xs" style={{ color: '#B9BBB7' }}>
+                      {d.vueltas.length}/{d.vueltasMaxEfectivas}V
                     </span>
                   </div>
                   <p className="text-xs mt-0.5" style={{ color: '#B9BBB7' }}>
@@ -842,6 +1792,72 @@ function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string 
                             <span style={{ color: '#f59e0b' }}>({v.pedidosConUbicacion}/{v.pedidos} con ubic.)</span>
                           )}
                         </div>
+                        {/* Tiempos reales de la vuelta */}
+                        {(v.horaInicioVuelta || v.horaFinVuelta) && (
+                          <div className="flex items-center justify-between text-xs pt-1" style={{ borderTop: '1px solid #e8edf8' }}>
+                            <span style={{ color: '#065f46', fontWeight: 600 }}>
+                              {v.horaInicioVuelta ? `▶ ${formatHora(v.horaInicioVuelta)}` : ''}
+                              {v.horaInicioVuelta && v.horaFinVuelta ? ' → ' : ''}
+                              {v.horaFinVuelta ? `⏹ ${formatHora(v.horaFinVuelta)}` : ''}
+                            </span>
+                            {v.horaInicioVuelta && v.horaFinVuelta && (
+                              <span style={{ color: '#065f46', fontWeight: 600 }}>
+                                {duracion(v.horaInicioVuelta, v.horaFinVuelta)}
+                              </span>
+                            )}
+                          </div>
+                        )}
+
+                        {/* Horas de entrega por pedido */}
+                        {(() => {
+                          const entregas = v.detalle
+                            .filter(p => p.hora_entregado)
+                            .sort((a, b) => new Date(a.hora_entregado!).getTime() - new Date(b.hora_entregado!).getTime())
+                          if (entregas.length === 0) return null
+                          return (
+                            <div className="text-xs pt-1" style={{ borderTop: '1px solid #e8edf8' }}>
+                              <div className="flex flex-wrap gap-x-2 gap-y-0.5" style={{ color: '#B9BBB7' }}>
+                                <span style={{ color: '#254A96', fontWeight: 600 }}>📦</span>
+                                {entregas.map((p, i) => (
+                                  <span key={p.id}>
+                                    <span style={{ color: '#1a1a1a', fontWeight: 500 }}>{formatHora(p.hora_entregado)}</span>
+                                    <span style={{ color: '#B9BBB7' }}> {p.estado === 'rechazado' ? '✕' : p.estado === 'entregado_parcial' ? '½' : '✓'}</span>
+                                    {i < entregas.length - 1 && <span style={{ color: '#d1d5db' }}> ·</span>}
+                                  </span>
+                                ))}
+                              </div>
+                            </div>
+                          )
+                        })()}
+
+                        {/* Tiempo estimado */}
+                        {(() => {
+                          const esTrailer = /trailer|semi/i.test(d.tipo_unidad ?? '')
+                          const descMin = calcularTiempoDescargaMin(v.detalle, esTrailer)
+                          const trasMin = v.tiempoTrasladoMin
+                          // Fallback: estimación de traslado desde km en línea recta
+                          // (factor 1.3 de desvío de ruta × vel promedio según sucursal)
+                          const velKmh = getVelFallback(d.sucursal)
+                          const trasEst = trasMin === null && v.distanciaKm > 0
+                            ? Math.round(v.distanciaKm * 1.3 / velKmh * 60)
+                            : null
+                          const trasUsado = trasMin ?? trasEst
+                          if (descMin === 0 && trasUsado === null) return null
+                          const totalMin = (trasUsado ?? 0) + descMin
+                          return (
+                            <div className="text-xs pt-1" style={{ borderTop: '1px solid #e8edf8' }}>
+                              <div className="flex items-center justify-between">
+                                <span style={{ color: '#7c3aed', fontWeight: 600 }}>⏱ Est: {formatMinutos(totalMin)}</span>
+                                <span style={{ color: '#B9BBB7', fontSize: 10 }}>
+                                  {trasUsado !== null
+                                    ? `${trasMin === null ? '~' : ''}${formatMinutos(trasUsado)} traslado + `
+                                    : ''
+                                  }{formatMinutos(descMin)} descarga
+                                </span>
+                              </div>
+                            </div>
+                          )
+                        })()}
                       </div>
                     ))}
                   </div>
@@ -855,7 +1871,7 @@ function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string 
                     { label: 'Inicio', value: formatHora(d.hora_inicio) },
                     { label: 'Fin', value: formatHora(d.hora_fin) },
                     { label: 'Duración', value: duracion(d.hora_inicio, d.hora_fin) },
-                    { label: 'Min/km', value: minKm(d.hora_inicio, d.hora_fin, d.km_ruta) + (minKm(d.hora_inicio, d.hora_fin, d.km_ruta) !== '—' ? ' min/km' : '') },
+                    { label: 'Min/km', value: (() => { const km = d.km_ruta ?? (d.distanciaTotalKm > 0 ? d.distanciaTotalKm : null); const v = minKm(d.hora_inicio, d.hora_fin, km); return v !== '—' ? `${v} min/km${!d.km_ruta ? ' ~' : ''}` : '—' })() },
                   ].map(item => (
                     <div key={item.label} className="rounded-lg p-2 text-center" style={{ background: '#f4f4f3' }}>
                       <p className="text-xs mb-0.5" style={{ color: '#B9BBB7' }}>{item.label}</p>
@@ -868,6 +1884,23 @@ function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string 
           </div>
         )
       })}
+
+      {/* Unidades no activadas — informativo */}
+      {camionesNoActivados.length > 0 && (
+        <div className="rounded-xl p-4" style={{ background: '#f4f4f3', border: '1px solid #e8edf8' }}>
+          <p className="text-sm font-medium mb-2" style={{ color: '#666' }}>
+            ℹ {camionesNoActivados.length} unidad{camionesNoActivados.length !== 1 ? 'es' : ''} disponible{camionesNoActivados.length !== 1 ? 's' : ''} no activada{camionesNoActivados.length !== 1 ? 's' : ''} hoy
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {camionesNoActivados.map(c => (
+              <span key={c.camion_codigo} className="text-xs px-2.5 py-1 rounded-full"
+                style={{ background: 'white', color: '#888', border: '1px solid #e8edf8' }}>
+                {c.camion_codigo} · {c.sucursal}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Modal pedidos de vuelta */}
       {modalVuelta && (
@@ -931,7 +1964,7 @@ function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string 
               <table className="w-full text-sm" style={{ minWidth: 700 }}>
                 <thead>
                   <tr style={{ background: '#f9f9f9', borderBottom: '1px solid #f0f0f0' }}>
-                    {['#', 'NV', 'Cliente', 'Kg', 'Pos', 'Estado', 'Pago', ''].map(h => (
+                    {['#', 'NV', 'Cliente', 'Kg', 'Pos', 'Estado', 'Pago', 'Hora entrega', ''].map(h => (
                       <th key={h} className="text-left px-4 py-2.5 text-xs font-semibold uppercase tracking-wide whitespace-nowrap" style={{ color: '#B9BBB7' }}>{h}</th>
                     ))}
                   </tr>
@@ -984,13 +2017,18 @@ function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string 
                             : <span style={{ color: '#ddd' }}>—</span>
                           }
                         </td>
+                        <td className="px-4 py-2.5 text-xs whitespace-nowrap" style={{ color: p.hora_entregado ? '#065f46' : '#ddd', fontWeight: p.hora_entregado ? 600 : 400 }}>
+                          {p.hora_entregado ? formatHora(p.hora_entregado) : '—'}
+                        </td>
                         <td className="px-3 py-2.5">
-                          <button
-                            onClick={() => router.push(`/pedidos?nv=${encodeURIComponent(p.nv)}`)}
-                            className="text-xs px-2 py-1 rounded-lg font-semibold whitespace-nowrap"
+                          <a
+                            href={`/pedidos?nv=${encodeURIComponent(p.nv)}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-xs px-2 py-1 rounded-lg font-semibold whitespace-nowrap inline-block"
                             style={{ background: '#e8edf8', color: '#254A96' }}
-                            title="Ver detalle completo"
-                          >→</button>
+                            title="Ver detalle completo (nueva pestaña)"
+                          >→</a>
                         </td>
                       </tr>
                     )
@@ -1009,6 +2047,21 @@ function VistaDiaria({ datos, fecha }: { datos: DatosCamionDia[]; fecha: string 
 
 function VistaMensual({ datos, mes }: { datos: DatosCamionMes[]; mes: string }) {
   const nombreMes = new Date(mes + '-15').toLocaleDateString('es-AR', { month: 'long', year: 'numeric' })
+  type SortKeyMes = 'camion' | 'ocup_kg' | 'ocup_pos' | 'dist'
+  const [sortKey, setSortKey] = useState<SortKeyMes>('ocup_kg')
+  const [sortDir, setSortDir] = useState<SortDir>('desc')
+  function toggleSort(k: SortKeyMes) {
+    if (sortKey === k) setSortDir(d => d === 'desc' ? 'asc' : 'desc')
+    else { setSortKey(k); setSortDir('desc') }
+  }
+  const datosSorted = [...datos].sort((a, b) => {
+    let v = 0
+    if (sortKey === 'camion') v = a.camion_codigo.localeCompare(b.camion_codigo)
+    else if (sortKey === 'ocup_kg') v = a.avgPctKg - b.avgPctKg
+    else if (sortKey === 'ocup_pos') v = a.avgPctPos - b.avgPctPos
+    else if (sortKey === 'dist') v = a.totalKm - b.totalKm
+    return sortDir === 'desc' ? -v : v
+  })
 
   if (datos.length === 0) return (
     <div className="flex flex-col items-center justify-center py-24" style={{ color: '#B9BBB7' }}>
@@ -1049,13 +2102,18 @@ function VistaMensual({ datos, mes }: { datos: DatosCamionMes[]; mes: string }) 
           <table className="w-full text-sm">
             <thead>
               <tr style={{ background: '#f9f9f9', borderBottom: '1px solid #f0f0f0' }}>
-                {['Camión', 'Sucursal', 'Días activo', 'Ocup. kg', 'Ocup. pos', 'Total km', 'Min/km prom', 'Estado'].map(h => (
-                  <th key={h} className="text-left px-4 py-2.5 text-xs font-semibold uppercase tracking-wide whitespace-nowrap" style={{ color: '#B9BBB7' }}>{h}</th>
-                ))}
+                <SortTh label="Camión" sortKey="camion" active={sortKey === 'camion'} dir={sortDir} onClick={() => toggleSort('camion')} numeric={false} />
+                <th className="text-left px-4 py-2.5 text-xs font-semibold uppercase tracking-wide whitespace-nowrap" style={{ color: '#B9BBB7' }}>Sucursal</th>
+                <th className="text-left px-4 py-2.5 text-xs font-semibold uppercase tracking-wide whitespace-nowrap" style={{ color: '#B9BBB7' }}>Días activo</th>
+                <SortTh label="Ocup. kg" sortKey="ocup_kg" active={sortKey === 'ocup_kg'} dir={sortDir} onClick={() => toggleSort('ocup_kg')} />
+                <SortTh label="Ocup. pos" sortKey="ocup_pos" active={sortKey === 'ocup_pos'} dir={sortDir} onClick={() => toggleSort('ocup_pos')} />
+                <SortTh label="Total km" sortKey="dist" active={sortKey === 'dist'} dir={sortDir} onClick={() => toggleSort('dist')} />
+                <th className="text-left px-4 py-2.5 text-xs font-semibold uppercase tracking-wide whitespace-nowrap" style={{ color: '#B9BBB7' }}>Min/km prom</th>
+                <th className="text-left px-4 py-2.5 text-xs font-semibold uppercase tracking-wide whitespace-nowrap" style={{ color: '#B9BBB7' }}>Estado</th>
               </tr>
             </thead>
             <tbody>
-              {datos.map((d, i) => {
+              {datosSorted.map((d, i) => {
                 const sem = colorSemaforo(d.avgPctKg)
                 return (
                   <tr key={d.camion_codigo} style={{ borderBottom: '1px solid #f9f9f9', background: i % 2 === 0 ? 'white' : '#fdfdfd' }}>
@@ -1093,6 +2151,160 @@ function VistaMensual({ datos, mes }: { datos: DatosCamionMes[]; mes: string }) 
                       <span className="text-xs px-2 py-1 rounded-full font-semibold whitespace-nowrap" style={{ background: sem.bg, color: sem.color }}>
                         {sem.label}
                       </span>
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ─── Vista Rango ─────────────────────────────────────────────────────────────────
+
+function VistaRango({ datos, loading, onExport }: { datos: DatosRangoDia[]; loading: boolean; onExport: () => void }) {
+  type SortKeyRango = 'fecha' | 'camion' | 'chofer' | 'kg' | 'pos' | 'dist' | 'ocup_kg' | 'ocup_pos'
+  const [sortKey, setSortKey] = useState<SortKeyRango>('fecha')
+  const [sortDir, setSortDir] = useState<SortDir>('asc')
+  function toggleSort(k: SortKeyRango) {
+    if (sortKey === k) setSortDir(d => d === 'desc' ? 'asc' : 'desc')
+    else { setSortKey(k); setSortDir(k === 'fecha' || k === 'camion' || k === 'chofer' ? 'asc' : 'desc') }
+  }
+  const datosSorted = [...datos].sort((a, b) => {
+    let v = 0
+    if (sortKey === 'fecha') v = a.fecha.localeCompare(b.fecha) || a.camion_codigo.localeCompare(b.camion_codigo)
+    else if (sortKey === 'camion') v = a.camion_codigo.localeCompare(b.camion_codigo)
+    else if (sortKey === 'chofer') v = a.chofer_nombre.localeCompare(b.chofer_nombre)
+    else if (sortKey === 'kg') v = a.kgUsados - b.kgUsados
+    else if (sortKey === 'pos') v = a.posUsadas - b.posUsadas
+    else if (sortKey === 'dist') v = (a.kmReal ?? -1) - (b.kmReal ?? -1)
+    else if (sortKey === 'ocup_kg') v = a.pctKg - b.pctKg
+    else if (sortKey === 'ocup_pos') v = a.pctPos - b.pctPos
+    return sortDir === 'desc' ? -v : v
+  })
+
+  if (loading) return (
+    <div className="flex justify-center py-24">
+      <div className="w-6 h-6 border-2 border-t-transparent rounded-full animate-spin"
+        style={{ borderColor: '#254A96', borderTopColor: 'transparent' }} />
+    </div>
+  )
+
+  if (datos.length === 0) return (
+    <div className="flex flex-col items-center justify-center py-24" style={{ color: '#B9BBB7' }}>
+      <div className="text-5xl mb-4">📅</div>
+      <p className="font-medium">Aplicá filtros y hacé clic en Buscar</p>
+      <p className="text-sm mt-1">Se mostrarán los datos día a día para el rango seleccionado</p>
+    </div>
+  )
+
+  const totalPedidos = datos.reduce((a, r) => a + r.pedidos, 0)
+  const diasUnicos = new Set(datos.map(r => r.fecha)).size
+  const avgPctKg = datos.length > 0 ? Math.round(datos.reduce((a, r) => a + r.pctKg, 0) / datos.length) : 0
+  const avgPctPos = datos.length > 0 ? Math.round(datos.reduce((a, r) => a + r.pctPos, 0) / datos.length) : 0
+
+  const DIAS_FIN_SEMANA = new Set(['sáb', 'dom', 'sab'])
+
+  return (
+    <div className="space-y-4">
+      {/* Resumen */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        {[
+          { label: 'Días con datos', value: diasUnicos, emoji: '📅', bg: '#e8edf8', color: '#254A96' },
+          { label: 'Total pedidos', value: totalPedidos, emoji: '📦', bg: '#f3e8ff', color: '#7c3aed' },
+          { label: 'Ocup. prom. kg', value: `${avgPctKg}%`, emoji: '⚖️', bg: colorSemaforo(avgPctKg).bg, color: colorSemaforo(avgPctKg).color },
+          { label: 'Ocup. prom. pos', value: `${avgPctPos}%`, emoji: '📐', bg: colorSemaforo(avgPctPos).bg, color: colorSemaforo(avgPctPos).color },
+        ].map(s => (
+          <div key={s.label} className="bg-white rounded-xl p-4 flex items-center gap-3 shadow-sm" style={{ border: '1px solid #f0f0f0' }}>
+            <div className="w-10 h-10 rounded-lg flex items-center justify-center text-xl shrink-0" style={{ background: s.bg }}>{s.emoji}</div>
+            <div>
+              <p className="text-xl font-bold leading-none" style={{ color: s.color }}>{s.value}</p>
+              <p className="text-xs mt-0.5" style={{ color: '#B9BBB7' }}>{s.label}</p>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* Tabla */}
+      <div className="bg-white rounded-xl shadow-sm overflow-hidden" style={{ border: '1px solid #f0f0f0' }}>
+        <div className="px-4 py-3 border-b flex items-center justify-between" style={{ borderColor: '#f0f0f0', background: '#f9f9f9' }}>
+          <p className="text-xs font-semibold uppercase tracking-widest" style={{ color: '#B9BBB7' }}>
+            {datos.length} registros
+          </p>
+          <button onClick={onExport}
+            className="px-3 py-1.5 rounded-lg text-xs font-semibold"
+            style={{ background: '#f4f4f3', color: '#254A96', border: '1px solid #e8edf8' }}>
+            ⬇️ Exportar Excel
+          </button>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm" style={{ minWidth: 900 }}>
+            <thead>
+              <tr style={{ background: '#f9f9f9', borderBottom: '1px solid #f0f0f0' }}>
+                <SortTh label="Fecha" sortKey="fecha" active={sortKey === 'fecha'} dir={sortDir} onClick={() => toggleSort('fecha')} numeric={false} />
+                <th className="text-left px-3 py-2.5 text-xs font-semibold uppercase tracking-wide whitespace-nowrap" style={{ color: '#B9BBB7' }}>Día</th>
+                <SortTh label="Camión" sortKey="camion" active={sortKey === 'camion'} dir={sortDir} onClick={() => toggleSort('camion')} numeric={false} />
+                <th className="text-left px-3 py-2.5 text-xs font-semibold uppercase tracking-wide whitespace-nowrap" style={{ color: '#B9BBB7' }}>Sucursal</th>
+                <SortTh label="Chofer" sortKey="chofer" active={sortKey === 'chofer'} dir={sortDir} onClick={() => toggleSort('chofer')} numeric={false} />
+                <th className="text-left px-3 py-2.5 text-xs font-semibold uppercase tracking-wide whitespace-nowrap" style={{ color: '#B9BBB7' }}>Pedidos</th>
+                <SortTh label="Kg" sortKey="kg" active={sortKey === 'kg'} dir={sortDir} onClick={() => toggleSort('kg')} />
+                <SortTh label="Pos" sortKey="pos" active={sortKey === 'pos'} dir={sortDir} onClick={() => toggleSort('pos')} />
+                <SortTh label="Ocup.Kg%" sortKey="ocup_kg" active={sortKey === 'ocup_kg'} dir={sortDir} onClick={() => toggleSort('ocup_kg')} />
+                <SortTh label="Ocup.Pos%" sortKey="ocup_pos" active={sortKey === 'ocup_pos'} dir={sortDir} onClick={() => toggleSort('ocup_pos')} />
+                <SortTh label="Km" sortKey="dist" active={sortKey === 'dist'} dir={sortDir} onClick={() => toggleSort('dist')} />
+                <th className="text-left px-3 py-2.5 text-xs font-semibold uppercase tracking-wide whitespace-nowrap" style={{ color: '#B9BBB7' }}>Inicio</th>
+                <th className="text-left px-3 py-2.5 text-xs font-semibold uppercase tracking-wide whitespace-nowrap" style={{ color: '#B9BBB7' }}>Fin</th>
+                <th className="text-left px-3 py-2.5 text-xs font-semibold uppercase tracking-wide whitespace-nowrap" style={{ color: '#B9BBB7' }}>Duración</th>
+              </tr>
+            </thead>
+            <tbody>
+              {datosSorted.map((r, i) => {
+                const esFinde = DIAS_FIN_SEMANA.has(r.diaSemana.toLowerCase())
+                return (
+                  <tr key={`${r.fecha}|${r.camion_codigo}`} style={{ borderBottom: '1px solid #f9f9f9', background: i % 2 === 0 ? 'white' : '#fdfdfd' }}>
+                    <td className="px-3 py-2.5 text-xs font-medium whitespace-nowrap" style={{ color: '#1a1a1a' }}>{r.fecha}</td>
+                    <td className="px-3 py-2.5 text-xs font-semibold whitespace-nowrap"
+                      style={{ color: esFinde ? '#b45309' : '#254A96' }}>
+                      {r.diaSemana}
+                    </td>
+                    <td className="px-3 py-2.5 text-xs font-bold whitespace-nowrap" style={{ color: '#254A96' }}>{r.camion_codigo}</td>
+                    <td className="px-3 py-2.5 text-xs whitespace-nowrap" style={{ color: '#B9BBB7' }}>{r.sucursal}</td>
+                    <td className="px-3 py-2.5 text-xs whitespace-nowrap" style={{ color: '#666' }}>{r.chofer_nombre}</td>
+                    <td className="px-3 py-2.5 text-xs font-medium" style={{ color: '#1a1a1a' }}>{r.pedidos}</td>
+                    <td className="px-3 py-2.5 text-xs whitespace-nowrap" style={{ color: '#1a1a1a' }}>
+                      {r.kgUsados.toLocaleString('es-AR')}
+                    </td>
+                    <td className="px-3 py-2.5 text-xs whitespace-nowrap" style={{ color: '#1a1a1a' }}>{r.posUsadas}</td>
+                    <td className="px-3 py-2.5">
+                      <div className="flex items-center gap-1.5">
+                        <div className="w-12 h-2 rounded-full" style={{ background: '#f0f0f0' }}>
+                          <div className="h-2 rounded-full" style={{ width: `${Math.min(r.pctKg, 100)}%`, background: colorBarra(r.pctKg) }} />
+                        </div>
+                        <span className="text-xs font-semibold whitespace-nowrap" style={{ color: colorBarra(r.pctKg) }}>{r.pctKg}%</span>
+                      </div>
+                    </td>
+                    <td className="px-3 py-2.5">
+                      <div className="flex items-center gap-1.5">
+                        <div className="w-12 h-2 rounded-full" style={{ background: '#f0f0f0' }}>
+                          <div className="h-2 rounded-full" style={{ width: `${Math.min(r.pctPos, 100)}%`, background: colorBarra(r.pctPos) }} />
+                        </div>
+                        <span className="text-xs font-semibold whitespace-nowrap" style={{ color: colorBarra(r.pctPos) }}>{r.pctPos}%</span>
+                      </div>
+                    </td>
+                    <td className="px-3 py-2.5 text-xs whitespace-nowrap" style={{ color: '#B9BBB7' }}>
+                      {r.kmReal !== null ? `${r.kmReal} km` : '—'}
+                    </td>
+                    <td className="px-3 py-2.5 text-xs whitespace-nowrap" style={{ color: '#B9BBB7' }}>
+                      {formatHora(r.hora_inicio)}
+                    </td>
+                    <td className="px-3 py-2.5 text-xs whitespace-nowrap" style={{ color: '#B9BBB7' }}>
+                      {formatHora(r.hora_fin)}
+                    </td>
+                    <td className="px-3 py-2.5 text-xs whitespace-nowrap" style={{ color: '#B9BBB7' }}>
+                      {r.duracionMin !== null ? formatMinutos(r.duracionMin) : '—'}
                     </td>
                   </tr>
                 )

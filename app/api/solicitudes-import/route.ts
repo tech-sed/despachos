@@ -27,16 +27,54 @@ function normalizeSucursal(s: string) {
 }
 
 function parseDate(val: any): string | null {
-  if (!val) return null
+  if (val == null || val === '') return null
   try {
-    // Excel serial number
-    if (typeof val === 'number') {
-      const d = XLSX.SSF.parse_date_code(val)
-      return `${d.y}-${String(d.m).padStart(2,'0')}-${String(d.d).padStart(2,'0')}`
+    // JS Date object (cellDates: true)
+    if (val instanceof Date) {
+      if (isNaN(val.getTime())) return null
+      // Usar componentes locales para evitar desfase por timezone
+      const y = val.getFullYear()
+      const m = String(val.getMonth() + 1).padStart(2, '0')
+      const d = String(val.getDate()).padStart(2, '0')
+      return `${y}-${m}-${d}`
     }
-    const d = new Date(val)
-    if (isNaN(d.getTime())) return null
-    return d.toISOString().split('T')[0]
+    // Objeto fecha de XLSX ({ y, m, d, H, M, S })
+    if (typeof val === 'object' && 'y' in val && 'm' in val && 'd' in val) {
+      return `${val.y}-${String(val.m).padStart(2,'0')}-${String(val.d).padStart(2,'0')}`
+    }
+    // Serial numérico de Excel
+    if (typeof val === 'number' && val > 0) {
+      const d = XLSX.SSF.parse_date_code(val)
+      if (d?.y > 1900) return `${d.y}-${String(d.m).padStart(2,'0')}-${String(d.d).padStart(2,'0')}`
+    }
+    if (typeof val === 'string') {
+      const raw = val.trim().replace(/^["']|["']$/g, '') // quitar comillas si las hay
+      if (!raw) return null
+
+      // Quitar componente de hora si la hay (ej: "01-04-2026 00:00:00" → "01-04-2026")
+      const s = raw.split(/[\sT]/)[0]
+
+      // Formato DD/MM/YYYY o DD-MM-YYYY (argentino / ERP: día-mes-año)
+      const dmyMatch = s.match(/^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})$/)
+      if (dmyMatch) {
+        const [, d, m, y] = dmyMatch
+        return `${y}-${m.padStart(2,'0')}-${d.padStart(2,'0')}`
+      }
+
+      // Formato ISO YYYY-MM-DD (pasarlo directamente sin invertir)
+      const isoMatch = s.match(/^(\d{4})[\/\-\.](\d{2})[\/\-\.](\d{2})$/)
+      if (isoMatch) {
+        const [, y, m, d] = isoMatch
+        return `${y}-${m}-${d}`
+      }
+
+      // Fallback genérico
+      const d = new Date(s)
+      if (!isNaN(d.getTime())) {
+        return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`
+      }
+    }
+    return null
   } catch { return null }
 }
 
@@ -55,13 +93,23 @@ export async function POST(req: NextRequest) {
     if (!file) return NextResponse.json({ error: 'No se recibió archivo' }, { status: 400 })
 
     const buffer = await file.arrayBuffer()
-    const wb = XLSX.read(buffer, { type: 'array', cellDates: false })
+    const wb = XLSX.read(buffer, { type: 'array', cellDates: true })
 
     // Leer hoja de solicitudes
     const ws = wb.Sheets['Solicitudes de Despacho'] ?? wb.Sheets[wb.SheetNames[0]]
     const rows: any[] = XLSX.utils.sheet_to_json(ws)
 
     if (!rows.length) return NextResponse.json({ error: 'Hoja de solicitudes vacía' }, { status: 400 })
+
+    // Debug: devolver info de la primera fila para diagnosticar fechas
+    const primeraFila = rows[0]
+    const fechaRaw = primeraFila['fecha_despacho']
+    const fechaDebug = {
+      valor: fechaRaw,
+      tipo: typeof fechaRaw,
+      esDate: fechaRaw instanceof Date,
+      parseado: parseDate(fechaRaw),
+    }
 
     // Normalizar las solicitudes del Excel
     const solicitudes = rows.map(r => ({
@@ -91,15 +139,17 @@ export async function POST(req: NextRequest) {
     const cargados = solicitudes.filter(s => nvsEnApp.has(String(s.id_venta)))
     const noCargados = solicitudes.filter(s => !nvsEnApp.has(String(s.id_venta)))
 
-    // Si no es solo análisis, guardar en tabla solicitudes_importadas
+    // Si no es solo análisis, reemplazar TODA la tabla (borrar + insertar)
     if (!soloAnalizar) {
-      // Upsert por id
-      const toUpsert = solicitudes.map(s => ({
-        ...s,
-        importado_en: new Date().toISOString(),
-      }))
-      for (let i = 0; i < toUpsert.length; i += 500) {
-        await admin.from('solicitudes_importadas').upsert(toUpsert.slice(i, i + 500), { onConflict: 'id' })
+      // Borrar items primero (FK), luego solicitudes
+      await admin.from('solicitudes_importadas_items').delete().gte('id_solicitud', 0)
+      await admin.from('solicitudes_importadas').delete().gte('id', 0)
+
+      const now = new Date().toISOString()
+      const toInsert = solicitudes.map(s => ({ ...s, importado_en: now }))
+      for (let i = 0; i < toInsert.length; i += 500) {
+        const { error } = await admin.from('solicitudes_importadas').insert(toInsert.slice(i, i + 500))
+        if (error) return NextResponse.json({ error: error.message }, { status: 500 })
       }
     }
 
@@ -109,7 +159,7 @@ export async function POST(req: NextRequest) {
       const wsItems = wb.Sheets['items_solicitudes']
       const itemRows: any[] = XLSX.utils.sheet_to_json(wsItems)
       itemsCount = itemRows.length
-      const toUpsert = itemRows.map(r => ({
+      const toInsert = itemRows.map(r => ({
         id_solicitud: Number(r['id_solicitud']),
         id_venta: Number(r['id_venta']),
         id_producto: Number(r['id_producto']),
@@ -121,8 +171,9 @@ export async function POST(req: NextRequest) {
         cantidad_entregada: Number(r['cantidad_entregada'] ?? 0),
         hojas_de_ruta: String(r['hojas_de_ruta'] ?? ''),
       }))
-      for (let i = 0; i < toUpsert.length; i += 500) {
-        await admin.from('solicitudes_importadas_items').upsert(toUpsert.slice(i, i + 500))
+      for (let i = 0; i < toInsert.length; i += 500) {
+        const { error } = await admin.from('solicitudes_importadas_items').insert(toInsert.slice(i, i + 500))
+        if (error) return NextResponse.json({ error: error.message }, { status: 500 })
       }
     }
 
@@ -132,7 +183,8 @@ export async function POST(req: NextRequest) {
       cargados_en_app: cargados.length,
       no_cargados: noCargados.length,
       items: itemsCount,
-      solicitudes_sin_cargar: noCargados.slice(0, 200), // devolver primeras 200 para mostrar en UI
+      solicitudes_sin_cargar: noCargados.slice(0, 200),
+      _debug_fecha: fechaDebug, // temporal para diagnosticar formato de fecha
     })
   } catch (e: any) {
     return NextResponse.json({ error: e.message }, { status: 500 })
@@ -172,4 +224,17 @@ export async function GET(req: NextRequest) {
   }))
 
   return NextResponse.json(result)
+}
+
+// DELETE /api/solicitudes-import — borrar todos los datos importados
+export async function DELETE() {
+  const admin = getAdmin()
+  try {
+    await admin.from('solicitudes_importadas_items').delete().gte('id_solicitud', 0)
+    const { error } = await admin.from('solicitudes_importadas').delete().gte('id', 0)
+    if (error) return NextResponse.json({ error: error.message }, { status: 500 })
+    return NextResponse.json({ success: true })
+  } catch (e: any) {
+    return NextResponse.json({ error: e.message }, { status: 500 })
+  }
 }

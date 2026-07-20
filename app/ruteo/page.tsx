@@ -3,6 +3,7 @@
 import { useEffect, useState, useRef } from 'react'
 import { supabase } from '../supabase'
 import { useRouter } from 'next/navigation'
+import Link from 'next/link'
 import { logAuditoria } from '../lib/auditoria'
 import { tieneAcceso } from '../lib/permisos'
 import type { jsPDF as JsPDFType } from 'jspdf'
@@ -10,6 +11,7 @@ import type { jsPDF as JsPDFType } from 'jspdf'
 interface Pedido {
   id: string
   nv: string
+  id_despacho?: string | null
   cliente: string
   direccion: string
   sucursal: string
@@ -25,6 +27,7 @@ interface Pedido {
   telefono: string | null
   items?: { nombre: string; cantidad: number; unidad: string }[]
   tipo?: string
+  _esTransfer?: boolean
 }
 
 interface CamionDisponible {
@@ -60,6 +63,7 @@ export default function RuteoPage() {
   const [horaInicio, setHoraInicio] = useState<string | null>(null)
   const [horaFin, setHoraFin] = useState<string | null>(null)
   const [vueltasIniciadas, setVueltasIniciadas] = useState<Set<number>>(new Set())
+  const [vueltasTimings, setVueltasTimings] = useState<Record<number, { hora_inicio: string | null; hora_fin: string | null }>>({})
   const [kmRuta, setKmRuta] = useState<number | null>(null)
   const [guardandoRuta, setGuardandoRuta] = useState(false)
 
@@ -113,19 +117,22 @@ export default function RuteoPage() {
       }
 
       setDatosUsuario({ nombre: userData?.nombre ?? user.email ?? 'Chofer', rol: userData?.rol ?? '' })
-      if (userData?.sucursal) setFiltroSucursal(userData.sucursal)
+      // Solo aplicar filtro si la sucursal es una de las sucursales reales (no "TODAS" ni null)
+      if (userData?.sucursal && SUCURSALES.includes(userData.sucursal)) {
+        setFiltroSucursal(userData.sucursal)
+      }
 
       // Si es chofer, buscar el camión asignado para HOY en flota_dia
       if (userData?.rol === 'chofer') {
-        const { data: asignacion } = await supabase
+        const { data: asignaciones } = await supabase
           .from('flota_dia')
           .select('camion_codigo')
           .eq('fecha', hoy())
           .eq('chofer_id', user.id)
-          .single()
-        if (asignacion?.camion_codigo) {
-          setCamionSeleccionado(asignacion.camion_codigo)
-        }
+          .eq('activo', true)
+        // Tomar el primer camión activo asignado (no usar .single() para no romper con >1 resultado)
+        const camion = asignaciones?.[0]?.camion_codigo
+        if (camion) setCamionSeleccionado(camion)
       }
 
       setCargando(false)
@@ -152,6 +159,13 @@ export default function RuteoPage() {
     setContactosSoporte(data.contactos ?? [])
   }
 
+  // Normaliza cualquier formato de cod_vehiculo al canónico de camiones_flota
+  // Ej: 'ca 49' | 'CA49' | 'ca-49' → 'CA-49'
+  function normalizarCodigo(cod: string): string {
+    const stripped = cod.trim().toUpperCase().replace(/[-\s]+/g, '')
+    return stripped.replace(/^([A-Z]+)(\d+)$/, '$1-$2')
+  }
+
   const cargarCamionesDisponibles = async () => {
     // Traer camiones que tienen pedidos programados para esta fecha
     const { data: pedidosData } = await supabase
@@ -161,7 +175,20 @@ export default function RuteoPage() {
       .in('estado', ['programado', 'en_camino', 'entregado', 'rechazado'])
       .not('camion_id', 'is', null)
 
-    const codigos = [...new Set((pedidosData ?? []).map((p: any) => p.camion_id))]
+    // Transferencias: fecha_solicitada = fecha, o si es null → fecha_req = fecha
+    const { data: requerData } = await supabase
+      .from('requerimientos')
+      .select('cod_vehiculo')
+      .or(`fecha_solicitada.eq.${fecha},and(fecha_solicitada.is.null,fecha_req.eq.${fecha})`)
+      .in('estado', ['conf_stock', 'preparacion', 'en_transito', 'entregado', 'rechazado'])
+      .not('cod_vehiculo', 'is', null)
+
+    const codigosSet = new Set([
+      ...(pedidosData ?? []).map((p: any) => p.camion_id),
+      // Normalizar el formato antes de buscar en camiones_flota
+      ...(requerData ?? []).map((r: any) => normalizarCodigo(r.cod_vehiculo)),
+    ])
+    const codigos = [...codigosSet]
 
     if (codigos.length === 0) {
       setCamionesDisponibles([])
@@ -196,15 +223,19 @@ export default function RuteoPage() {
 
   const cargarInfoRuta = async () => {
     if (!camionSeleccionado) return
-    const { data } = await supabase
-      .from('flota_dia')
-      .select('hora_inicio, hora_fin, km_ruta')
-      .eq('fecha', fecha)
-      .eq('camion_codigo', camionSeleccionado)
-      .single()
-    setHoraInicio(data?.hora_inicio ?? null)
-    setHoraFin(data?.hora_fin ?? null)
-    setKmRuta(data?.km_ruta ?? null)
+    const [{ data: flotaData }, { data: timingsData }] = await Promise.all([
+      supabase.from('flota_dia').select('hora_inicio, hora_fin, km_ruta').eq('fecha', fecha).eq('camion_codigo', camionSeleccionado).single(),
+      supabase.from('vueltas_tiempos').select('vuelta, hora_inicio, hora_fin').eq('fecha', fecha).eq('camion_codigo', camionSeleccionado),
+    ])
+    setHoraInicio(flotaData?.hora_inicio ?? null)
+    setHoraFin(flotaData?.hora_fin ?? null)
+    setKmRuta(flotaData?.km_ruta ?? null)
+    const timings: Record<number, { hora_inicio: string | null; hora_fin: string | null }> = {}
+    for (const t of timingsData ?? []) timings[t.vuelta] = { hora_inicio: t.hora_inicio ?? null, hora_fin: t.hora_fin ?? null }
+    setVueltasTimings(timings)
+    // Vueltas con hora_inicio ya registrada = iniciadas (para restablecer estado al recargar)
+    const conInicio = (timingsData ?? []).filter((t: any) => t.hora_inicio).map((t: any) => t.vuelta as number)
+    if (conInicio.length > 0) setVueltasIniciadas(prev => new Set([...prev, ...conInicio]))
   }
 
   const iniciarRuta = async () => {
@@ -212,7 +243,7 @@ export default function RuteoPage() {
     setGuardandoRuta(true)
     const ahora = new Date().toISOString()
 
-    // Solo guardar hora_inicio en flota_dia la primera vez (primera vuelta del día)
+    // Guardar hora_inicio en flota_dia solo la primera vez (primera vuelta del día)
     if (!horaInicio) {
       await supabase.from('flota_dia')
         .update({ hora_inicio: ahora })
@@ -220,15 +251,36 @@ export default function RuteoPage() {
       setHoraInicio(ahora)
     }
 
+    // Guardar hora_inicio en vueltas_tiempos para esta vuelta específica
+    await supabase.from('vueltas_tiempos').upsert(
+      { camion_codigo: camionSeleccionado, fecha, vuelta: vueltaActiva, hora_inicio: ahora },
+      { onConflict: 'camion_codigo,fecha,vuelta' }
+    )
+    setVueltasTimings(prev => ({
+      ...prev,
+      [vueltaActiva!]: { hora_inicio: ahora, hora_fin: prev[vueltaActiva!]?.hora_fin ?? null },
+    }))
+
     // Actualizar SOLO los pedidos de esta vuelta por ID — no bulk filter
     const aIniciar = pedidos.filter(p => p.vuelta === vueltaActiva && p.estado === 'programado')
+    const aIniciarPedidos = aIniciar.filter(p => !p._esTransfer)
+    const aIniciarTransfers = aIniciar.filter(p => p._esTransfer)
     const errores = await Promise.all(
-      aIniciar.map(p =>
+      aIniciarPedidos.map(p =>
         fetch('/api/pedidos', {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ id: p.id, estado: 'en_camino' }),
         }).then(r => r.json())
+      )
+    )
+    await Promise.all(
+      aIniciarTransfers.map(p =>
+        fetch('/api/requerimientos', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: p.id, estado: 'en_transito' }),
+        })
       )
     )
     const hayError = errores.some(r => r.error)
@@ -245,14 +297,39 @@ export default function RuteoPage() {
   }
 
   const finalizarRuta = async () => {
-    if (!camionSeleccionado || horaFin) return
+    if (!camionSeleccionado) return
     setGuardandoRuta(true)
     const ahora = new Date().toISOString()
-    const { error } = await supabase.from('flota_dia')
-      .update({ hora_fin: ahora })
-      .eq('fecha', fecha).eq('camion_codigo', camionSeleccionado)
-    if (!error) { setHoraFin(ahora); showToast('Ruta finalizada') }
-    else showToast('Error al finalizar ruta', 'err')
+    const vueltaCerrada = vueltaActiva
+
+    const [flotaResult, timingResult] = await Promise.all([
+      // Actualizar hora_fin en flota_dia (día completo — última vuelta sobreescribe)
+      supabase.from('flota_dia').update({ hora_fin: ahora }).eq('fecha', fecha).eq('camion_codigo', camionSeleccionado),
+      // Guardar hora_fin en vueltas_tiempos para esta vuelta específica
+      vueltaCerrada
+        ? supabase.from('vueltas_tiempos').upsert(
+            {
+              camion_codigo: camionSeleccionado,
+              fecha,
+              vuelta: vueltaCerrada,
+              hora_inicio: vueltasTimings[vueltaCerrada]?.hora_inicio ?? null,
+              hora_fin: ahora,
+            },
+            { onConflict: 'camion_codigo,fecha,vuelta' }
+          )
+        : Promise.resolve({ error: null }),
+    ])
+
+    if (!flotaResult.error) {
+      setHoraFin(ahora)
+      if (vueltaCerrada) {
+        setVueltasTimings(prev => ({
+          ...prev,
+          [vueltaCerrada]: { hora_inicio: prev[vueltaCerrada]?.hora_inicio ?? null, hora_fin: ahora },
+        }))
+      }
+      showToast(vueltaCerrada ? `Vuelta ${vueltaCerrada} cerrada` : 'Ruta finalizada')
+    } else showToast('Error al finalizar ruta', 'err')
     setGuardandoRuta(false)
   }
 
@@ -261,9 +338,11 @@ export default function RuteoPage() {
   }
 
   function duracionRuta(): string | null {
-    if (!horaInicio) return null
-    const fin = horaFin ? new Date(horaFin) : new Date()
-    const min = Math.round((fin.getTime() - new Date(horaInicio).getTime()) / 60000)
+    const timingVuelta = vueltaActiva ? vueltasTimings[vueltaActiva] : null
+    const inicio = timingVuelta?.hora_inicio ?? horaInicio
+    if (!inicio) return null
+    const fin = timingVuelta?.hora_fin ? new Date(timingVuelta.hora_fin) : new Date()
+    const min = Math.round((fin.getTime() - new Date(inicio).getTime()) / 60000)
     const hs = Math.floor(min / 60); const m = min % 60
     return hs > 0 ? `${hs}h ${m}min` : `${m}min`
   }
@@ -287,7 +366,49 @@ export default function RuteoPage() {
       .order('vuelta')
       .order('orden_entrega', { ascending: true, nullsFirst: false })
 
-    const todosPedidos = data ?? []
+    // Buscar por todas las variantes de formato del código de camión
+    const camionVariants = [...new Set([
+      camionSeleccionado,
+      normalizarCodigo(camionSeleccionado),
+      camionSeleccionado.toLowerCase(),
+      camionSeleccionado.toLowerCase().replace(/-/g, ' '),
+      camionSeleccionado.replace(/-/g, ''),
+    ].filter(Boolean))]
+
+    const { data: transfersRaw } = await supabase
+      .from('requerimientos')
+      .select('*, requerimiento_items(*)')
+      .or(`fecha_solicitada.eq.${fecha},and(fecha_solicitada.is.null,fecha_req.eq.${fecha})`)
+      .in('cod_vehiculo', camionVariants)
+      .in('estado', ['conf_stock', 'preparacion', 'en_transito', 'entregado', 'rechazado'])
+      .order('vuelta')
+
+    const transfers: Pedido[] = (transfersRaw ?? []).map((t: any) => ({
+      id: t.id,
+      nv: t.nv ?? '',
+      cliente: `→ ${t.sucursal_destino}`,
+      direccion: t.sucursal_destino,
+      sucursal: t.sucursal_origen,
+      vuelta: t.vuelta ?? 1,
+      estado: t.estado === 'en_transito' ? 'en_camino' : (t.estado === 'entregado' || t.estado === 'rechazado') ? t.estado : 'programado',
+      estado_pago: '',
+      peso_total_kg: null,
+      notas: t.notas ?? null,
+      camion_id: t.cod_vehiculo,
+      orden_entrega: null,
+      latitud: null,
+      longitud: null,
+      telefono: null,
+      items: (t.requerimiento_items ?? []).map((it: any) => ({
+        nombre: it.nombre_producto,
+        cantidad: Number(it.cantidad_aprobada ?? it.cantidad_solicitada),
+        unidad: 'un.',
+      })),
+      tipo: 'transferencia',
+      _esTransfer: true,
+    }))
+
+    const todosPedidos = [...(data ?? []), ...transfers]
     setPedidos(todosPedidos)
 
     // Marcar vueltas que ya tienen actividad (en_camino o entregado)
@@ -432,6 +553,25 @@ export default function RuteoPage() {
       const res = await fetch('/api/entrega-parcial', { method: 'POST', body: formData })
       const data = await res.json()
       if (data.success) {
+        // Guardar detalle de entrega parcial con cantidades reales, nota y labels de fotos
+        fetch('/api/entrega-detalle', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            pedido_id: modalParcial.id,
+            id_despacho: modalParcial.id_despacho ?? null,
+            nv: modalParcial.nv,
+            foto_urls: data.foto_urls ?? [],
+            foto_labels: data.foto_labels ?? [],
+            motivo: data.nota || null,
+            items: (modalParcial.items ?? []).map((item, i) => ({
+              nombre: item.nombre,
+              cantidad_solicitada: item.cantidad,
+              cantidad_entregada: cantEntregadas[i] ?? item.cantidad,
+              unidad: item.unidad,
+            })),
+          }),
+        }).catch(() => {})
         setPedidos(prev => prev.map(p => p.id === modalParcial.id ? { ...p, estado: 'entregado_parcial' } : p))
         showToast('Entrega parcial registrada')
         setModalParcial(null); setCantEntregadas({}); setNotaParcial(''); setFotosParcial([])
@@ -444,6 +584,37 @@ export default function RuteoPage() {
 
   const confirmarEntrega = async (accion: 'entregar' | 'rechazar') => {
     if (!modalPedido) return
+
+    // Transfer: simplified confirmation, no photo required
+    if (modalPedido._esTransfer) {
+      setConfirmando(true)
+      try {
+        const nuevoEstado = accion === 'rechazar' ? 'rechazado' : 'entregado'
+        const patchBody: any = { id: modalPedido.id, estado: nuevoEstado }
+        if (nota) patchBody.notas = nota
+        if (accion === 'rechazar' && motivoRechazo) patchBody.notas = `✕ ${motivoRechazo}${nota ? ' | ' + nota : ''}`
+        const res = await fetch('/api/requerimientos', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(patchBody),
+        })
+        const data = await res.json()
+        if (data.success) {
+          setPedidos(prev => prev.map(p =>
+            p.id === modalPedido.id ? { ...p, estado: nuevoEstado, notas: patchBody.notas ?? p.notas } : p
+          ))
+          showToast(accion === 'rechazar' ? 'Transferencia rechazada' : 'Transferencia entregada')
+          cerrarModal()
+        } else {
+          setErrorModal(data.error ?? 'Error al guardar')
+        }
+      } catch (e: any) {
+        setErrorModal(e.message ?? 'Error al guardar')
+      }
+      setConfirmando(false)
+      return
+    }
+
     if (fotos.length === 0) { setErrorModal('Necesitás agregar al menos una foto antes de continuar.'); return }
     if (accion === 'rechazar' && !motivoRechazo.trim()) { setErrorModal('Ingresá el motivo del rechazo para continuar.'); return }
     setErrorModal('')
@@ -479,6 +650,25 @@ export default function RuteoPage() {
               ...(accion === 'rechazar' ? { motivo: motivoRechazo } : {}),
             })
         }
+        // Guardar detalle de entrega (completa o rechazada)
+        fetch('/api/entrega-detalle', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            pedido_id: modalPedido.id,
+            id_despacho: modalPedido.id_despacho ?? null,
+            nv: modalPedido.nv,
+            foto_urls: data.foto_urls ?? [],
+            foto_labels: data.foto_labels ?? [],
+            motivo: accion === 'rechazar' ? (motivoRechazo || null) : (data.nota || null),
+            items: (modalPedido.items ?? []).map(item => ({
+              nombre: item.nombre,
+              cantidad_solicitada: item.cantidad,
+              cantidad_entregada: accion === 'rechazar' ? 0 : item.cantidad,
+              unidad: item.unidad,
+            })),
+          }),
+        }).catch(() => {})
         setPedidos(prev => prev.map(p =>
           p.id === modalPedido.id ? { ...p, estado: nuevoEstado, notas: notasNuevas ?? p.notas } : p
         ))
@@ -517,11 +707,24 @@ export default function RuteoPage() {
     const tablasPorPedido = pedidosVuelta.map((p, idx) => {
       const items = p.items ?? []
       const num = p.orden_entrega ?? idx + 1
-      const header = `<td rowspan="${Math.max(items.length,1)}" style="vertical-align:top;font-weight:bold;width:24px">${num}</td><td rowspan="${Math.max(items.length,1)}" style="vertical-align:top;width:38%"><strong>${p.cliente}</strong><br><small style="color:#666">NV ${p.nv}</small><br><small style="color:#888">${p.direccion}</small></td>`
-      const filas = items.length === 0
-        ? `<tr>${header}<td colspan="3" style="color:#999">Sin items</td></tr>`
-        : items.map((item, i) => `<tr>${i === 0 ? header : ''}<td>${item.nombre}</td><td style="text-align:right;font-weight:bold;color:#254A96">${item.cantidad.toLocaleString('es-AR')}</td><td>${item.unidad}</td></tr>`).join('')
-      return `<table class="pedido"><thead><tr><th style="width:24px">#</th><th style="width:38%">Cliente / NV / Dirección</th><th>Material</th><th style="text-align:right">Cant.</th><th>U.</th></tr></thead><tbody>${filas}</tbody></table>`
+      const notaComercial = p.notas
+        ? p.notas.split(' | ').filter((s: string) => !s.trimStart().startsWith('⚡')).join(' | ').trim()
+        : ''
+      const totalFilas = Math.max(items.length, 1) + (notaComercial ? 1 : 0)
+      const headerCells = `<td rowspan="${totalFilas}" style="vertical-align:top;font-weight:bold;width:24px">${num}</td><td rowspan="${totalFilas}" style="vertical-align:top;width:38%"><strong>${p.cliente}</strong><br><small style="color:#666">NV ${p.nv}</small><br><small style="color:#888">${p.direccion}</small></td>`
+      const filaNote = notaComercial
+        ? `<tr><td colspan="3" style="background:#fef3c7;color:#b45309;padding:4px 7px"><strong>NOTA:</strong> ${notaComercial}</td></tr>`
+        : ''
+      const filaItems = items.length === 0
+        ? `<tr><td colspan="3" style="color:#999">Sin items</td></tr>`
+        : items.map((item: {nombre:string;cantidad:number;unidad:string}) => `<tr><td>${item.nombre}</td><td class="qty">${item.cantidad.toLocaleString('es-AR')}</td><td>${item.unidad}</td></tr>`).join('')
+      const primeraFila = notaComercial
+        ? `<tr>${headerCells}${filaNote.replace('<tr>', '').replace('</tr>', '')}</tr>`
+        : `<tr>${headerCells}${items.length === 0 ? '<td colspan="3" style="color:#999">Sin items</td>' : `<td>${items[0].nombre}</td><td class="qty">${items[0].cantidad.toLocaleString('es-AR')}</td><td>${items[0].unidad}</td>`}</tr>`
+      const filasResto = notaComercial
+        ? filaItems
+        : items.slice(1).map((item: {nombre:string;cantidad:number;unidad:string}) => `<tr><td>${item.nombre}</td><td class="qty">${item.cantidad.toLocaleString('es-AR')}</td><td>${item.unidad}</td></tr>`).join('')
+      return `<table class="pedido"><thead><tr><th style="width:24px">#</th><th style="width:38%">Cliente / NV / Dirección</th><th>Material</th><th class="qty" style="width:60px">Cant.</th><th style="width:36px">U.</th></tr></thead><tbody>${primeraFila}${filasResto}</tbody></table>`
     }).join('')
 
     win.document.write(`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8">
@@ -531,12 +734,12 @@ export default function RuteoPage() {
         h1{font-size:15px;margin:0 0 2px 0;color:#254A96}
         .meta{font-size:11px;color:#666;margin-bottom:14px}
         h2{font-size:12px;margin:14px 0 8px;color:#254A96;border-bottom:1px solid #ccc;padding-bottom:3px;text-transform:uppercase;letter-spacing:.5px}
-        table.pedido{width:100%;border-collapse:collapse;margin-bottom:20px;font-size:11px;page-break-inside:avoid}
+        table.pedido{width:100%;border-collapse:collapse;margin-bottom:20px;font-size:11px;page-break-inside:avoid;table-layout:fixed}
         thead{display:table-header-group}
         th{background:#254A96;color:#fff;padding:5px 7px;text-align:left}
-        td{padding:4px 7px;border-bottom:1px solid #eee}
-        table.totales{width:100%;border-collapse:collapse;font-size:11px}
-        .qty{text-align:right;font-weight:bold;color:#254A96}
+        td{padding:4px 7px;border-bottom:1px solid #eee;overflow:hidden}
+        table.totales{width:100%;border-collapse:collapse;font-size:11px;table-layout:fixed}
+        .qty{text-align:right;font-weight:bold;color:#254A96;white-space:nowrap}
         @media print{@page{margin:15mm}table.pedido{page-break-inside:avoid}}
       </style></head><body>
       <h1>🚛 ${camionSeleccionado} — Vuelta ${vueltaActiva} · ${VUELTA_LABEL[vueltaActiva!] ?? ''}</h1>
@@ -572,6 +775,9 @@ export default function RuteoPage() {
     const margenIzq = 14
     const ancho = 182
 
+    const pedidosEntrega = pedidosVuelta.filter(p => p.tipo !== 'retiro')
+    const pedidosRetiroPDF = pedidosVuelta.filter(p => p.tipo === 'retiro')
+
     // ── Encabezado ──
     doc.setFillColor(...azul)
     doc.rect(margenIzq, y, ancho, 14, 'F')
@@ -583,7 +789,10 @@ export default function RuteoPage() {
     doc.setTextColor(...gris)
     doc.setFontSize(9)
     doc.setFont('helvetica', 'normal')
-    doc.text(`${fechaStr} · ${pedidosVuelta.length} entregas`, margenIzq, y)
+    const subtitulo = pedidosRetiroPDF.length > 0
+      ? `${fechaStr} · ${pedidosEntrega.length} entregas · ${pedidosRetiroPDF.length} retiro${pedidosRetiroPDF.length !== 1 ? 's' : ''}`
+      : `${fechaStr} · ${pedidosEntrega.length} entregas`
+    doc.text(subtitulo, margenIzq, y)
     y += 8
 
     // ── Detalle por entrega ──
@@ -595,13 +804,18 @@ export default function RuteoPage() {
     doc.line(margenIzq, y + 1.5, margenIzq + ancho, y + 1.5)
     y += 6
 
-    pedidosVuelta.forEach((p, idx) => {
+    pedidosEntrega.forEach((p, idx) => {
       const items = p.items ?? []
       const filas = items.length === 0 ? [['Sin items', '', '']] : items.map(i => [i.nombre, i.cantidad.toLocaleString('es-AR'), i.unidad])
       const numEntrega = p.orden_entrega ?? idx + 1
+      // Solo notas cargadas por comercial (las automáticas empiezan con ⚡)
+      const notaComercial = p.notas
+        ? p.notas.split(' | ').filter(s => !s.trimStart().startsWith('⚡')).join(' | ').trim()
+        : ''
 
-      // Estimar altura para page break
-      const alturaEstimada = 14 + filas.length * 6
+      // Estimar altura para page break (nota puede tener varias líneas)
+      const lineasNota = notaComercial ? Math.ceil(notaComercial.length / 80) : 0
+      const alturaEstimada = 14 + (lineasNota > 0 ? lineasNota * 5 + 3 : 0) + filas.length * 6
       if (y + alturaEstimada > 270) { doc.addPage(); y = 15 }
 
       // Fila de cabecera del pedido
@@ -616,6 +830,29 @@ export default function RuteoPage() {
       doc.setFontSize(8)
       doc.text(`NV ${p.nv} · ${p.direccion ?? ''}`, margenIzq + 60, y + 5.5)
       y += 8
+
+      // Nota comercial (si existe)
+      if (notaComercial) {
+        const naranja: [number, number, number] = [180, 83, 9]
+        const prefijo = 'NOTA: '
+        doc.setFontSize(8)
+        doc.setFont('helvetica', 'normal')
+        const maxAncho = ancho - 6
+        const lineas = doc.splitTextToSize(`${prefijo}${notaComercial}`, maxAncho)
+        const altNota = lineas.length * 5 + 3
+        doc.setFillColor(255, 243, 199)
+        doc.rect(margenIzq, y, ancho, altNota, 'F')
+        doc.setTextColor(...naranja)
+        doc.setFont('helvetica', 'bold')
+        doc.text('NOTA: ', margenIzq + 2, y + 4.2)
+        doc.setFont('helvetica', 'normal')
+        const anchoNota = doc.getTextWidth('NOTA: ')
+        const lineasTexto = doc.splitTextToSize(notaComercial, maxAncho - anchoNota)
+        lineasTexto.forEach((linea: string, li: number) => {
+          doc.text(linea, margenIzq + 2 + (li === 0 ? anchoNota : 0), y + 4.2 + li * 5)
+        })
+        y += altNota
+      }
 
       // Filas de items
       filas.forEach((fila, i) => {
@@ -636,9 +873,9 @@ export default function RuteoPage() {
       y += 3
     })
 
-    // ── Totales generales ──
+    // ── Totales generales (solo entregas, no retiros) ──
     const totales: Record<string, { nombre: string; cantidad: number; unidad: string }> = {}
-    pedidosVuelta.forEach(p => {
+    pedidosEntrega.forEach(p => {
       ;(p.items ?? []).forEach(item => {
         if (!totales[item.nombre]) totales[item.nombre] = { nombre: item.nombre, cantidad: 0, unidad: item.unidad }
         totales[item.nombre].cantidad += item.cantidad
@@ -680,6 +917,57 @@ export default function RuteoPage() {
         doc.setTextColor(...gris)
         doc.text(t.unidad, margenIzq + ancho - 2, y + 4.2, { align: 'right' })
         y += 6
+      })
+    }
+
+    // ── Retiros de clientes ──
+    if (pedidosRetiroPDF.length > 0) {
+      if (y + 20 > 270) { doc.addPage(); y = 15 }
+      y += 4
+      const rojo: [number, number, number] = [229, 35, 34]
+      doc.setFillColor(...rojo)
+      doc.rect(margenIzq, y, ancho, 8, 'F')
+      doc.setTextColor(...blanco)
+      doc.setFontSize(10)
+      doc.setFont('helvetica', 'bold')
+      doc.text(`RETIRAR DE CLIENTES — ${pedidosRetiroPDF.length} parada${pedidosRetiroPDF.length !== 1 ? 's' : ''}`, margenIzq + 3, y + 5.5)
+      y += 10
+
+      pedidosRetiroPDF.forEach((p, idx) => {
+        const items = p.items ?? []
+        const filas = items.length === 0 ? [['Sin items', '', '']] : items.map((i: any) => [i.nombre, i.cantidad.toLocaleString('es-AR'), i.unidad])
+        const alturaEstimada = 8 + filas.length * 6
+        if (y + alturaEstimada > 270) { doc.addPage(); y = 15 }
+
+        const bgRetiro: [number, number, number] = [255, 240, 240]
+        doc.setFillColor(...bgRetiro)
+        doc.rect(margenIzq, y, ancho, 8, 'F')
+        doc.setTextColor(...rojo)
+        doc.setFontSize(9)
+        doc.setFont('helvetica', 'bold')
+        doc.text(`${idx + 1}. ${p.cliente}`, margenIzq + 2, y + 5.5)
+        doc.setFont('helvetica', 'normal')
+        doc.setTextColor(...gris)
+        doc.setFontSize(8)
+        doc.text(`NV ${p.nv} · ${p.direccion ?? ''}`, margenIzq + 60, y + 5.5)
+        y += 8
+
+        filas.forEach((fila: string[], i: number) => {
+          doc.setFillColor(i % 2 === 0 ? 255 : 252, i % 2 === 0 ? 248 : 248, i % 2 === 0 ? 248 : 248)
+          doc.rect(margenIzq, y, ancho, 6, 'F')
+          doc.setTextColor(30, 30, 30)
+          doc.setFontSize(8.5)
+          doc.setFont('helvetica', 'normal')
+          doc.text(fila[0], margenIzq + 4, y + 4.2)
+          doc.setFont('helvetica', 'bold')
+          doc.setTextColor(...rojo)
+          doc.text(fila[1], margenIzq + ancho - 20, y + 4.2, { align: 'right' })
+          doc.setFont('helvetica', 'normal')
+          doc.setTextColor(...gris)
+          doc.text(fila[2], margenIzq + ancho - 2, y + 4.2, { align: 'right' })
+          y += 6
+        })
+        y += 3
       })
     }
 
@@ -819,11 +1107,12 @@ export default function RuteoPage() {
           <div className="bg-white rounded-2xl w-full max-w-md p-6 space-y-4" style={{ maxHeight: '90vh', overflowY: 'auto' }}>
             <div className="flex justify-between items-start">
               <div>
-                <h3 className="font-bold text-base" style={{ color: '#254A96' }}>Registrar entrega</h3>
+                <h3 className="font-bold text-base" style={{ color: '#254A96' }}>{modalPedido._esTransfer ? 'Confirmar transferencia interna' : 'Registrar entrega'}</h3>
                 <p className="text-sm mt-0.5" style={{ color: '#B9BBB7' }}>{modalPedido.cliente}</p>
               </div>
               <button onClick={cerrarModal} className="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
             </div>
+            {modalPedido._esTransfer && <p className="text-xs px-2 py-1 rounded-lg" style={{background:'#e0f2fe',color:'#0369a1'}}>🏪 Transferencia interna — sin foto requerida</p>}
             <div className="rounded-xl p-3 text-sm" style={{ background: '#f4f4f3' }}>
               <p className="font-medium" style={{ color: '#1a1a1a' }}>{modalPedido.direccion}</p>
             </div>
@@ -837,7 +1126,8 @@ export default function RuteoPage() {
                 placeholder="Ej: Dejé en portería, firmó el encargado..." />
             </div>
 
-            {/* Fotos — obligatorias */}
+            {/* Fotos — obligatorias (solo para pedidos normales) */}
+            {!modalPedido._esTransfer && (
             <div>
               <label className="block text-xs font-medium mb-1.5" style={{ color: '#254A96' }}>
                 Foto <span style={{ color: '#E52322' }}>*</span>
@@ -874,6 +1164,7 @@ export default function RuteoPage() {
               <input ref={fileRef} type="file" accept="image/*" capture="environment"
                 multiple onChange={handleFoto} className="hidden" />
             </div>
+            )}
 
             {/* Motivo de rechazo — solo visible si se elige rechazar */}
             {accionModal === 'rechazar' && (
@@ -946,15 +1237,28 @@ export default function RuteoPage() {
                       <div key={i} className="rounded-xl p-3 border"
                         style={{ borderColor: pendiente > 0 ? '#fbbf24' : '#d1fae5', background: pendiente > 0 ? '#fffbeb' : '#f0fdf4' }}>
                         <p className="text-xs font-medium mb-2" style={{ color: '#1a1a1a' }}>{item.nombre}</p>
-                        <div className="flex items-center gap-3">
+                        <div className="flex items-center gap-2">
                           <button onClick={() => setCantEntregadas(prev => ({ ...prev, [i]: Math.max(0, (prev[i] ?? item.cantidad) - 1) }))}
-                            className="w-8 h-8 rounded-full text-base font-bold flex items-center justify-center"
+                            className="w-8 h-8 rounded-full text-base font-bold flex items-center justify-center shrink-0"
                             style={{ background: '#f4f4f3', color: '#666' }}>−</button>
-                          <span className="text-sm font-semibold flex-1 text-center" style={{ color: '#254A96' }}>
-                            {entregado} / {item.cantidad} {item.unidad}
-                          </span>
+                          <div className="flex items-center gap-1 flex-1 justify-center">
+                            <input
+                              type="text"
+                              inputMode="numeric"
+                              value={entregado}
+                              onChange={e => {
+                                const raw = e.target.value.replace(/[^\d]/g, '')
+                                const n = raw === '' ? 0 : Math.min(item.cantidad, Math.max(0, parseInt(raw)))
+                                setCantEntregadas(prev => ({ ...prev, [i]: n }))
+                              }}
+                              onFocus={e => e.target.select()}
+                              className="w-12 text-sm font-bold text-center rounded-lg border focus:outline-none focus:ring-2"
+                              style={{ color: '#254A96', borderColor: '#e8edf8', focusRingColor: '#254A96', padding: '4px' } as any}
+                            />
+                            <span className="text-xs" style={{ color: '#B9BBB7' }}>/ {item.cantidad} {item.unidad}</span>
+                          </div>
                           <button onClick={() => setCantEntregadas(prev => ({ ...prev, [i]: Math.min(item.cantidad, (prev[i] ?? item.cantidad) + 1) }))}
-                            className="w-8 h-8 rounded-full text-base font-bold flex items-center justify-center"
+                            className="w-8 h-8 rounded-full text-base font-bold flex items-center justify-center shrink-0"
                             style={{ background: '#f4f4f3', color: '#666' }}>+</button>
                           {pendiente > 0 && <span className="text-xs shrink-0" style={{ color: '#b45309' }}>Saldo: {pendiente}</span>}
                         </div>
@@ -1028,11 +1332,11 @@ export default function RuteoPage() {
         <div className="max-w-2xl mx-auto px-4 h-14 flex items-center justify-between">
           <div className="flex items-center gap-3">
             {datosUsuario?.rol !== 'chofer' && (
-              <button onClick={() => router.push('/dashboard')}
+              <Link href="/dashboard"
                 className="text-xs px-2 py-1.5 rounded-lg font-medium"
                 style={{ background: '#e8edf8', color: '#254A96' }}>
                 ← Volver
-              </button>
+              </Link>
             )}
             <img src="/logo.png" alt="Construyo al Costo" className="h-7 w-auto rounded-lg hidden sm:block" />
             <div>
@@ -1177,30 +1481,53 @@ export default function RuteoPage() {
                     ) : (
                       <div className="space-y-3">
                         <div className="grid grid-cols-3 gap-2 text-center">
-                          <div className="rounded-lg p-2" style={{ background: '#f4f4f3' }}>
-                            <p className="text-xs mb-0.5" style={{ color: '#B9BBB7' }}>Inicio</p>
-                            <p className="font-bold text-sm" style={{ color: '#254A96' }}>{formatHora(horaInicio!)}</p>
-                          </div>
-                          <div className="rounded-lg p-2" style={{ background: '#f4f4f3' }}>
-                            <p className="text-xs mb-0.5" style={{ color: '#B9BBB7' }}>Duración</p>
-                            <p className="font-bold text-sm" style={{ color: horaFin ? '#065f46' : '#254A96' }}>{duracionRuta()}</p>
-                          </div>
-                          <div className="rounded-lg p-2" style={{ background: '#f4f4f3' }}>
-                            <p className="text-xs mb-0.5" style={{ color: '#B9BBB7' }}>Velocidad</p>
-                            <p className="font-bold text-sm" style={{ color: '#254A96' }}>{minPorKm() ?? '—'}</p>
-                          </div>
+                          {(() => {
+                            const tvActiva = vueltaActiva ? vueltasTimings[vueltaActiva] : null
+                            const inicioMostrar = tvActiva?.hora_inicio ?? horaInicio
+                            const finMostrar = tvActiva?.hora_fin ?? null
+                            // Buscar vuelta anterior con fin registrado
+                            const vueltasConFin = Object.entries(vueltasTimings)
+                              .filter(([v, t]) => t.hora_fin && vueltaActiva && Number(v) < vueltaActiva)
+                              .sort((a, b) => Number(b[0]) - Number(a[0]))
+                            const prevVueltaFin = vueltasConFin[0]
+                            return (
+                              <>
+                                <div className="grid grid-cols-3 gap-2 text-center">
+                                  <div className="rounded-lg p-2" style={{ background: '#f4f4f3' }}>
+                                    <p className="text-xs mb-0.5" style={{ color: '#B9BBB7' }}>Inicio V{vueltaActiva}</p>
+                                    <p className="font-bold text-sm" style={{ color: '#254A96' }}>{inicioMostrar ? formatHora(inicioMostrar) : '—'}</p>
+                                  </div>
+                                  <div className="rounded-lg p-2" style={{ background: '#f4f4f3' }}>
+                                    <p className="text-xs mb-0.5" style={{ color: '#B9BBB7' }}>Duración</p>
+                                    <p className="font-bold text-sm" style={{ color: finMostrar ? '#065f46' : '#254A96' }}>{duracionRuta()}</p>
+                                  </div>
+                                  <div className="rounded-lg p-2" style={{ background: '#f4f4f3' }}>
+                                    <p className="text-xs mb-0.5" style={{ color: '#B9BBB7' }}>Velocidad</p>
+                                    <p className="font-bold text-sm" style={{ color: '#254A96' }}>{minPorKm() ?? '—'}</p>
+                                  </div>
+                                </div>
+                                {!vueltaActiva && horaFin ? (
+                                  <div className="text-center py-2 rounded-xl text-sm font-semibold" style={{ background: '#d1fae5', color: '#065f46' }}>
+                                    ✓ Ruta finalizada a las {formatHora(horaFin)}
+                                  </div>
+                                ) : (
+                                  <div className="space-y-1">
+                                    {prevVueltaFin && (
+                                      <p className="text-xs text-center" style={{ color: '#B9BBB7' }}>
+                                        V{prevVueltaFin[0]} cerrada a las {formatHora(prevVueltaFin[1].hora_fin!)}
+                                      </p>
+                                    )}
+                                    <button onClick={finalizarRuta} disabled={guardandoRuta}
+                                      className="w-full py-2.5 rounded-xl text-sm font-semibold text-white disabled:opacity-50"
+                                      style={{ background: '#E52322' }}>
+                                      {guardandoRuta ? 'Guardando...' : vueltaActiva ? `⏹ Cerrar vuelta ${vueltaActiva}` : '⏹ Finalizar ruta'}
+                                    </button>
+                                  </div>
+                                )}
+                              </>
+                            )
+                          })()}
                         </div>
-                        {horaFin ? (
-                          <div className="text-center py-2 rounded-xl text-sm font-semibold" style={{ background: '#d1fae5', color: '#065f46' }}>
-                            ✓ Ruta finalizada a las {formatHora(horaFin)}
-                          </div>
-                        ) : (
-                          <button onClick={finalizarRuta} disabled={guardandoRuta}
-                            className="w-full py-2.5 rounded-xl text-sm font-semibold text-white disabled:opacity-50"
-                            style={{ background: '#E52322' }}>
-                            {guardandoRuta ? 'Guardando...' : '⏹ Finalizar ruta'}
-                          </button>
-                        )}
                       </div>
                     )}
                   </div>
@@ -1282,20 +1609,22 @@ export default function RuteoPage() {
                       const parcial = pedido.estado === 'entregado_parcial'
                       const finalizado = entregado || rechazado || parcial
                       const esRetiro = pedido.tipo === 'retiro'
+                      const esTransfer = pedido._esTransfer === true
                       return (
                         <div key={pedido.id}
                           className="rounded-xl shadow-sm overflow-hidden"
-                          style={{ opacity: finalizado ? 0.75 : 1, border: `2px solid ${entregado ? '#d1fae5' : rechazado ? '#fde8e8' : parcial ? '#fef3c7' : esRetiro ? '#99f6e4' : '#f0f0f0'}`, background: esRetiro ? '#f0fdfa' : 'white' }}>
+                          style={{ opacity: finalizado ? 0.75 : 1, border: `2px solid ${entregado ? '#d1fae5' : rechazado ? '#fde8e8' : parcial ? '#fef3c7' : esTransfer ? '#bfdbfe' : esRetiro ? '#99f6e4' : '#f0f0f0'}`, background: esTransfer ? '#eff6ff' : esRetiro ? '#f0fdfa' : 'white' }}>
                           <div className="px-4 py-3 flex items-center justify-between"
-                            style={{ background: entregado ? '#f0fdf4' : rechazado ? '#fff5f5' : parcial ? '#fffbeb' : esRetiro ? '#ccfbf1' : 'white', borderBottom: '1px solid #f4f4f3' }}>
+                            style={{ background: entregado ? '#f0fdf4' : rechazado ? '#fff5f5' : parcial ? '#fffbeb' : esTransfer ? '#dbeafe' : esRetiro ? '#ccfbf1' : 'white', borderBottom: '1px solid #f4f4f3' }}>
                             <div className="flex items-center gap-3">
                               <div className="w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold text-white shrink-0"
-                                style={{ background: entregado ? '#10b981' : rechazado ? '#E52322' : parcial ? '#f59e0b' : esRetiro ? '#0d9488' : '#254A96' }}>
-                                {entregado ? '✓' : rechazado ? '✕' : parcial ? '½' : esRetiro ? '🔄' : (pedido.orden_entrega ?? idx + 1)}
+                                style={{ background: entregado ? '#10b981' : rechazado ? '#E52322' : parcial ? '#f59e0b' : esTransfer ? '#0369a1' : esRetiro ? '#0d9488' : '#254A96' }}>
+                                {entregado ? '✓' : rechazado ? '✕' : parcial ? '½' : esTransfer ? '↔' : esRetiro ? '🔄' : (pedido.orden_entrega ?? idx + 1)}
                               </div>
                               <div>
                                 <div className="flex items-center gap-1.5">
-                                  <p className="font-semibold text-sm" style={{ color: esRetiro ? '#0f766e' : '#254A96' }}>{pedido.cliente}</p>
+                                  <p className="font-semibold text-sm" style={{ color: esTransfer ? '#1d4ed8' : esRetiro ? '#0f766e' : '#254A96' }}>{pedido.cliente}</p>
+                                  {esTransfer && <span className="text-xs px-1.5 py-0.5 rounded font-medium" style={{ background: '#dbeafe', color: '#1d4ed8' }}>TRANSFER</span>}
                                   {esRetiro && <span className="text-xs px-1.5 py-0.5 rounded font-medium" style={{ background: '#99f6e4', color: '#0f766e' }}>RETIRO</span>}
                                 </div>
                                 {pedido.nv && <p className="text-xs" style={{ color: '#B9BBB7' }}>NV {pedido.nv}</p>}
@@ -1314,7 +1643,7 @@ export default function RuteoPage() {
                               </div>
                             )}
                             <div>
-                              <p className="text-xs mb-0.5" style={{ color: '#B9BBB7' }}>{esRetiro ? 'Lugar de retiro' : 'Dirección'}</p>
+                              <p className="text-xs mb-0.5" style={{ color: '#B9BBB7' }}>{esTransfer ? 'Destino' : esRetiro ? 'Lugar de retiro' : 'Dirección'}</p>
                               <p className="text-sm font-medium" style={{ color: '#1a1a1a' }}>{pedido.direccion}</p>
                             </div>
                             {pedido.telefono && !finalizado && (
@@ -1354,22 +1683,26 @@ export default function RuteoPage() {
                             {!finalizado && (
                               <div className="space-y-2 pt-1">
                                 <div className="flex gap-2">
-                                  <button onClick={() => abrirMaps(pedido)}
-                                    className="flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-medium border"
-                                    style={{ borderColor: '#e8edf8', color: '#254A96', background: '#f9f9f9' }}>
-                                    🗺️ Maps
-                                  </button>
+                                  {!esTransfer && (
+                                    <button onClick={() => abrirMaps(pedido)}
+                                      className="flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-medium border"
+                                      style={{ borderColor: '#e8edf8', color: '#254A96', background: '#f9f9f9' }}>
+                                      🗺️ Maps
+                                    </button>
+                                  )}
                                   <button onClick={() => setModalPedido(pedido)}
                                     className="flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-semibold text-white"
                                     style={{ background: '#254A96' }}>
                                     ✓ Confirmar
                                   </button>
                                 </div>
-                                <button onClick={() => abrirModalParcial(pedido)}
-                                  className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-medium"
-                                  style={{ background: '#fef3c7', color: '#92400e', border: '1px solid #fbbf24' }}>
-                                  📦 Entrega parcial
-                                </button>
+                                {!esTransfer && (
+                                  <button onClick={() => abrirModalParcial(pedido)}
+                                    className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-medium"
+                                    style={{ background: '#fef3c7', color: '#92400e', border: '1px solid #fbbf24' }}>
+                                    📦 Entrega parcial
+                                  </button>
+                                )}
                               </div>
                             )}
                             {finalizado && pedido.notas && (

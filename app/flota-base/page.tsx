@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react'
 import { supabase } from '../supabase'
 import { useRouter } from 'next/navigation'
+import Link from 'next/link'
 import { logAuditoria } from '../lib/auditoria'
 
 const SUCURSALES = ['LP520', 'LP139', 'Guernica', 'Cañuelas', 'Pinamar']
@@ -26,6 +27,7 @@ interface Camion {
   volcador: boolean
   activo: boolean
   chofer_id_default: string
+  km_max_dia: number
 }
 
 export default function FlotaBasePage() {
@@ -41,10 +43,10 @@ export default function FlotaBasePage() {
   const [userId, setUserId] = useState('')
   const [userNombre, setUserNombre] = useState('')
   const [nuevoCamion, setNuevoCamion] = useState({
-    codigo: '', tipo_unidad: 'Camión', sucursal: 'LP520',
+    codigo: '', tipo_unidad: 'HIDROGRUA', sucursal: 'LP520',
     pos_caja: 10, pos_acoplado: 0, posiciones_total: 10, tonelaje_max_kg: 5000,
     grua_hidraulica: false, volcador: false, activo: true,
-    chofer_id_default: '',
+    chofer_id_default: '', km_max_dia: 200,
   })
 
   const showToast = (msg: string, tipo: 'ok' | 'err' = 'ok') => {
@@ -95,6 +97,7 @@ export default function FlotaBasePage() {
       volcador: c.volcador,
       activo: c.activo,
       chofer_id_default: c.chofer_id_default || null,
+      km_max_dia: c.km_max_dia ?? 200,
     }).eq('codigo', c.codigo)
 
     if (error) {
@@ -140,7 +143,7 @@ export default function FlotaBasePage() {
       showToast(`Camión ${nuevoCamion.codigo.toUpperCase()} creado`)
       if (userId) logAuditoria(userId, userNombre, 'Creó camión', 'Flota Base', { codigo: nuevoCamion.codigo.trim().toUpperCase(), tipo_unidad: nuevoCamion.tipo_unidad, sucursal: nuevoCamion.sucursal, posiciones_total: posTotal, tonelaje_max_kg: nuevoCamion.tonelaje_max_kg })
       setMostrarNuevo(false)
-      setNuevoCamion({ codigo: '', tipo_unidad: 'Camión', sucursal: 'LP520', pos_caja: 10, pos_acoplado: 0, posiciones_total: 10, tonelaje_max_kg: 5000, grua_hidraulica: false, volcador: false, activo: true, chofer_id_default: '' })
+      setNuevoCamion({ codigo: '', tipo_unidad: 'HIDROGRUA', sucursal: 'LP520', pos_caja: 10, pos_acoplado: 0, posiciones_total: 10, tonelaje_max_kg: 5000, grua_hidraulica: false, volcador: false, activo: true, chofer_id_default: '', km_max_dia: 200 })
       cargar()
     }
     setGuardando(false)
@@ -167,11 +170,11 @@ export default function FlotaBasePage() {
       <nav className="bg-white border-b sticky top-0 z-40" style={{ borderColor: '#e8edf8' }}>
         <div className="max-w-4xl mx-auto px-4 md:px-6 h-14 flex items-center justify-between">
           <div className="flex items-center gap-4">
-            <button onClick={() => router.push('/dashboard')}
+            <Link href="/dashboard"
               className="flex items-center gap-1.5 text-sm font-medium px-3 py-1.5 rounded-lg"
               style={{ color: '#254A96', background: '#e8edf8' }}>
               ← Volver
-            </button>
+            </Link>
             <img src="/logo.png" alt="Construyo al Costo" className="h-7 w-auto rounded-lg hidden sm:block" />
             <div>
               <span className="font-semibold text-sm" style={{ color: '#254A96' }}>Flota base</span>
@@ -285,6 +288,18 @@ export default function FlotaBasePage() {
                 </select>
               </div>
 
+              <div>
+                <label className="block text-xs font-semibold mb-1" style={{ color: '#254A96' }}>Km máx/día</label>
+                <input
+                  type="number" min="50" max="600" step="10"
+                  value={nuevoCamion.km_max_dia}
+                  onChange={e => setNuevoCamion(p => ({ ...p, km_max_dia: parseInt(e.target.value) || 200 }))}
+                  className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none"
+                  style={{ borderColor: '#e8edf8' }}
+                />
+                <p className="text-xs mt-0.5" style={{ color: '#B9BBB7' }}>Default: 200 km</p>
+              </div>
+
               <div className="flex items-center gap-6 py-1">
                 <label className="flex items-center gap-2 cursor-pointer">
                   <input type="checkbox" checked={nuevoCamion.grua_hidraulica}
@@ -376,6 +391,9 @@ export default function FlotaBasePage() {
                               <span>⚖️ {(c.tonelaje_max_kg / 1000).toFixed(1)}tn</span>
                               {c.grua_hidraulica && <span>🏗️ Grúa</span>}
                               {c.volcador && <span>🔄 Volc.</span>}
+                              {c.km_max_dia && c.km_max_dia !== 200 && (
+                                <span style={{ color: '#6b7280' }}>🛣 {c.km_max_dia}km/día</span>
+                              )}
                               {choferDefault && (
                                 <span style={{ color: colors.header }}>👤 {choferDefault.nombre}</span>
                               )}
@@ -396,17 +414,33 @@ export default function FlotaBasePage() {
                       {/* Formulario edición */}
                       {editando && (
                         <div className="px-4 py-4 space-y-4" style={{ borderTop: `1px solid ${colors.bg}` }}>
-                          <div>
-                            <label className="block text-xs font-semibold mb-1.5" style={{ color: '#254A96' }}>
-                              Sucursal base
-                            </label>
-                            <select
-                              value={c.sucursal}
-                              onChange={e => actualizar(c.codigo, 'sucursal', e.target.value)}
-                              className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none"
-                              style={{ borderColor: '#e8edf8' }}>
-                              {SUCURSALES.map(s => <option key={s} value={s}>{s}</option>)}
-                            </select>
+                          <div className="grid grid-cols-2 gap-4">
+                            <div>
+                              <label className="block text-xs font-semibold mb-1.5" style={{ color: '#254A96' }}>
+                                Sucursal base
+                              </label>
+                              <select
+                                value={c.sucursal}
+                                onChange={e => actualizar(c.codigo, 'sucursal', e.target.value)}
+                                className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none"
+                                style={{ borderColor: '#e8edf8' }}>
+                                {SUCURSALES.map(s => <option key={s} value={s}>{s}</option>)}
+                              </select>
+                            </div>
+                            <div>
+                              <label className="block text-xs font-semibold mb-1.5" style={{ color: '#254A96' }}>
+                                Tipo de unidad
+                              </label>
+                              <select
+                                value={c.tipo_unidad}
+                                onChange={e => actualizar(c.codigo, 'tipo_unidad', e.target.value)}
+                                className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none"
+                                style={{ borderColor: '#e8edf8' }}>
+                                {['HIDROGRUA','HIDROGRUA+TRAILER','HIDROGRUA+VOLCADOR','SEMI','SEMI ALQUILADO','Camioneta'].map(t => (
+                                  <option key={t} value={t}>{t}</option>
+                                ))}
+                              </select>
+                            </div>
                           </div>
 
                         <div className="grid grid-cols-2 gap-4">
@@ -451,6 +485,19 @@ export default function FlotaBasePage() {
                               <p className="text-xs mt-1" style={{ color: '#B9BBB7' }}>
                                 = {(c.tonelaje_max_kg / 1000).toFixed(2)} tn
                               </p>
+                            </div>
+                            <div>
+                              <label className="block text-xs font-semibold mb-1.5" style={{ color: '#254A96' }}>
+                                Km máx/día
+                              </label>
+                              <input
+                                type="number" min="50" max="600" step="10"
+                                value={c.km_max_dia ?? 200}
+                                onChange={e => actualizar(c.codigo, 'km_max_dia', parseInt(e.target.value) || 200)}
+                                className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none"
+                                style={{ borderColor: '#e8edf8' }}
+                              />
+                              <p className="text-xs mt-1" style={{ color: '#B9BBB7' }}>Para estimar vueltas</p>
                             </div>
                           </div>
 

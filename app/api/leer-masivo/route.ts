@@ -16,7 +16,7 @@ Para cada solicitud extraé:
   "longitud": número o null,
   "horario": "Mañana" o "Tarde",
   "prioridad_texto": "Normal" o "Alta" o "Urgente",
-  "productos": [{"descripcion": "nombre exacto del producto", "cantidad": número}]
+  "productos": [{"descripcion": "nombre del producto sin prefijos numéricos (ej: si dice '1.Arena en bolson' devolvé 'Arena en bolson')", "cantidad": número}]
 }
 
 No incluyas en productos los que tengan "Transporte" en el nombre.
@@ -67,6 +67,14 @@ export async function POST(request: NextRequest) {
     const texto = response.content[0].type === 'text' ? response.content[0].text : ''
     const limpio = texto.replace(/```json\n?|```\n?/g, '').trim()
     const solicitudes = JSON.parse(limpio)
+
+    if (Array.isArray(solicitudes)) {
+      for (const sol of solicitudes) {
+        if (Array.isArray(sol.productos)) {
+          sol.productos = sol.productos.map((p: any) => ({ ...p, descripcion: typeof p.descripcion === 'string' ? p.descripcion.toUpperCase() : p.descripcion }))
+        }
+      }
+    }
 
     return NextResponse.json({ success: true, solicitudes })
   } catch (error: any) {

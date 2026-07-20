@@ -1,13 +1,14 @@
 'use client'
 
-import { useRouter, useSearchParams } from 'next/navigation'
+import { useSearchParams } from 'next/navigation'
+import Link from 'next/link'
 import { useEffect, useState, useRef, Suspense } from 'react'
 import { supabase } from '@/app/supabase'
 import { puedeEditar } from '@/app/lib/permisos'
 import { logAuditoria } from '@/app/lib/auditoria'
 
 interface Pedido {
-  id: string; nv: string; cliente: string; direccion: string; sucursal: string
+  id: string; nv: string; id_despacho?: string | null; cliente: string; direccion: string; sucursal: string
   fecha_entrega: string; vuelta: number; estado: string; estado_pago: string; peso_total_kg: number | null
   volumen_total_m3: number | null; pedido_grande?: boolean; tipo?: string
   notas: string | null; camion_id: string | null; orden_entrega: number | null
@@ -31,8 +32,10 @@ const VUELTAS = [
   { num: 4,  label: 'V4',             horario: '15:00–17:00' },
   { num: 5,  label: 'DHora',          horario: 'Después de hora' },
   { num: -1, label: 'Fuera de prog.', horario: '' },
+  { num: -2, label: '🔄 Transferencias', horario: '' },
 ]
 const VUELTA_FUERA = -1
+const VUELTA_TRANSFERENCIAS = -2
 const PAGO_COLOR: Record<string, string> = {
   cobrado: 'bg-green-100 text-green-800', cuenta_corriente: 'bg-blue-100 text-blue-800',
   pendiente_cobro: 'bg-yellow-100 text-yellow-800', pago_en_obra: 'bg-orange-100 text-orange-800',
@@ -42,6 +45,7 @@ const PAGO_LABEL: Record<string, string> = {
 }
 
 function hoy() { return new Date().toISOString().split('T')[0] }
+function esSabado(fecha: string) { return new Date(fecha + 'T12:00:00').getDay() === 6 }
 
 // Hora de corte para cada vuelta: si ya pasó ese horario, la vuelta no está disponible para hoy
 // V4 y "después de hora" no tienen corte — siempre disponibles para emergencias
@@ -53,14 +57,19 @@ const TODAS_VUELTAS = [
   { num: 4, label: 'Vuelta 4 (15–17h)' },
   { num: 5, label: 'Después de hora' },
 ]
+// Sábados: solo V1, V2 y V5 (sin V3 ni V4)
+const VUELTAS_SABADO = new Set([3, 4])
 function vueltasDisponibles(fecha: string): number[] {
-  if (fecha !== hoy()) return TODAS_VUELTAS.map(v => v.num)
+  const todas = TODAS_VUELTAS.map(v => v.num)
+  const sinSabado = esSabado(fecha) ? todas.filter(v => !VUELTAS_SABADO.has(v)) : todas
+  if (fecha !== hoy()) return sinSabado
   const horaActual = new Date().getHours()
-  return TODAS_VUELTAS.map(v => v.num).filter(v => !(v in VUELTA_CORTE) || horaActual < VUELTA_CORTE[v])
+  return sinSabado.filter(v => !(v in VUELTA_CORTE) || horaActual < VUELTA_CORTE[v])
 }
-function pesoColumna(ps: Pedido[]) { return ps.reduce((a, p) => a + (p.peso_total_kg ?? 0), 0) }
-function posColumna(ps: Pedido[]) { return ps.reduce((a, p) => a + (p.volumen_total_m3 ?? 0), 0) }
-function pct(peso: number, max: number) { return max === 0 ? 0 : Math.min(100, Math.round(peso / max * 100)) }
+const ESTADOS_ACTIVOS = new Set(['pendiente', 'programado'])
+function pesoColumna(ps: Pedido[]) { return ps.filter(p => ESTADOS_ACTIVOS.has(p.estado)).reduce((a, p) => a + (p.peso_total_kg ?? 0), 0) }
+function posColumna(ps: Pedido[]) { return ps.filter(p => ESTADOS_ACTIVOS.has(p.estado)).reduce((a, p) => a + (p.volumen_total_m3 ?? 0), 0) }
+function pct(peso: number, max: number) { return max === 0 ? 0 : Math.round(peso / max * 100) }
 function colorBarra(p: number) { return p >= 90 ? '#E52322' : p >= 70 ? '#f59e0b' : '#10b981' }
 
 function localidadDeDireccion(dir: string): string {
@@ -97,6 +106,66 @@ function localidadDeDireccion(dir: string): string {
   return ''
 }
 
+// Extrae el nombre del barrio cerrado de una dirección.
+// Ej: "Calle Los Aromos 123, San Jorge, Canning, Buenos Aires" → "san jorge"
+// Busca el segmento sin número que NO sea la última parte (que suele ser ciudad/provincia).
+function nombreBarrioCerrado(dir: string): string {
+  if (!dir) return ''
+  const SKIP = /^(buenos aires|córdoba|cordoba|santa fe|mendoza|prov\.|pcia\.|argentina|bs\.? ?as?\.?)$/i
+  const parts = dir.split(',').map(s => s.trim()).filter(Boolean)
+  // Candidatos: segmentos sin números, no provincia/país, longitud razonable
+  const candidates = parts.filter(p => !/\d/.test(p) && !SKIP.test(p) && p.length > 2 && p.length < 50)
+  // El nombre del barrio suele ser el penúltimo segmento (antes de la ciudad)
+  // Si hay al menos 2 candidatos tomamos el anteúltimo; si hay 1 lo usamos igual
+  const raw = candidates.length >= 2 ? candidates[candidates.length - 2] : candidates[candidates.length - 1]
+  if (!raw) return ''
+  return raw.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim()
+}
+
+// Agrupa pedidos por proximidad geográfica (< 15 km), mismo cliente, misma dirección o mismo barrio cerrado.
+// Se usa tanto en el algoritmo como en el UI para mostrar feedback al usuario.
+function buildClusters(pedidos: Pedido[]): Pedido[][] {
+  // Normaliza tildes ("Martín" → "martin"), puntuación y espacios
+  const normStr = (s: string) => s.toLowerCase()
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .replace(/[.,\-#°]/g, ' ').replace(/\s+/g, ' ').trim()
+  // Para clientes también quita puntos en siglas: "S.R.L." → "srl"
+  const normCliente = (c: string) => c.toLowerCase()
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .replace(/\./g, '').replace(/[,\-#°]/g, ' ').replace(/\s+/g, ' ').trim()
+  const n = pedidos.length
+  const parent = Array.from({ length: n }, (_, i) => i)
+  function find(i: number): number { return parent[i] === i ? i : (parent[i] = find(parent[i])) }
+  function union(i: number, j: number) { parent[find(i)] = find(j) }
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      const a = pedidos[i], b = pedidos[j]
+      // Mismo barrio cerrado (nombre extraído de la dirección) → siempre juntos
+      // "San Jorge, Canning" ≠ "Saint Thomas, Canning" → no se mezclan
+      if (a.barrio_cerrado && b.barrio_cerrado) {
+        const ba = nombreBarrioCerrado(a.direccion)
+        const bb = nombreBarrioCerrado(b.direccion)
+        if (ba && bb && ba === bb) { union(i, j); continue }
+      }
+      // Misma dirección normalizada (incluyendo tildes) → siempre juntos
+      if (a.direccion && b.direccion && normStr(a.direccion) === normStr(b.direccion)) { union(i, j); continue }
+      // Mismo cliente (normalizado) → juntar solo si están a < 2 km entre sí
+      const tienenCoords = a.latitud && a.longitud && b.latitud && b.longitud
+      if (a.cliente && b.cliente && normCliente(a.cliente) === normCliente(b.cliente)) {
+        if (tienenCoords && distanciaKm(a.latitud!, a.longitud!, b.latitud!, b.longitud!) < 2) union(i, j)
+        continue
+      }
+      // Coordenadas a < 15 km → misma zona/ciudad
+      if (tienenCoords && distanciaKm(a.latitud!, a.longitud!, b.latitud!, b.longitud!) < 15) union(i, j)
+    }
+  }
+  const groups = new Map<number, Pedido[]>()
+  for (let i = 0; i < n; i++) {
+    const r = find(i); if (!groups.has(r)) groups.set(r, []); groups.get(r)!.push(pedidos[i])
+  }
+  return Array.from(groups.values())
+}
+
 function sugerirAsignacion(sin: Pedido[], camiones: Camion[], ya: Pedido[], sucursal: string): Record<string, string | null> {
   const deposito = DEPOSITOS[sucursal] ?? { lat: -34.9205, lng: -57.9536 }
   const acum: Record<string, number> = {}
@@ -109,110 +178,240 @@ function sugerirAsignacion(sin: Pedido[], camiones: Camion[], ya: Pedido[], sucu
   // Tracking por camión: true = tiene pedidos "largo" (chapa/perfil/tubo/caño), false = tiene pedidos no-largo, undefined = vacío
   // Hierro normal (barra/malla/vigueta) NO es "largo" y puede mezclarse libremente con pallets/bolsones
   const camionTieneLargo: Record<string, boolean | undefined> = {}
+  // Zonas (localidades) que ya tiene cada camión: { camionCodigo: { localidad: cantPedidos } }
+  const camionZonas: Record<string, Record<string, number>> = {}
 
   const HIERRO_KEYWORDS = ['hierro', 'barra', 'varilla', 'malla', 'vigueta', 'alambre', 'pretensado', 'armadura', 'chapa', 'perfil', 'caño', 'tubo', 'canal', 'angulo', 'ángulo', 'zingueria', 'upn', 'ipn']
-  // Materiales largos que NO se pueden mezclar con pallets/bolsones
+  // Materiales largos que NO se pueden mezclar con pallets/bolsones (estructurales/metálicos)
   const LARGO_KEYWORDS = ['chapa', 'perfil', 'caño', 'tubo', 'canal', 'angulo', 'ángulo', 'zingueria', 'upn', 'ipn']
+  // Excluir cañerías sanitarias/pluviales de PVC: físicamente son largas pero viajan con cualquier material
+  const LARGO_EXCL = ['cloacal', 'pluvial', 'sanitario', 'desague', 'desagüe']
 
   function esLargoPedido(items: { nombre: string }[]) {
-    return items.length > 0 && items.some(it => LARGO_KEYWORDS.some(kw => it.nombre.toLowerCase().includes(kw)))
+    return items.length > 0 && items.some(it => {
+      const nombre = it.nombre.toLowerCase()
+      if (LARGO_EXCL.some(ex => nombre.includes(ex))) return false
+      return LARGO_KEYWORDS.some(kw => nombre.includes(kw))
+    })
+  }
+
+  // Normalizar dirección/texto (quita tildes, puntuación y espacios extra)
+  function normDir(dir: string): string {
+    return dir.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[.,\-#°]/g, ' ').replace(/\s+/g, ' ').trim()
+  }
+
+  // ¿Dos pedidos van al mismo lugar? (misma dirección normalizada O coords a < 300 m)
+  function sonColocados(a: Pedido, b: Pedido): boolean {
+    if (a.direccion && b.direccion && normDir(a.direccion) === normDir(b.direccion)) return true
+    if (a.latitud && a.longitud && b.latitud && b.longitud) {
+      return distanciaKm(a.latitud, a.longitud, b.latitud, b.longitud) < 0.3
+    }
+    return false
+  }
+
+  // Zona de un pedido (localidad ya precalculada o extraída de la dirección)
+  function zonaPedido(p: Pedido): string {
+    return p.localidad || localidadDeDireccion(p.direccion) || '__sin_zona__'
   }
 
   // Pre-clasificar camiones que ya tienen pedidos asignados
   camiones.forEach(c => {
     const yaEnCamion = ya.filter(p => p.camion_id === c.codigo)
+    camionZonas[c.codigo] = {}
     if (yaEnCamion.length === 0) { camionTieneLargo[c.codigo] = undefined; return }
     const tieneLargo = yaEnCamion.some(p => esLargoPedido(p.items ?? []))
     const tieneNoLargo = yaEnCamion.some(p => !esLargoPedido(p.items ?? []))
     // Si tiene ambos (mezcla ya existente), lo dejamos como undefined para no bloquear más
     camionTieneLargo[c.codigo] = tieneLargo && !tieneNoLargo ? true : (!tieneLargo && tieneNoLargo ? false : undefined)
+    // Inicializar conteo de zonas con los pedidos ya asignados
+    yaEnCamion.forEach(p => {
+      const z = zonaPedido(p)
+      if (z !== '__sin_zona__') camionZonas[c.codigo][z] = (camionZonas[c.codigo][z] || 0) + 1
+    })
   })
 
-  // Ordenar: prioridades primero, luego por distancia al depósito (cercanos primero → se agrupan geográficamente)
-  const ordenados = [...sin].sort((a, b) => {
-    if (a.prioridad && !b.prioridad) return -1
-    if (!a.prioridad && b.prioridad) return 1
-    const dA = a.latitud && a.longitud ? distanciaKm(deposito.lat, deposito.lng, a.latitud, a.longitud) : 9999
-    const dB = b.latitud && b.longitud ? distanciaKm(deposito.lat, deposito.lng, b.latitud, b.longitud) : 9999
-    return dA - dB
-  })
+  // ── Registrar asignación de un pedido a un camión ─────────────────────────
+  function registrarAsignacion(p: Pedido, c: Camion) {
+    asigs[p.id] = c.codigo
+    acum[c.codigo] += p.peso_total_kg ?? 0
+    acumPos[c.codigo] += p.volumen_total_m3 ?? 0
+    const loc = zonaPedido(p)
+    if (loc !== '__sin_zona__') camionZonas[c.codigo][loc] = (camionZonas[c.codigo][loc] || 0) + 1
+    const pedidoEsLargo = esLargoPedido(p.items ?? [])
+    const tipoAnterior = camionTieneLargo[c.codigo]
+    if (tipoAnterior === undefined) {
+      camionTieneLargo[c.codigo] = pedidoEsLargo
+    } else if (tipoAnterior !== pedidoEsLargo) {
+      camionTieneLargo[c.codigo] = undefined
+    }
+  }
 
-  for (const p of ordenados) {
+  // ── Buscar el mejor camión para un pedido individual ──────────────────────
+  function mejorCamionParaPedido(p: Pedido): Camion | null {
     const peso = p.peso_total_kg ?? 0
     const pos = p.volumen_total_m3 ?? 0
     const esVolcador = p.requiere_volcador === true
-
-    // ¿El pedido es solo hierro (para determinar si necesita grúa)?
-    const itemsDelPedido = p.items ?? []
-    const soloHierro = itemsDelPedido.length > 0 &&
-      itemsDelPedido.every(it => HIERRO_KEYWORDS.some(kw => it.nombre.toLowerCase().includes(kw)))
+    const items = p.items ?? []
+    const soloHierro = items.length > 0 && items.every(it => HIERRO_KEYWORDS.some(kw => it.nombre.toLowerCase().includes(kw)))
     const requiereGrua = !esVolcador && !soloHierro
+    const pedidoEsLargo = esLargoPedido(items)
+    const locPedido = zonaPedido(p)
 
-    // ¿El pedido tiene materiales largos (chapas/perfiles/tubos) que no pueden mezclarse?
-    const pedidoEsLargo = esLargoPedido(itemsDelPedido)
-
-    // Filtrar por capacidad, tipo de camión y anti-mezcla largo/no-largo
     const elegibles = camiones.filter(c => {
       if (acum[c.codigo] + peso > c.tonelaje_max_kg) return false
       if (c.posiciones_total > 0 && pos > 0 && acumPos[c.codigo] + pos > c.posiciones_total) return false
       if (esVolcador && !c.volcador) return false
       if (requiereGrua && !c.grua_hidraulica) return false
-      // Anti-mezcla: chapas/perfiles/tubos no van con pallets/bolsones
-      const tipoActual = camionTieneLargo[c.codigo]
-      if (tipoActual !== undefined) {
-        if (pedidoEsLargo && tipoActual === false) return false   // camión tiene no-largos
-        if (!pedidoEsLargo && tipoActual === true) return false   // camión tiene largos
+      const tipo = camionTieneLargo[c.codigo]
+      if (tipo !== undefined) {
+        if (pedidoEsLargo && tipo === false) return false
+        if (!pedidoEsLargo && tipo === true) return false
       }
       return true
     })
+    if (elegibles.length === 0) return null
 
-    if (elegibles.length === 0) { asigs[p.id] = null; continue }
-
-    // Afinidad geográfica + agrupación por cliente
     let mejor: Camion | null = null
     let mejorScore = Infinity
 
     for (const c of elegibles) {
-      const todosPedidosCamion = [
+      const todosEnCamion = [
         ...ya.filter(pp => pp.camion_id === c.codigo),
         ...Object.entries(asigs).filter(([, cod]) => cod === c.codigo).map(([id]) => sin.find(pp => pp.id === id)).filter(Boolean) as Pedido[],
       ]
-      const yaAsignados = todosPedidosCamion.filter(pp => pp.latitud && pp.longitud)
+      if (todosEnCamion.some(pp => sonColocados(pp, p))) return c
+      if (todosEnCamion.some(pp => pp.cliente === p.cliente)) return c
 
-      // Prioridad máxima: mismo cliente ya asignado a este camión
-      const mismoCliente = todosPedidosCamion.some(pp => pp.cliente === p.cliente)
-      if (mismoCliente) { mejor = c; break }
-
+      const yaConCoords = todosEnCamion.filter(pp => pp.latitud && pp.longitud)
       let score: number
-      if (p.latitud && p.longitud && yaAsignados.length > 0) {
-        // Distancia al centroide de los pedidos ya asignados al camión
-        const avgLat = yaAsignados.reduce((s, pp) => s + pp.latitud!, 0) / yaAsignados.length
-        const avgLng = yaAsignados.reduce((s, pp) => s + pp.longitud!, 0) / yaAsignados.length
+      if (p.latitud && p.longitud && yaConCoords.length > 0) {
+        const avgLat = yaConCoords.reduce((s, pp) => s + pp.latitud!, 0) / yaConCoords.length
+        const avgLng = yaConCoords.reduce((s, pp) => s + pp.longitud!, 0) / yaConCoords.length
         score = distanciaKm(p.latitud, p.longitud, avgLat, avgLng)
       } else if (p.latitud && p.longitud) {
-        // Camión sin pedidos aún: distancia al depósito (penalty leve para que los con pedidos tengan prioridad)
         score = distanciaKm(deposito.lat, deposito.lng, p.latitud, p.longitud) + 500
       } else {
-        // Sin coordenadas: best-fit por capacidad restante
         score = c.tonelaje_max_kg - acum[c.codigo]
       }
+      const tieneZonaTexto = locPedido !== '__sin_zona__' && (camionZonas[c.codigo]?.[locPedido] ?? 0) > 0
+      const tieneZonaCoords = p.latitud != null && p.longitud != null && todosEnCamion.some(pp =>
+        pp.latitud != null && pp.longitud != null &&
+        distanciaKm(p.latitud!, p.longitud!, pp.latitud!, pp.longitud!) < 8
+      )
+      if (tieneZonaTexto || tieneZonaCoords) score *= 0.25
+      if (score < mejorScore) { mejorScore = score; mejor = c }
+    }
+    return mejor
+  }
+
+  // ── Asignación cluster por cluster ────────────────────────────────────────
+  const clusters = buildClusters(sin)
+
+  // Ordenar clusters: prioridad > volumen total desc (FFD) > distancia al depósito desc
+  clusters.sort((ca, cb) => {
+    const prioA = ca.some(p => p.prioridad) ? 1 : 0
+    const prioB = cb.some(p => p.prioridad) ? 1 : 0
+    if (prioA !== prioB) return prioB - prioA
+    const posA = ca.reduce((s, p) => s + (p.volumen_total_m3 ?? 0), 0)
+    const posB = cb.reduce((s, p) => s + (p.volumen_total_m3 ?? 0), 0)
+    if (Math.abs(posA - posB) > 2) return posB - posA
+    const conCoordsA = ca.filter(p => p.latitud && p.longitud)
+    const conCoordsB = cb.filter(p => p.latitud && p.longitud)
+    const distA = conCoordsA.length > 0 ? conCoordsA.reduce((s, p) => s + distanciaKm(deposito.lat, deposito.lng, p.latitud!, p.longitud!), 0) / conCoordsA.length : 0
+    const distB = conCoordsB.length > 0 ? conCoordsB.reduce((s, p) => s + distanciaKm(deposito.lat, deposito.lng, p.latitud!, p.longitud!), 0) / conCoordsB.length : 0
+    return distB - distA
+  })
+
+  for (const cluster of clusters) {
+    cluster.sort((a, b) => {
+      if (a.prioridad && !b.prioridad) return -1
+      if (!a.prioridad && b.prioridad) return 1
+      return (b.volumen_total_m3 ?? 0) - (a.volumen_total_m3 ?? 0)
+    })
+
+    if (cluster.length === 1) {
+      const c = mejorCamionParaPedido(cluster[0])
+      if (c) registrarAsignacion(cluster[0], c)
+      else asigs[cluster[0].id] = null
+      continue
+    }
+
+    // Cluster multi-pedido: buscar camión que aguante TODOS juntos
+    const pesoTotal = cluster.reduce((s, p) => s + (p.peso_total_kg ?? 0), 0)
+    const posTotal = cluster.reduce((s, p) => s + (p.volumen_total_m3 ?? 0), 0)
+    const necesitaVolcador = cluster.some(p => p.requiere_volcador === true)
+    const clusterEsLargo = cluster.some(p => esLargoPedido(p.items ?? []))
+    const clusterEsNoLargo = cluster.some(p => !esLargoPedido(p.items ?? []))
+    const necesitaGrua = cluster.some(p => {
+      const items = p.items ?? []
+      const soloHierro = items.length > 0 && items.every(it => HIERRO_KEYWORDS.some(kw => it.nombre.toLowerCase().includes(kw)))
+      return !p.requiere_volcador && !soloHierro
+    })
+
+    let mejor: Camion | null = null
+    let mejorScore = Infinity
+
+    for (const c of camiones) {
+      if (acum[c.codigo] + pesoTotal > c.tonelaje_max_kg) continue
+      if (c.posiciones_total > 0 && posTotal > 0 && acumPos[c.codigo] + posTotal > c.posiciones_total) continue
+      if (necesitaVolcador && !c.volcador) continue
+      if (necesitaGrua && !c.grua_hidraulica) continue
+      const tipo = camionTieneLargo[c.codigo]
+      if (tipo === true && clusterEsNoLargo && !clusterEsLargo) continue
+      if (tipo === false && clusterEsLargo && !clusterEsNoLargo) continue
+
+      const todosEnCamion = [
+        ...ya.filter(pp => pp.camion_id === c.codigo),
+        ...Object.entries(asigs).filter(([, cod]) => cod === c.codigo).map(([id]) => sin.find(pp => pp.id === id)).filter(Boolean) as Pedido[],
+      ]
+
+      // P1: algún pedido del cluster coincide con dirección/cliente ya en el camión
+      if (cluster.some(p => todosEnCamion.some(pp => sonColocados(pp, p) || pp.cliente === p.cliente))) {
+        mejor = c; break
+      }
+
+      // Scoring: centroide del cluster vs centroide del camión
+      const ccCoords = cluster.filter(p => p.latitud && p.longitud)
+      const tcCoords = todosEnCamion.filter(pp => pp.latitud && pp.longitud)
+      let score: number
+      if (ccCoords.length > 0 && tcCoords.length > 0) {
+        const avgCLat = ccCoords.reduce((s, p) => s + p.latitud!, 0) / ccCoords.length
+        const avgCLng = ccCoords.reduce((s, p) => s + p.longitud!, 0) / ccCoords.length
+        const avgTLat = tcCoords.reduce((s, pp) => s + pp.latitud!, 0) / tcCoords.length
+        const avgTLng = tcCoords.reduce((s, pp) => s + pp.longitud!, 0) / tcCoords.length
+        score = distanciaKm(avgCLat, avgCLng, avgTLat, avgTLng)
+      } else if (ccCoords.length > 0) {
+        const avgCLat = ccCoords.reduce((s, p) => s + p.latitud!, 0) / ccCoords.length
+        const avgCLng = ccCoords.reduce((s, p) => s + p.longitud!, 0) / ccCoords.length
+        score = distanciaKm(deposito.lat, deposito.lng, avgCLat, avgCLng) + 500
+      } else {
+        score = c.tonelaje_max_kg - acum[c.codigo]
+      }
+
+      // Bonus zona: si algún pedido del cluster tiene afinidad de zona con el camión
+      const tieneZona = cluster.some(p => {
+        const loc = zonaPedido(p)
+        const tieneTexto = loc !== '__sin_zona__' && (camionZonas[c.codigo]?.[loc] ?? 0) > 0
+        const tieneCoords = p.latitud != null && p.longitud != null && todosEnCamion.some(pp =>
+          pp.latitud != null && pp.longitud != null &&
+          distanciaKm(p.latitud!, p.longitud!, pp.latitud!, pp.longitud!) < 8
+        )
+        return tieneTexto || tieneCoords
+      })
+      if (tieneZona) score *= 0.25
 
       if (score < mejorScore) { mejorScore = score; mejor = c }
     }
 
     if (mejor) {
-      asigs[p.id] = mejor.codigo
-      acum[mejor.codigo] += peso
-      acumPos[mejor.codigo] += pos
-      // Actualizar tipo de camión para anti-mezcla en próximos pedidos
-      const tipoAnterior = camionTieneLargo[mejor.codigo]
-      if (tipoAnterior === undefined) {
-        camionTieneLargo[mejor.codigo] = pedidoEsLargo
-      } else if (tipoAnterior !== pedidoEsLargo) {
-        camionTieneLargo[mejor.codigo] = undefined // mixto (no debería pasar)
-      }
+      for (const p of cluster) registrarAsignacion(p, mejor)
     } else {
-      asigs[p.id] = null
+      // Fallback: no hay camión que aguante el cluster completo → asignar individualmente
+      for (const p of cluster) {
+        const c = mejorCamionParaPedido(p)
+        if (c) registrarAsignacion(p, c)
+        else asigs[p.id] = null
+      }
     }
   }
   return asigs
@@ -220,19 +419,21 @@ function sugerirAsignacion(sin: Pedido[], camiones: Camion[], ya: Pedido[], sucu
 
 const BIG_MODES = ['stock', 'separar', 'reprog']
 
-function PedidoCard({ pedido, onDragStart, onCancelar, onCambiarVuelta, onReprogramar, onEditarPeso, onToggleVolcador, onSepararPedido, onMoverSucursal, onIncidenciaStock, onNeedsExpand, soloVer = false }: {
+function PedidoCard({ pedido, onDragStart, onCancelar, onCambiarVuelta, onReprogramar, onEditarPeso, onRecalcularPosiciones, onToggleVolcador, onSepararPedido, onMoverSucursal, onIncidenciaStock, onNeedsExpand, soloVer = false, esTransferencia = false }: {
   pedido: Pedido
   onDragStart: (e: React.DragEvent, p: Pedido) => void
   onCancelar: (id: string) => void
   onCambiarVuelta: (id: string, vuelta: number) => void
   onReprogramar: (id: string, fecha: string, vuelta: number, motivo: string) => void
   onEditarPeso: (id: string, peso: number, posiciones: number) => void
+  onRecalcularPosiciones: (id: string, peso: number, posiciones: number) => void
   onToggleVolcador: (id: string, valor: boolean) => void
   onSepararPedido: (id: string, itemsNuevo: any[], itemsMantener: any[]) => void
   onMoverSucursal: (id: string, sucursal: string) => void
   onIncidenciaStock: (id: string, itemsSinStock: any[], itemsConStock: any[]) => void
   onNeedsExpand?: (id: string, needs: boolean) => void
   soloVer?: boolean
+  esTransferencia?: boolean
 }) {
   const [expandido, setExpandido] = useState(false)
   const [modo, _setModo] = useState<'normal' | 'vuelta' | 'reprog' | 'cancelar' | 'editar_peso' | 'separar' | 'mover_sucursal' | 'stock'>('normal')
@@ -245,6 +446,25 @@ function PedidoCard({ pedido, onDragStart, onCancelar, onCambiarVuelta, onReprog
   }, [])
   const [editPeso, setEditPeso] = useState(0)
   const [editPos, setEditPos] = useState(0)
+  const [recalculando, setRecalculando] = useState(false)
+
+  async function recalcularDesdeCard(e: React.MouseEvent) {
+    e.stopPropagation()
+    setRecalculando(true)
+    try {
+      const res = await fetch('/api/recalcular-posiciones', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pedido_id: pedido.id }),
+      })
+      const data = await res.json()
+      if (data.success && data.resultados?.[0]) {
+        const r = data.resultados[0]
+        onRecalcularPosiciones(pedido.id, r.peso_kg, r.posiciones)
+      }
+    } catch {}
+    setRecalculando(false)
+  }
   const [cantNuevo, setCantNuevo] = useState<Record<number, number>>({})
   const [stockDisp, setStockDisp] = useState<Record<number, number>>({})
   const [reprogFecha, setReprogFecha] = useState('')
@@ -253,19 +473,51 @@ function PedidoCard({ pedido, onDragStart, onCancelar, onCambiarVuelta, onReprog
   const mananaStr = (() => { const d = new Date(); d.setDate(d.getDate() + 1); return d.toISOString().split('T')[0] })()
   const esReprogramado = pedido.notas?.startsWith('⚡')
   const esRetiro = pedido.tipo === 'retiro'
-  const borderColor = esRetiro ? '#0d9488' : pedido.pedido_grande ? '#f59e0b' : esReprogramado ? '#fbbf24' : '#f0f0f0'
-  const bgColor = esRetiro ? '#f0fdfa' : pedido.pedido_grande ? '#fffbeb' : 'white'
+
+  // Estados finalizados — se muestran "apagados" para no confundirse con los activos
+  const esEnCamino = pedido.estado === 'en_camino'
+  const esEntregado = pedido.estado === 'entregado'
+  const esParcial = pedido.estado === 'entregado_parcial'
+  const esRechazado = pedido.estado === 'rechazado'
+  const esFinalizado = esEnCamino || esEntregado || esParcial || esRechazado
+
+  const ESTADO_BADGE: Record<string, { label: string; bg: string; color: string }> = {
+    en_camino:        { label: '🚛 En camino',  bg: '#dbeafe', color: '#1d4ed8' },
+    entregado:        { label: '✓ Entregado',   bg: '#d1fae5', color: '#065f46' },
+    entregado_parcial:{ label: '½ Parcial',     bg: '#fef3c7', color: '#b45309' },
+    rechazado:        { label: '✕ Rechazado',   bg: '#fde8e8', color: '#E52322' },
+  }
+  const estadoBadge = esFinalizado ? ESTADO_BADGE[pedido.estado] : null
+
+  const borderColor = esFinalizado
+    ? (esEntregado ? '#bbf7d0' : esParcial ? '#fde68a' : esRechazado ? '#fca5a5' : '#93c5fd')
+    : esRetiro ? '#0d9488' : pedido.pedido_grande ? '#f59e0b' : esReprogramado ? '#fbbf24' : '#f0f0f0'
+  const bgColor = esFinalizado ? '#fafafa' : esRetiro ? '#f0fdfa' : pedido.pedido_grande ? '#fffbeb' : 'white'
+
   return (
-    <div draggable={!soloVer} onDragStart={e => { if (!soloVer) onDragStart(e, pedido) }}
-      className="rounded-lg p-3 mb-2 select-none hover:shadow-md transition-shadow"
-      style={{ border: `1px solid ${borderColor}`, background: bgColor, cursor: soloVer ? 'default' : 'grab' }}>
-      {esRetiro && (
+    <div
+      draggable={!soloVer && !esFinalizado}
+      onDragStart={e => { if (!soloVer && !esFinalizado) onDragStart(e, pedido) }}
+      className="rounded-lg p-3 mb-2 select-none transition-shadow"
+      style={{
+        border: `1px solid ${borderColor}`,
+        background: bgColor,
+        cursor: (soloVer || esFinalizado) ? 'default' : 'grab',
+        opacity: esFinalizado ? 0.7 : 1,
+      }}>
+      {estadoBadge && (
+        <div className="text-xs font-semibold mb-1.5 px-2 py-1 rounded-lg"
+          style={{ background: estadoBadge.bg, color: estadoBadge.color }}>
+          {estadoBadge.label}
+        </div>
+      )}
+      {esRetiro && !esFinalizado && (
         <div className="text-xs font-semibold mb-1.5 px-2 py-1 rounded-lg flex items-center gap-1.5"
           style={{ background: '#ccfbf1', color: '#0f766e' }}>
           🔄 Retiro — no cuenta para cupos
         </div>
       )}
-      {pedido.pedido_grande && !esRetiro && (
+      {pedido.pedido_grande && !esRetiro && !esFinalizado && (
         <div className="text-xs font-semibold mb-1.5 px-2 py-1 rounded-lg"
           style={{ background: '#fde68a', color: '#92400e' }}>
           ⚠️ Pedido grande — requiere separación
@@ -320,6 +572,16 @@ function PedidoCard({ pedido, onDragStart, onCancelar, onCambiarVuelta, onReprog
                   className="text-xs hover:underline" style={{ color: '#f59e0b' }} title="Ingresar peso y posiciones">
                   ⚠ sin peso ✎
                 </button>
+          )}
+          {!soloVer && (
+            <button onMouseDown={e => e.stopPropagation()}
+              onClick={recalcularDesdeCard}
+              disabled={recalculando}
+              title="Recalcular posiciones y peso automáticamente"
+              className="text-xs px-1 py-0.5 rounded hover:bg-blue-50 disabled:opacity-40 transition-colors"
+              style={{ color: '#254A96', fontSize: 11 }}>
+              {recalculando ? '…' : '↺'}
+            </button>
           )}
         </div>
       </div>
@@ -564,17 +826,21 @@ function PedidoCard({ pedido, onDragStart, onCancelar, onCambiarVuelta, onReprog
             className="text-xs hover:underline" style={{ color: '#B9BBB7' }}>
             V{pedido.vuelta} · cambiar
           </button>
-          <span style={{ color: '#e0e0e0' }}>|</span>
-          <button onMouseDown={e => e.stopPropagation()}
-            onClick={e => { e.stopPropagation(); setStockDisp({}); setModo('stock') }}
-            className="text-xs hover:underline font-medium" style={{ color: '#b45309' }}>
-            ⚠ stock
-          </button>
-          <span style={{ color: '#e0e0e0' }}>|</span>
-          <button onMouseDown={e => e.stopPropagation()} onClick={e => { e.stopPropagation(); setModo('mover_sucursal') }}
-            className="text-xs hover:underline" style={{ color: '#B9BBB7' }}>
-            🏭 {pedido.sucursal}
-          </button>
+          {!esTransferencia && (
+            <>
+              <span style={{ color: '#e0e0e0' }}>|</span>
+              <button onMouseDown={e => e.stopPropagation()}
+                onClick={e => { e.stopPropagation(); setStockDisp({}); setModo('stock') }}
+                className="text-xs hover:underline font-medium" style={{ color: '#b45309' }}>
+                ⚠ stock
+              </button>
+              <span style={{ color: '#e0e0e0' }}>|</span>
+              <button onMouseDown={e => e.stopPropagation()} onClick={e => { e.stopPropagation(); setModo('mover_sucursal') }}
+                className="text-xs hover:underline" style={{ color: '#B9BBB7' }}>
+                🏭 {pedido.sucursal}
+              </button>
+            </>
+          )}
           <span style={{ color: '#e0e0e0' }}>|</span>
           <button onMouseDown={e => e.stopPropagation()}
             onClick={e => { e.stopPropagation(); setModo('reprog'); setReprogFecha(''); setReprogVuelta(1); setReprogMotivo('') }}
@@ -636,7 +902,7 @@ function PedidoCard({ pedido, onDragStart, onCancelar, onCambiarVuelta, onReprog
   )
 }
 
-function ColumnaCamion({ columna, sinAsignar = false, onDrop, onDragOver, onDragLeave, onDragStart, isDragOver, onCancelar, onCambiarVuelta, onReprogramar, onReprogramarCamion, onEditarPeso, onToggleVolcador, onSepararPedido, onMoverSucursal, onIncidenciaStock, deposito, soloVer = false }: {
+function ColumnaCamion({ columna, sinAsignar = false, onDrop, onDragOver, onDragLeave, onDragStart, isDragOver, onCancelar, onCambiarVuelta, onReprogramar, onReprogramarCamion, onEditarPeso, onRecalcularPosiciones, onToggleVolcador, onSepararPedido, onMoverSucursal, onIncidenciaStock, deposito, soloVer = false, bloqueado = false, onToggleLock, esTransferencia = false }: {
   columna: ColumnaKanban; sinAsignar?: boolean
   onDrop: (e: React.DragEvent, cod: string | null) => void
   onDragOver: (e: React.DragEvent, cod: string | null) => void
@@ -646,12 +912,16 @@ function ColumnaCamion({ columna, sinAsignar = false, onDrop, onDragOver, onDrag
   onReprogramar: (id: string, fecha: string, vuelta: number, motivo: string) => void
   onReprogramarCamion?: (codigo: string) => void
   onEditarPeso: (id: string, peso: number, posiciones: number) => void
+  onRecalcularPosiciones: (id: string, peso: number, posiciones: number) => void
   onToggleVolcador: (id: string, valor: boolean) => void
   onSepararPedido: (id: string, itemsNuevo: any[], itemsMantener: any[]) => void
   onMoverSucursal: (id: string, sucursal: string) => void
   onIncidenciaStock: (id: string, itemsSinStock: any[], itemsConStock: any[]) => void
   deposito?: { lat: number; lng: number }
   soloVer?: boolean
+  bloqueado?: boolean
+  onToggleLock?: () => void
+  esTransferencia?: boolean
 }) {
   const { camion, pedidos, pesoTotal, posTotal } = columna
   const [manualExpanded, setManualExpanded] = useState(false)
@@ -665,7 +935,13 @@ function ColumnaCamion({ columna, sinAsignar = false, onDrop, onDragOver, onDrag
   const maxDistKm = !sinAsignar && deposito
     ? Math.max(0, ...pedidos.filter(p => p.latitud && p.longitud).map(p => distanciaKm(deposito.lat, deposito.lng, p.latitud!, p.longitud!)))
     : 0
-  const maxVueltas = maxDistKm > 0 ? maxVueltasPorDistancia(maxDistKm) : null
+  const esGrua = !sinAsignar && !!(camion as any).grua_hidraulica
+  const maxVueltas = maxDistKm > 0
+    ? Math.min(
+        maxVueltasPorDistancia(maxDistKm),
+        maxVueltasPorTiempo(maxDistKm, posTotal, pedidos.length, esGrua)
+      )
+    : null
   const w = isExpanded ? 360 : 220
   return (
     <div onDrop={e => onDrop(e, sinAsignar ? null : camion.codigo)}
@@ -674,9 +950,10 @@ function ColumnaCamion({ columna, sinAsignar = false, onDrop, onDragOver, onDrag
       className="flex flex-col h-full shrink-0 rounded-xl transition-all"
       style={{
         width: w, minWidth: w,
-        border: `2px ${sinAsignar ? 'dashed' : 'solid'} ${isDragOver ? '#254A96' : '#f0f0f0'}`,
-        background: isDragOver ? '#e8edf8' : '#f9f9f9',
-        boxShadow: isDragOver ? '0 0 0 3px rgba(37,74,150,0.12)' : 'none',
+        border: `2px ${sinAsignar ? 'dashed' : 'solid'} ${isDragOver ? '#254A96' : bloqueado ? '#f59e0b' : (soloVer && ((camion as any)._sale_a_sucursal || (camion as any)._desde_sucursal)) ? '#e0e0e0' : '#f0f0f0'}`,
+        background: isDragOver ? '#e8edf8' : bloqueado ? '#fffbeb' : (soloVer && ((camion as any)._sale_a_sucursal || (camion as any)._desde_sucursal)) ? '#f0f0f0' : '#f9f9f9',
+        boxShadow: isDragOver ? '0 0 0 3px rgba(37,74,150,0.12)' : bloqueado ? '0 0 0 2px rgba(245,158,11,0.15)' : 'none',
+        opacity: (soloVer && ((camion as any)._sale_a_sucursal || (camion as any)._desde_sucursal)) ? 0.65 : 1,
       }}>
       <div className="p-3 rounded-t-xl shrink-0" style={{ background: sinAsignar ? 'transparent' : 'white', borderBottom: sinAsignar ? 'none' : '1px solid #f0f0f0' }}>
         {sinAsignar ? (
@@ -694,14 +971,32 @@ function ColumnaCamion({ columna, sinAsignar = false, onDrop, onDragOver, onDrag
             <div className="flex justify-between items-center mb-1">
               <span className="font-bold text-sm" style={{ color: '#254A96' }}>{camion.codigo}</span>
               <div className="flex gap-1 items-center">
+                {(camion as any)._en_ruta && (
+                  <span className="text-xs px-1.5 py-0.5 rounded-full font-medium" style={{ background: '#fff3e0', color: '#e65100' }}
+                    title={`Posiblemente en ruta — salió en V${(camion as any)._en_ruta_desde_vuelta} con entrega a ~${(camion as any)._en_ruta_dist_km}km`}>
+                    🚛 V{(camion as any)._en_ruta_desde_vuelta} en ruta
+                  </span>
+                )}
                 {(camion as any)._desde_sucursal && (
                   <span className="text-xs px-1.5 py-0.5 rounded-full font-medium" style={{ background: '#f5f3ff', color: '#7c3aed' }}
                     title={`Viene de ${(camion as any)._desde_sucursal}, disponible desde V${(camion as any)._disponible_desde_vuelta ?? 2}`}>
                     🔀 {(camion as any)._desde_sucursal} V{(camion as any)._disponible_desde_vuelta ?? 2}+
                   </span>
                 )}
+                {(camion as any)._sale_a_sucursal && (
+                  <span className="text-xs px-1.5 py-0.5 rounded-full font-medium" style={{ background: '#fde8e8', color: '#E52322' }}
+                    title={`Va a ${(camion as any)._sale_a_sucursal} desde V${(camion as any)._sale_desde_vuelta ?? 2}`}>
+                    🔀 → {(camion as any)._sale_a_sucursal} V{(camion as any)._sale_desde_vuelta ?? 2}+
+                  </span>
+                )}
                 {camion.grua_hidraulica && <span className="text-xs px-1.5 py-0.5 rounded-full" style={{ background: '#e8edf8', color: '#254A96' }}>Grúa</span>}
                 {camion.volcador && <span className="text-xs px-1.5 py-0.5 rounded-full" style={{ background: '#fef3c7', color: '#d97706' }}>Volc.</span>}
+                {onToggleLock && (
+                  <button onClick={onToggleLock} className="text-xs px-1.5 py-0.5 rounded" title={bloqueado ? 'Desbloqueado para sugerencia' : 'Bloquear: excluir de la sugerencia'}
+                    style={{ background: bloqueado ? '#fef3c7' : '#f0f0f0', color: bloqueado ? '#d97706' : '#B9BBB7' }}>
+                    {bloqueado ? '🔒' : '🔓'}
+                  </button>
+                )}
                 <button onClick={() => setManualExpanded(e => !e)} className="text-xs px-1.5 py-0.5 rounded ml-1" style={{ color: '#B9BBB7', background: '#f0f0f0' }} title={isExpanded ? 'Contraer' : 'Expandir'}>
                   {isExpanded ? '◀' : '▶'}
                 </button>
@@ -717,11 +1012,11 @@ function ColumnaCamion({ columna, sinAsignar = false, onDrop, onDragOver, onDrag
               )}
             </div>
             <div className="w-full rounded-full h-1.5 mb-0.5" style={{ background: '#f0f0f0' }}>
-              <div className="h-1.5 rounded-full transition-all" style={{ width: `${p}%`, background: colorBarra(p) }} />
+              <div className="h-1.5 rounded-full transition-all" style={{ width: `${Math.min(p, 100)}%`, background: colorBarra(p) }} />
             </div>
             {camion.posiciones_total > 0 && (
               <div className="w-full rounded-full h-1 mb-1" style={{ background: '#f0f0f0' }}>
-                <div className="h-1 rounded-full transition-all" style={{ width: `${pPos}%`, background: colorBarra(pPos) }} />
+                <div className="h-1 rounded-full transition-all" style={{ width: `${Math.min(pPos, 100)}%`, background: colorBarra(pPos) }} />
               </div>
             )}
             <div className="flex justify-between items-center text-xs" style={{ color: '#B9BBB7' }}>
@@ -744,7 +1039,10 @@ function ColumnaCamion({ columna, sinAsignar = false, onDrop, onDragOver, onDrag
       <div className="p-2 flex-1 overflow-y-auto">
         {pedidos.length === 0
           ? <div className="text-center py-8 text-xs" style={{ color: '#B9BBB7' }}>{sinAsignar ? 'Todos asignados ✓' : 'Arrastrá pedidos acá'}</div>
-          : pedidos.map(p => <PedidoCard key={p.id} pedido={p} onDragStart={onDragStart} onCancelar={onCancelar} onCambiarVuelta={onCambiarVuelta} onReprogramar={onReprogramar} onEditarPeso={onEditarPeso} onToggleVolcador={onToggleVolcador} onSepararPedido={onSepararPedido} onMoverSucursal={onMoverSucursal} onIncidenciaStock={onIncidenciaStock} onNeedsExpand={handleNeedsExpand} soloVer={soloVer} />)}
+          : pedidos.map(p => {
+              const pFinalizado = ['en_camino','entregado','entregado_parcial','rechazado'].includes(p.estado)
+              return <PedidoCard key={p.id} pedido={p} onDragStart={onDragStart} onCancelar={onCancelar} onCambiarVuelta={onCambiarVuelta} onReprogramar={onReprogramar} onEditarPeso={onEditarPeso} onRecalcularPosiciones={onRecalcularPosiciones} onToggleVolcador={onToggleVolcador} onSepararPedido={onSepararPedido} onMoverSucursal={onMoverSucursal} onIncidenciaStock={onIncidenciaStock} onNeedsExpand={handleNeedsExpand} soloVer={soloVer || pFinalizado} esTransferencia={esTransferencia} />
+            })}
       </div>
     </div>
   )
@@ -772,11 +1070,52 @@ function maxVueltasPorDistancia(distKm: number): number {
   return 1
 }
 
-function calcularOrdenRuta(pedidos: Pedido[], sucursal: string): Record<string, number> {
+// Jornada laboral y demora de recarga en depósito (en horas)
+const JORNADA_H = 9
+const RECARGA_H = 40 / 60
+
+/**
+ * Cap de vueltas basado en el tiempo estimado de la vuelta.
+ * @param maxDistKm  distancia en línea recta al pedido más lejano (km)
+ * @param posTotal   m3 totales de la vuelta (volumen_total_m3 acumulado)
+ * @param numStops   cantidad de pedidos/paradas de la vuelta
+ * @param esGrua     el camión tiene grúa hidráulica (descarga más lenta por parada)
+ */
+function maxVueltasPorTiempo(maxDistKm: number, posTotal: number, numStops: number, esGrua: boolean): number {
+  const VEL_KMH = 25
+  const FACTOR_RUTA = 1.5          // factor crow-flies → distancia real de ruta
+  const MIN_POR_POS = esGrua ? 8 : 3   // min por m3 de pallet: grúa es más lenta
+  const MIN_POR_PARADA = 5
+
+  const trasladoMin = (maxDistKm * FACTOR_RUTA / VEL_KMH) * 60
+  const descargaMin = posTotal * MIN_POR_POS + numStops * MIN_POR_PARADA
+  const totalHoras = (trasladoMin + descargaMin) / 60
+
+  if (totalHoras <= 0) return 4
+  return Math.max(1, Math.floor((JORNADA_H + RECARGA_H) / (totalHoras + RECARGA_H)))
+}
+
+function calcularOrdenRuta(pedidos: Pedido[], sucursal: string, ordenGoogle?: Record<string, number>): Record<string, number> {
   const deposito = DEPOSITOS[sucursal] ?? { lat: -34.9205, lng: -57.9536 }
   const conCoords = pedidos.filter(p => p.latitud && p.longitud)
   const sinCoords = pedidos.filter(p => !p.latitud || !p.longitud)
 
+  // Si Google ya calculó el orden, usarlo directamente (es el optimizado)
+  if (ordenGoogle && Object.keys(ordenGoogle).length > 0) {
+    const resultado: Record<string, number> = {}
+    pedidos.forEach((p, i) => {
+      resultado[p.id] = ordenGoogle[p.id] ?? (pedidos.length + i + 1)
+    })
+    return resultado
+  }
+
+  if (conCoords.length === 0) {
+    const resultado: Record<string, number> = {}
+    sinCoords.forEach((p, i) => { resultado[p.id] = i + 1 })
+    return resultado
+  }
+
+  // Paso 1 — Nearest Neighbor: solución inicial
   const ordenados: Pedido[] = []
   const restantes = [...conCoords]
   let latActual = deposito.lat
@@ -795,13 +1134,765 @@ function calcularOrdenRuta(pedidos: Pedido[], sucursal: string): Record<string, 
     lngActual = siguiente.longitud!
   }
 
+  // Paso 2 — 2-opt: eliminar cruces invirtiendo segmentos hasta que no mejore
+  // Distancia total incluyendo salida desde el depósito
+  function totalDist(ruta: Pedido[]): number {
+    let d = 0
+    let pLat = deposito.lat, pLng = deposito.lng
+    for (const p of ruta) {
+      d += distanciaKm(pLat, pLng, p.latitud!, p.longitud!)
+      pLat = p.latitud!; pLng = p.longitud!
+    }
+    return d
+  }
+
+  let mejorado = true
+  while (mejorado && ordenados.length > 2) {
+    mejorado = false
+    const distActual = totalDist(ordenados)
+    outer: for (let i = 0; i < ordenados.length - 1; i++) {
+      for (let j = i + 2; j < ordenados.length; j++) {
+        // Invertir el segmento [i+1 … j]
+        const candidato = [
+          ...ordenados.slice(0, i + 1),
+          ...ordenados.slice(i + 1, j + 1).reverse(),
+          ...ordenados.slice(j + 1),
+        ]
+        if (totalDist(candidato) < distActual - 0.001) {
+          ordenados.splice(0, ordenados.length, ...candidato)
+          mejorado = true
+          break outer // reiniciar el bucle con la nueva ruta mejorada
+        }
+      }
+    }
+  }
+
   const todos = [...ordenados, ...sinCoords]
   const resultado: Record<string, number> = {}
   todos.forEach((p, i) => { resultado[p.id] = i + 1 })
   return resultado
 }
+// ── Interfaces y componente de consolidación ────────────────────────────────
+interface ConsolidacionItem {
+  id: string; nv: string; idDespacho: string | null; cliente: string
+  vuelta: number; direccion: string; peso: number | null; posiciones: number | null
+  latitud: number | null; longitud: number | null
+}
+// camionBase: lo que sale de la DB (sin vueltasLibres todavía)
+interface ConsolidacionCamionBase { codigo: string; tipo_unidad: string; posiciones_total: number; tonelaje_max_kg: number; volcador?: boolean; grua_hidraulica?: boolean }
+// camion con vueltas libres calculadas para un grupo/pedido concreto
+interface ConsolidacionCamion extends ConsolidacionCamionBase { vueltasLibres: number[] }
+interface PedidoEnRiesgo {
+  id: string; nv: string; cliente: string; vuelta: number
+  posiciones: number | null; peso: number | null
+  camionesIds: string[]
+  camionVueltasLibres: Record<string, number[]> // cod → vueltas con capacidad libre
+}
+interface PedidoParaSeparar {
+  id: string; nv: string; cliente: string; vuelta: number
+  peso: number; posiciones: number | null
+  nPartes: number   // mínimo de partes necesarias
+  pesoXParte: number // peso aproximado por parte
+  camionesVolcador: ConsolidacionCamionBase[] // volcadores disponibles con capacidad
+}
+interface ConsolidacionGrupo {
+  key: string; tipo: 'mismo_cliente' | 'proximidad'; etiqueta: string
+  distanciaKm?: number; pedidos: ConsolidacionItem[]
+  camionesCompatibles: ConsolidacionCamion[]
+}
+
+const VUELTA_MAP_COLORS: Record<number, string> = {
+  1: '#254A96', 2: '#10b981', 3: '#f59e0b', 4: '#7c3aed', 5: '#f97316',
+}
+
+function MapaGrupoConsolidacion({ pedidos, sucursal }: { pedidos: ConsolidacionItem[]; sucursal: string }) {
+  const mapRef = useRef<HTMLDivElement>(null)
+  const leafletRef = useRef<any>(null)
+
+  useEffect(() => {
+    if (!document.getElementById('leaflet-css')) {
+      const link = document.createElement('link')
+      link.id = 'leaflet-css'; link.rel = 'stylesheet'
+      link.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'
+      document.head.appendChild(link)
+    }
+    function initMap() {
+      if (!mapRef.current) return
+      const L = (window as any).L
+      if (leafletRef.current) { leafletRef.current.remove(); leafletRef.current = null }
+
+      const depot = DEPOSITOS[sucursal] ?? { lat: -34.9205, lng: -57.9536 }
+      const conCoords = pedidos.filter(p => p.latitud != null && p.longitud != null)
+      const map = L.map(mapRef.current).setView([depot.lat, depot.lng], 12)
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '© <a href="https://www.openstreetmap.org/copyright">OSM</a>', maxZoom: 18,
+      }).addTo(map)
+
+      // Depósito
+      L.marker([depot.lat, depot.lng], {
+        icon: L.divIcon({
+          html: `<div style="background:#1a1a1a;color:white;padding:2px 7px;border-radius:5px;font-size:10px;font-weight:bold;white-space:nowrap;box-shadow:0 2px 4px rgba(0,0,0,.35)">🏭 ${sucursal}</div>`,
+          className: '', iconSize: [80, 20], iconAnchor: [40, 10],
+        })
+      }).addTo(map)
+
+      const bounds: [number, number][] = [[depot.lat, depot.lng]]
+
+      // Polilínea punteada por vuelta (muestra cómo está hoy separado)
+      const porVuelta = new Map<number, ConsolidacionItem[]>()
+      conCoords.forEach(p => { if (!porVuelta.has(p.vuelta)) porVuelta.set(p.vuelta, []); porVuelta.get(p.vuelta)!.push(p) })
+      for (const [vuelta, vps] of porVuelta) {
+        L.polyline(
+          [[depot.lat, depot.lng], ...vps.map(p => [p.latitud!, p.longitud!] as [number, number])],
+          { color: VUELTA_MAP_COLORS[vuelta] ?? '#666', weight: 2.5, opacity: 0.7, dashArray: '6,4' }
+        ).addTo(map)
+      }
+
+      // Marcadores por pedido
+      conCoords.forEach(p => {
+        const color = VUELTA_MAP_COLORS[p.vuelta] ?? '#666'
+        L.marker([p.latitud!, p.longitud!], {
+          icon: L.divIcon({
+            html: `<div style="background:${color};color:white;padding:2px 6px;border-radius:10px;font-size:10px;font-weight:bold;border:2px solid white;box-shadow:0 1px 4px rgba(0,0,0,.3);white-space:nowrap">V${p.vuelta}</div>`,
+            className: '', iconSize: [32, 22], iconAnchor: [16, 11],
+          })
+        }).bindPopup(`<div style="min-width:180px">
+          <div style="font-weight:700;color:${color};font-size:12px">Vuelta ${p.vuelta}</div>
+          <div style="font-weight:700;font-size:12px;margin-top:2px">${p.cliente}</div>
+          <div style="font-size:11px;color:#6b7280">NV ${p.nv}${p.idDespacho ? ` · SD ${p.idDespacho}` : ''}</div>
+          ${p.direccion ? `<div style="font-size:11px;color:#374151;margin-top:2px">${p.direccion}</div>` : ''}
+          <div style="font-size:11px;color:#9ca3af;margin-top:3px">${p.posiciones ?? '?'} pos. · ${(p.peso ?? 0).toLocaleString()} kg</div>
+        </div>`).addTo(map)
+        bounds.push([p.latitud!, p.longitud!])
+      })
+
+      if (bounds.length > 1) map.fitBounds(bounds, { padding: [28, 28] })
+      leafletRef.current = map
+    }
+    if ((window as any).L) { setTimeout(initMap, 50) }
+    else {
+      const script = document.createElement('script')
+      script.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'
+      script.onload = () => setTimeout(initMap, 50)
+      document.body.appendChild(script)
+    }
+    return () => { if (leafletRef.current) { leafletRef.current.remove(); leafletRef.current = null } }
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const tieneCoords = pedidos.some(p => p.latitud != null)
+  if (!tieneCoords) return (
+    <div className="flex items-center justify-center py-6 text-xs" style={{ color: '#B9BBB7', borderTop: '1px solid #fde68a' }}>
+      Sin coordenadas para mostrar mapa
+    </div>
+  )
+  return <div ref={mapRef} style={{ height: 220, width: '100%', borderTop: '1px solid #fde68a' }} />
+}
+
+function PreProgramacionPanel({
+  grupos, descartados, onDescartar, onAceptar, onAsignar, onEditarPosiciones,
+  onAsignarRestricto, onSepararGranel,
+  pedidosEnRiesgo, pedidosParaSeparar, flota, fecha, sucursal,
+}: {
+  grupos: ConsolidacionGrupo[]
+  descartados: Set<string>
+  onDescartar: (key: string) => void
+  onAceptar: (key: string, pedidoIds: string[], targetVuelta: number) => Promise<void>
+  onAsignar: (key: string, pedidoIds: string[], targetVuelta: number, camionCodigo: string) => Promise<void>
+  onEditarPosiciones: (id: string, posiciones: number) => Promise<void>
+  onAsignarRestricto: (pedidoId: string, camionCodigo: string, vuelta: number) => Promise<void>
+  onSepararGranel: (pedidoId: string, nPartes: number) => Promise<void>
+  pedidosEnRiesgo: PedidoEnRiesgo[]
+  pedidosParaSeparar: PedidoParaSeparar[]
+  flota: ConsolidacionCamionBase[]
+  fecha: string
+  sucursal: string
+}) {
+  const [expandido, setExpandido] = useState(false)
+  const [sec0Open, setSec0Open] = useState(true)
+  const [sec1Open, setSec1Open] = useState(true)
+  const [sec2Open, setSec2Open] = useState(true)
+  const [sec3Open, setSec3Open] = useState(false)
+  const [separandoId, setSeparandoId] = useState<string | null>(null)
+  // consolidación
+  const [itemsExpandidos, setItemsExpandidos] = useState<Set<string>>(new Set())
+  const [itemsData, setItemsData] = useState<Record<string, { nombre: string; cantidad: number; unidad: string }[]>>({})
+  const [aceptandoKey, setAceptandoKey] = useState<string | null>(null)
+  const [aceptandoCamion, setAceptandoCamion] = useState<string | null>(null)
+  const [aceptarVuelta, setAceptarVuelta] = useState<number>(1)
+  const [procesando, setProcesando] = useState(false)
+  const [editandoPosId, setEditandoPosId] = useState<string | null>(null)
+  const [editPosVal, setEditPosVal] = useState('')
+  const [guardandoPos, setGuardandoPos] = useState(false)
+  const [mapaExpandidoKey, setMapaExpandidoKey] = useState<string | null>(null)
+  // restrictos
+  const [asigId, setAsigId] = useState<string | null>(null)
+  const [asigCamion, setAsigCamion] = useState('')
+  const [asigVuelta, setAsigVuelta] = useState(1)
+
+  const restrictos = pedidosEnRiesgo.filter(p => p.camionesIds.length === 1)
+  const pocasOpciones = pedidosEnRiesgo.filter(p => p.camionesIds.length === 2)
+  const visibles = grupos.filter(g => !descartados.has(g.key))
+
+  const hayAlgo = pedidosParaSeparar.length > 0 || restrictos.length > 0 || visibles.length > 0 || pocasOpciones.length > 0
+  if (!hayAlgo) return null
+
+  // Agrupar restrictos por camión
+  const restrictosPorCamion = new Map<string, PedidoEnRiesgo[]>()
+  for (const r of restrictos) {
+    const cod = r.camionesIds[0]
+    if (!restrictosPorCamion.has(cod)) restrictosPorCamion.set(cod, [])
+    restrictosPorCamion.get(cod)!.push(r)
+  }
+
+  async function toggleItems(pedidoId: string) {
+    setItemsExpandidos(prev => {
+      const s = new Set(prev)
+      if (s.has(pedidoId)) { s.delete(pedidoId); return s }
+      s.add(pedidoId); return s
+    })
+    if (itemsData[pedidoId] !== undefined) return
+    try {
+      const res = await fetch(`/api/pedido-items?ids=${pedidoId}`)
+      const json = await res.json()
+      const items = (json.items ?? []).filter((it: any) => it.pedido_id === pedidoId)
+      setItemsData(prev => ({ ...prev, [pedidoId]: items }))
+    } catch { setItemsData(prev => ({ ...prev, [pedidoId]: [] })) }
+  }
+
+  async function confirmarAceptar(key: string, pedidoIds: string[]) {
+    setProcesando(true)
+    if (aceptandoCamion) {
+      await onAsignar(key, pedidoIds, aceptarVuelta, aceptandoCamion)
+    } else {
+      await onAceptar(key, pedidoIds, aceptarVuelta)
+    }
+    setAceptandoKey(null)
+    setAceptandoCamion(null)
+    setProcesando(false)
+  }
+
+  return (
+    <div className="mb-2 rounded-xl overflow-hidden" style={{ border: '1px solid #e8edf8', background: '#f8faff' }}>
+      {/* Header global con chips */}
+      <div className="px-4 py-2.5 flex items-center gap-2 flex-wrap">
+        <span className="text-sm">⚙️</span>
+        <span className="font-semibold text-sm shrink-0" style={{ color: '#254A96' }}>Pre-programación y consolidación</span>
+        <div className="flex gap-1.5 flex-wrap">
+          {pedidosParaSeparar.length > 0 && (
+            <span className="text-xs px-2 py-0.5 rounded-full font-medium" style={{ background: '#fce7f3', color: '#9d174d' }}>
+              ✂️ {pedidosParaSeparar.length} para separar
+            </span>
+          )}
+          {restrictos.length > 0 && (
+            <span className="text-xs px-2 py-0.5 rounded-full font-medium" style={{ background: '#fde8e8', color: '#E52322' }}>
+              ⚡ {restrictos.length} restricto{restrictos.length > 1 ? 's' : ''}
+            </span>
+          )}
+          {visibles.length > 0 && (
+            <span className="text-xs px-2 py-0.5 rounded-full font-medium" style={{ background: '#fef3c7', color: '#92400e' }}>
+              🔀 {visibles.length} consolidación{visibles.length > 1 ? 'es' : ''}
+            </span>
+          )}
+          {pocasOpciones.length > 0 && (
+            <span className="text-xs px-2 py-0.5 rounded-full font-medium" style={{ background: '#fef9c3', color: '#b45309' }}>
+              ⚠️ {pocasOpciones.length} pocas opciones
+            </span>
+          )}
+        </div>
+        <button onClick={() => setExpandido(e => !e)}
+          className="ml-auto text-xs px-2.5 py-1.5 rounded-lg font-medium shrink-0"
+          style={{ background: '#e8edf8', color: '#254A96' }}>
+          {expandido ? 'Ocultar ▲' : 'Ver detalle ▼'}
+        </button>
+      </div>
+
+      {expandido && (
+        <div className="overflow-y-auto" style={{ maxHeight: '55vh' }}>
+
+        {/* ── Sección 0: Pedidos para separar ──────────────────────────────── */}
+        {pedidosParaSeparar.length > 0 && (
+          <div style={{ borderTop: '2px solid #f9a8d4' }}>
+            <button className="w-full px-4 py-2 flex items-center gap-2 text-left"
+              style={{ background: '#fce7f3' }}
+              onClick={() => setSec0Open(o => !o)}>
+              <span className="text-xs font-semibold" style={{ color: '#9d174d' }}>
+                ✂️ Separar antes de programar — pedidos de granel que exceden un camión volcador
+              </span>
+              <span className="text-xs ml-auto" style={{ color: '#be185d' }}>
+                {pedidosParaSeparar.length} pedido{pedidosParaSeparar.length > 1 ? 's' : ''} · {sec0Open ? '▲' : '▼'}
+              </span>
+            </button>
+            {sec0Open && (
+              <div className="bg-white divide-y" style={{ borderColor: '#fce7f3' }}>
+                {pedidosParaSeparar.map(p => (
+                  <div key={p.id}>
+                    {/* Línea del pedido */}
+                    <div className="px-3 py-2 flex items-center gap-2 flex-wrap text-xs">
+                      <span className="shrink-0 font-bold px-1.5 py-0.5 rounded text-white"
+                        style={{ fontSize: 10, background: VUELTA_MAP_COLORS[p.vuelta] ?? '#666' }}>V{p.vuelta}</span>
+                      <span className="font-medium truncate" style={{ color: '#1a1a1a', maxWidth: 180 }} title={p.cliente}>{p.cliente}</span>
+                      <span style={{ color: '#B9BBB7' }}>NV {p.nv}</span>
+                      <span style={{ color: '#9d174d', fontWeight: 600 }}>{(p.peso / 1000).toFixed(1)} tn</span>
+                      {p.posiciones != null && p.posiciones > 0 && (
+                        <span style={{ color: '#254A96' }}>{p.posiciones} pos.</span>
+                      )}
+                      {/* Indicador de la división propuesta */}
+                      <span className="px-2 py-0.5 rounded-full text-xs font-medium"
+                        style={{ background: '#fce7f3', color: '#9d174d' }}>
+                        → {p.nPartes} × ~{(p.pesoXParte / 1000).toFixed(1)} tn
+                      </span>
+                      {p.camionesVolcador.length > 0 && (
+                        <span className="text-xs" style={{ color: '#B9BBB7' }}>
+                          en {p.camionesVolcador.map(c => c.codigo).join(' + ')}
+                        </span>
+                      )}
+                      <button
+                        disabled={separandoId === p.id}
+                        onClick={async () => {
+                          setSeparandoId(p.id)
+                          await onSepararGranel(p.id, p.nPartes)
+                          setSeparandoId(null)
+                        }}
+                        className="ml-auto shrink-0 text-xs px-3 py-1.5 rounded-lg font-semibold text-white disabled:opacity-50"
+                        style={{ background: '#9d174d' }}>
+                        {separandoId === p.id ? '…' : `✂️ Separar en ${p.nPartes}`}
+                      </button>
+                    </div>
+                    {/* Preview de la división */}
+                    <div className="px-10 pb-2 flex gap-2 flex-wrap">
+                      {Array.from({ length: p.nPartes }, (_, i) => {
+                        const cam = p.camionesVolcador[i]
+                        const kg = i < p.nPartes - 1 ? p.pesoXParte : p.peso - p.pesoXParte * (p.nPartes - 1)
+                        return (
+                          <span key={i} className="text-xs px-2 py-0.5 rounded-lg"
+                            style={{ background: '#fce7f3', color: '#9d174d' }}>
+                            Parte {i + 1}: ~{(kg / 1000).toFixed(1)} tn
+                            {cam ? ` → ${cam.codigo}` : ''}
+                          </span>
+                        )
+                      })}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── Sección 1: Restrictos ─────────────────────────────────────────── */}
+        {restrictos.length > 0 && (
+          <div style={{ borderTop: '2px solid #fca5a5' }}>
+            <button className="w-full px-4 py-2 flex items-center gap-2 text-left"
+              style={{ background: '#fde8e8' }}
+              onClick={() => setSec1Open(o => !o)}>
+              <span className="text-xs font-semibold" style={{ color: '#E52322' }}>⚡ Asignar primero — solo entran en un camión</span>
+              <span className="text-xs ml-auto" style={{ color: '#b91c1c' }}>{restrictos.length} pedido{restrictos.length > 1 ? 's' : ''} · {sec1Open ? '▲' : '▼'}</span>
+            </button>
+            {sec1Open && (
+              <div className="bg-white">
+                {[...restrictosPorCamion.entries()].map(([camionCod, peds]) => {
+                  const camData = flota.find(c => c.codigo === camionCod)
+                  const vueltasLibresGlobales = peds[0]?.camionVueltasLibres[camionCod] ?? []
+                  return (
+                    <div key={camionCod} style={{ borderBottom: '1px solid #fde8e8' }}>
+                      {/* Truck header */}
+                      <div className="px-3 py-1.5 flex items-center gap-2 flex-wrap"
+                        style={{ background: '#fff8f8' }}>
+                        <span className="text-xs font-bold" style={{ color: '#E52322' }}>{camionCod}</span>
+                        {camData && (
+                          <span className="text-xs" style={{ color: '#B9BBB7' }}>
+                            {camData.tipo_unidad}{camData.posiciones_total > 0 ? ` · ${camData.posiciones_total} pos.` : ''} · {(camData.tonelaje_max_kg / 1000).toFixed(0)}t
+                          </span>
+                        )}
+                        <div className="flex gap-1 ml-auto flex-wrap">
+                          {vueltasLibresGlobales.map(v => (
+                            <span key={v} className="text-xs px-1.5 py-0.5 rounded font-medium"
+                              style={{ background: '#fde8e8', color: '#E52322', fontSize: 9 }}>V{v} libre</span>
+                          ))}
+                          {vueltasLibresGlobales.length === 0 && (
+                            <span className="text-xs px-1.5 py-0.5 rounded font-medium"
+                              style={{ background: '#fde8e8', color: '#E52322', fontSize: 9 }}>⚠️ sin vueltas libres hoy</span>
+                          )}
+                        </div>
+                      </div>
+                      {/* Pedidos bajo este camión */}
+                      {peds.map(r => {
+                        const isAsig = asigId === r.id
+                        const vueltasLibres = r.camionVueltasLibres[camionCod] ?? []
+                        const defaultV = vueltasLibres.includes(r.vuelta) ? r.vuelta : (vueltasLibres[0] ?? r.vuelta)
+                        return (
+                          <div key={r.id} style={{ borderTop: '1px solid #fde8e8' }}>
+                            <div className="px-3 py-1.5 flex items-center gap-2 text-xs">
+                              <span className="shrink-0 font-bold px-1.5 py-0.5 rounded text-white"
+                                style={{ fontSize: 10, background: VUELTA_MAP_COLORS[r.vuelta] ?? '#666' }}>V{r.vuelta}</span>
+                              <span className="font-medium truncate" style={{ color: '#1a1a1a', maxWidth: 140 }} title={r.cliente}>{r.cliente}</span>
+                              <span style={{ color: '#B9BBB7' }}>NV {r.nv}</span>
+                              {r.posiciones != null && r.posiciones > 0 && (
+                                <span style={{ color: '#254A96', fontWeight: 600 }}>{r.posiciones} pos.</span>
+                              )}
+                              {r.peso != null && r.peso > 0 && (
+                                <span style={{ color: '#B9BBB7' }}>{r.peso.toLocaleString()} kg</span>
+                              )}
+                              <button
+                                className="ml-auto text-xs px-2.5 py-1 rounded-lg font-medium shrink-0"
+                                style={{ background: isAsig ? '#E52322' : '#fde8e8', color: isAsig ? 'white' : '#E52322' }}
+                                onClick={() => {
+                                  if (isAsig) { setAsigId(null); return }
+                                  setAsigId(r.id); setAsigCamion(camionCod); setAsigVuelta(defaultV)
+                                }}>
+                                {isAsig ? 'Cancelar' : `✓ Asignar V${defaultV}`}
+                              </button>
+                            </div>
+                            {isAsig && (
+                              <div className="px-3 py-2 flex items-center gap-2 flex-wrap"
+                                style={{ background: '#fff8f8', borderTop: '1px solid #fde8e8' }}>
+                                <span className="text-xs font-medium shrink-0" style={{ color: '#E52322' }}>
+                                  {camionCod} en:
+                                </span>
+                                <div className="flex gap-1 flex-wrap">
+                                  {(vueltasLibres.length > 0 ? vueltasLibres : [r.vuelta]).map(v => (
+                                    <button key={v} onClick={() => setAsigVuelta(v)}
+                                      className="text-xs px-2 py-1 rounded-lg font-medium"
+                                      style={{ background: asigVuelta === v ? '#E52322' : '#fde8e8', color: asigVuelta === v ? 'white' : '#E52322' }}>
+                                      V{v}
+                                    </button>
+                                  ))}
+                                </div>
+                                <button
+                                  disabled={procesando}
+                                  onClick={async () => { setProcesando(true); await onAsignarRestricto(r.id, asigCamion, asigVuelta); setAsigId(null); setProcesando(false) }}
+                                  className="text-xs px-3 py-1 rounded-lg font-semibold text-white disabled:opacity-50 shrink-0"
+                                  style={{ background: '#E52322' }}>
+                                  {procesando ? '…' : 'Confirmar'}
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── Sección 2: Consolidaciones ────────────────────────────────────── */}
+        {visibles.length > 0 && (
+          <div style={{ borderTop: '2px solid #fde68a' }}>
+            <button className="w-full px-4 py-2 flex items-center gap-2 text-left"
+              style={{ background: '#fffbeb' }}
+              onClick={() => setSec2Open(o => !o)}>
+              <span className="text-xs font-semibold" style={{ color: '#92400e' }}>🔀 Oportunidades de consolidación</span>
+              <span className="text-xs ml-auto" style={{ color: '#b45309' }}>{visibles.length} grupo{visibles.length > 1 ? 's' : ''} · {sec2Open ? '▲' : '▼'}</span>
+            </button>
+            {sec2Open && (
+        <div className="px-3 pb-3 pt-1 space-y-2 bg-white">
+          {visibles.map(grupo => {
+            const totalPos = grupo.pedidos.reduce((s, p) => s + (p.posiciones ?? 0), 0)
+            const totalKg  = grupo.pedidos.reduce((s, p) => s + (p.peso ?? 0), 0)
+            const isAceptando = aceptandoKey === grupo.key
+            return (
+              <div key={grupo.key} className="rounded-xl overflow-hidden"
+                style={{ border: '1px solid #fde68a', background: 'white' }}>
+
+                {/* Cabecera del grupo */}
+                <div className="px-3 py-2 flex items-center gap-2 flex-wrap"
+                  style={{ background: grupo.tipo === 'mismo_cliente' ? '#fef9c3' : '#f0fdf4', borderBottom: '1px solid #fde68a' }}>
+                  <div className="flex items-center gap-2 min-w-0 flex-1 flex-wrap">
+                    <span className="text-xs font-semibold" style={{ color: '#92400e' }}>
+                      {grupo.tipo === 'mismo_cliente' ? '👤' : '📍'} {grupo.etiqueta}
+                    </span>
+                    <span className="text-xs px-1.5 py-0.5 rounded-full font-medium shrink-0"
+                      style={{ background: grupo.tipo === 'mismo_cliente' ? '#fde68a' : '#bbf7d0', color: grupo.tipo === 'mismo_cliente' ? '#92400e' : '#065f46' }}>
+                      {grupo.tipo === 'mismo_cliente' ? 'mismo cliente' : `${grupo.distanciaKm} km`}
+                    </span>
+                    <span className="text-xs shrink-0" style={{ color: '#b45309' }}>
+                      {grupo.pedidos.length} ped.
+                      {totalPos > 0 ? ` · ${totalPos} pos.` : ''}
+                      {totalKg > 0 ? ` · ${Math.round(totalKg).toLocaleString()} kg` : ''}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <button
+                      onClick={() => {
+                        if (isAceptando && !aceptandoCamion) { setAceptandoKey(null); return }
+                        const minVuelta = Math.min(...grupo.pedidos.map(p => p.vuelta))
+                        setAceptarVuelta(minVuelta)
+                        setAceptandoCamion(null)
+                        setAceptandoKey(grupo.key)
+                      }}
+                      className="text-xs px-2 py-1 rounded-lg font-medium"
+                      style={{ background: isAceptando && !aceptandoCamion ? '#065f46' : '#d1fae5', color: isAceptando && !aceptandoCamion ? 'white' : '#065f46' }}>
+                      ✓ Mover a vuelta
+                    </button>
+                    <button
+                      onClick={() => setMapaExpandidoKey(mapaExpandidoKey === grupo.key ? null : grupo.key)}
+                      className="text-xs px-2 py-1 rounded-lg font-medium"
+                      style={{ background: mapaExpandidoKey === grupo.key ? '#254A96' : '#e8edf8', color: mapaExpandidoKey === grupo.key ? 'white' : '#254A96' }}
+                      title="Ver preview de mapa">🗺️</button>
+                    <button onClick={() => onDescartar(grupo.key)}
+                      className="text-xs px-2 py-1 rounded-lg"
+                      style={{ color: '#b45309', background: '#fef3c7' }}>
+                      ✕
+                    </button>
+                  </div>
+                </div>
+
+                {/* Panel vuelta destino — consolidar o asignar a camión */}
+                {isAceptando && (
+                  <div className="px-3 py-2 flex items-center gap-3 flex-wrap"
+                    style={{ background: aceptandoCamion ? '#eff6ff' : '#f0fdf4', borderBottom: `1px solid ${aceptandoCamion ? '#bfdbfe' : '#bbf7d0'}` }}>
+                    <span className="text-xs font-medium shrink-0" style={{ color: aceptandoCamion ? '#1d4ed8' : '#065f46' }}>
+                      {aceptandoCamion ? `Asignar a ${aceptandoCamion} en:` : 'Mover todos en:'}
+                    </span>
+                    <div className="flex gap-1 flex-wrap">
+                      {(aceptandoCamion
+                        ? (grupo.camionesCompatibles.find(c => c.codigo === aceptandoCamion)?.vueltasLibres ?? vueltasDisponibles(fecha))
+                        : vueltasDisponibles(fecha)
+                      ).map(v => (
+                        <button key={v} onClick={() => setAceptarVuelta(v)}
+                          className="text-xs px-2 py-1 rounded-lg font-medium transition-colors"
+                          style={{ background: aceptarVuelta === v ? '#254A96' : '#e8edf8', color: aceptarVuelta === v ? 'white' : '#254A96' }}>
+                          {v === 5 ? 'DHora' : `V${v}`}
+                        </button>
+                      ))}
+                    </div>
+                    <button onClick={() => confirmarAceptar(grupo.key, grupo.pedidos.map(p => p.id))}
+                      disabled={procesando}
+                      className="text-xs px-3 py-1 rounded-lg font-semibold text-white disabled:opacity-50 shrink-0"
+                      style={{ background: aceptandoCamion ? '#1d4ed8' : '#065f46' }}>
+                      {procesando ? '…' : aceptandoCamion ? `Programar en ${aceptandoCamion}` : 'Mover todos'}
+                    </button>
+                    <button onClick={() => { setAceptandoKey(null); setAceptandoCamion(null) }}
+                      className="text-xs px-2 py-1 rounded-lg shrink-0"
+                      style={{ color: '#666', background: '#f0f0f0' }}>Cancelar</button>
+                    {/* Warning si el camión es la única opción de algún pedido en riesgo */}
+                    {aceptandoCamion && (() => {
+                      const conflictos = pedidosEnRiesgo.filter(p =>
+                        p.camionesIds.length === 1 && p.camionesIds[0] === aceptandoCamion &&
+                        !grupo.pedidos.some(gp => gp.id === p.id)
+                      )
+                      if (conflictos.length === 0) return null
+                      return (
+                        <div className="w-full mt-1 px-2 py-1.5 rounded-lg text-xs flex items-start gap-1.5"
+                          style={{ background: '#fde8e8', color: '#E52322', border: '1px solid #fca5a5' }}>
+                          <span className="shrink-0">⚠️</span>
+                          <span>
+                            <strong>{aceptandoCamion} es la única opción</strong> para{' '}
+                            {conflictos.map(p => `NV ${p.nv} (${p.cliente.split(' ')[0]})`).join(', ')}
+                            . Si lo asignás acá, ese pedido queda sin camión.
+                          </span>
+                        </div>
+                      )
+                    })()}
+                  </div>
+                )}
+
+                {/* Camiones compatibles — botones de asignación directa */}
+                {grupo.camionesCompatibles.length > 0 && (
+                  <div className="px-3 py-2 flex items-center gap-2 flex-wrap"
+                    style={{ background: '#f8faff', borderBottom: '1px solid #e8edf8' }}>
+                    <span className="text-xs shrink-0" style={{ color: '#B9BBB7' }}>📦 Asignar en:</span>
+                    {grupo.camionesCompatibles.map(c => {
+                      const isActive = isAceptando && aceptandoCamion === c.codigo
+                      // ¿Este camión es la única opción de algún pedido en riesgo (que no esté en este grupo)?
+                      const esPeligroso = pedidosEnRiesgo.some(p =>
+                        p.camionesIds.length === 1 && p.camionesIds[0] === c.codigo &&
+                        !grupo.pedidos.some(gp => gp.id === p.id)
+                      )
+                      return (
+                        <button key={c.codigo}
+                          onClick={() => {
+                            if (isActive) { setAceptandoKey(null); setAceptandoCamion(null); return }
+                            const minVuelta = Math.min(...grupo.pedidos.map(p => p.vuelta))
+                            setAceptarVuelta(minVuelta)
+                            setAceptandoCamion(c.codigo)
+                            setAceptandoKey(grupo.key)
+                          }}
+                          className="text-xs px-2 py-1 rounded-lg font-medium transition-colors relative"
+                          style={{
+                            background: isActive ? '#254A96' : esPeligroso ? '#fde8e8' : '#e8edf8',
+                            color: isActive ? 'white' : esPeligroso ? '#E52322' : '#254A96',
+                            border: esPeligroso ? '1px solid #fca5a5' : 'none',
+                          }}
+                          title={esPeligroso
+                            ? `⚠️ Este camión es la única opción de otro pedido en riesgo`
+                            : `${c.tipo_unidad} · ${c.posiciones_total > 0 ? `${c.posiciones_total} pos.` : ''} · ${(c.tonelaje_max_kg / 1000).toFixed(0)}t`}>
+                          {esPeligroso && <span style={{ marginRight: 2 }}>⚠️</span>}
+                          {c.codigo}
+                          <span style={{ opacity: 0.7, fontSize: 9 }}>
+                            {c.posiciones_total > 0 ? ` ${c.posiciones_total}p` : ''}
+                          </span>
+                        </button>
+                      )
+                    })}
+                  </div>
+                )}
+
+                {/* Pedidos del grupo */}
+                <div>
+                  {grupo.pedidos.map((item, idx) => {
+                    const isExp = itemsExpandidos.has(item.id)
+                    const items = itemsData[item.id]
+                    const isLast = idx === grupo.pedidos.length - 1
+                    return (
+                      <div key={item.id} style={{ borderBottom: isLast ? 'none' : '1px solid #fef9c3' }}>
+                        {/* Línea principal */}
+                        <div className="px-3 py-1.5 flex items-center gap-2 text-xs">
+                          <span className="shrink-0 font-bold px-1.5 py-0.5 rounded text-white"
+                            style={{ fontSize: 10, background: '#254A96' }}>V{item.vuelta}</span>
+                          <span className="font-medium truncate" style={{ color: '#1a1a1a', maxWidth: 150 }} title={item.cliente}>
+                            {item.cliente}
+                          </span>
+                          <span className="shrink-0" style={{ color: '#B9BBB7' }}>NV {item.nv}</span>
+                          {item.idDespacho && (
+                            <span className="shrink-0" style={{ color: '#B9BBB7' }}>SD {item.idDespacho}</span>
+                          )}
+                          {/* Posiciones — click para editar inline */}
+                          {editandoPosId === item.id ? (
+                            <span className="flex items-center gap-1 shrink-0">
+                              <input
+                                type="number" min={0} step={1}
+                                value={editPosVal}
+                                onChange={e => setEditPosVal(e.target.value)}
+                                onKeyDown={async e => {
+                                  if (e.key === 'Enter') {
+                                    const v = parseInt(editPosVal)
+                                    if (!isNaN(v) && v >= 0) {
+                                      setGuardandoPos(true)
+                                      await onEditarPosiciones(item.id, v)
+                                      setGuardandoPos(false)
+                                    }
+                                    setEditandoPosId(null)
+                                  }
+                                  if (e.key === 'Escape') setEditandoPosId(null)
+                                }}
+                                autoFocus
+                                className="w-14 border rounded px-1 py-0.5 text-center"
+                                style={{ fontSize: 11, borderColor: '#254A96', color: '#254A96' }}
+                              />
+                              <button
+                                disabled={guardandoPos}
+                                onClick={async () => {
+                                  const v = parseInt(editPosVal)
+                                  if (!isNaN(v) && v >= 0) {
+                                    setGuardandoPos(true)
+                                    await onEditarPosiciones(item.id, v)
+                                    setGuardandoPos(false)
+                                  }
+                                  setEditandoPosId(null)
+                                }}
+                                className="px-1.5 py-0.5 rounded font-semibold text-white disabled:opacity-50"
+                                style={{ fontSize: 10, background: '#254A96' }}>
+                                {guardandoPos ? '…' : '✓'}
+                              </button>
+                              <button onClick={() => setEditandoPosId(null)}
+                                className="px-1 py-0.5 rounded"
+                                style={{ fontSize: 10, color: '#666', background: '#f0f0f0' }}>✕</button>
+                            </span>
+                          ) : (
+                            <button
+                              onClick={() => { setEditandoPosId(item.id); setEditPosVal(String(item.posiciones ?? 0)) }}
+                              className="shrink-0 font-medium px-1.5 py-0.5 rounded"
+                              style={{ color: '#254A96', background: '#e8edf8', fontSize: 11 }}
+                              title="Editar posiciones">
+                              {item.posiciones != null && item.posiciones > 0 ? `${item.posiciones} pos.` : '— pos.'}
+                            </button>
+                          )}
+                          {item.peso != null && item.peso > 0 && (
+                            <span className="shrink-0" style={{ color: '#B9BBB7' }}>{item.peso.toLocaleString()} kg</span>
+                          )}
+                          <button onClick={() => toggleItems(item.id)}
+                            className="ml-auto shrink-0 px-1.5 py-0.5 rounded"
+                            style={{ fontSize: 10, color: '#B9BBB7', background: '#f4f4f3' }}
+                            title={isExp ? 'Ocultar detalle' : 'Ver productos'}>
+                            {isExp ? '▲' : '▼'}
+                          </button>
+                        </div>
+                        {/* Detalle expandible */}
+                        {isExp && (
+                          <div className="pl-10 pr-3 pb-2 text-xs space-y-0.5">
+                            {item.direccion && (
+                              <p style={{ color: '#9ca3af' }}>{item.direccion}</p>
+                            )}
+                            {items === undefined ? (
+                              <p style={{ color: '#B9BBB7' }}>Cargando ítems…</p>
+                            ) : items.length === 0 ? (
+                              <p style={{ color: '#B9BBB7' }}>Sin ítems cargados</p>
+                            ) : items.map((it, i) => (
+                              <p key={i} style={{ color: '#555' }}>
+                                <span style={{ color: '#254A96', fontWeight: 600 }}>{it.cantidad}</span>
+                                {it.unidad ? ` ${it.unidad}` : ''} — {it.nombre}
+                              </p>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+                {/* Mini-mapa del grupo */}
+                {mapaExpandidoKey === grupo.key && (
+                  <MapaGrupoConsolidacion pedidos={grupo.pedidos} sucursal={sucursal} />
+                )}
+              </div>
+            )
+          })}
+          <p className="text-xs px-1 pt-0.5 pb-2" style={{ color: '#b45309' }}>
+            💡 "Mover a vuelta" agrupa sin asignar. "Asignar en camión" programa directo. Solo se muestran vueltas con capacidad libre.
+          </p>
+        </div>
+        )}
+          </div>
+        )}
+
+        {/* ── Sección 3: Pocas opciones (2 camiones) ───────────────────────── */}
+        {pocasOpciones.length > 0 && (
+          <div style={{ borderTop: '2px solid #fde68a' }}>
+            <button className="w-full px-4 py-2 flex items-center gap-2 text-left"
+              style={{ background: '#fef9c3' }}
+              onClick={() => setSec3Open(o => !o)}>
+              <span className="text-xs font-semibold" style={{ color: '#b45309' }}>⚠️ Pocas opciones de camión (2 disponibles)</span>
+              <span className="text-xs ml-auto" style={{ color: '#b45309' }}>{pocasOpciones.length} pedido{pocasOpciones.length > 1 ? 's' : ''} · {sec3Open ? '▲' : '▼'}</span>
+            </button>
+            {sec3Open && (
+              <div className="bg-white divide-y" style={{ borderColor: '#fef9c3' }}>
+                {pocasOpciones.map(p => (
+                  <div key={p.id} className="px-3 py-1.5 flex items-center gap-2 text-xs flex-wrap">
+                    <span className="shrink-0 font-bold px-1.5 py-0.5 rounded text-white"
+                      style={{ fontSize: 10, background: VUELTA_MAP_COLORS[p.vuelta] ?? '#666' }}>V{p.vuelta}</span>
+                    <span className="font-medium truncate" style={{ color: '#1a1a1a', maxWidth: 150 }} title={p.cliente}>{p.cliente}</span>
+                    <span style={{ color: '#B9BBB7' }}>NV {p.nv}</span>
+                    {p.posiciones != null && p.posiciones > 0 && (
+                      <span style={{ color: '#254A96', fontWeight: 600 }}>{p.posiciones} pos.</span>
+                    )}
+                    {p.peso != null && p.peso > 0 && (
+                      <span style={{ color: '#B9BBB7' }}>{p.peso.toLocaleString()} kg</span>
+                    )}
+                    <div className="ml-auto flex gap-1 flex-wrap">
+                      {p.camionesIds.map(cod => (
+                        <span key={cod} className="text-xs px-2 py-0.5 rounded-full font-medium"
+                          style={{ background: '#fef3c7', color: '#b45309' }}>
+                          {cod} ({(p.camionVueltasLibres[cod] ?? []).map(v => `V${v}`).join(', ') || 'sin lugar'})
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        </div>
+      )}
+    </div>
+  )
+}
+
 function ProgramacionInner() {
-  const router = useRouter()
   const params = useSearchParams()
   const [fecha, setFecha] = useState(params.get('fecha') ?? hoy())
   const [sucursal, setSucursal] = useState(params.get('sucursal') ?? 'LP520')
@@ -824,8 +1915,30 @@ function ProgramacionInner() {
   const [bannerGrandeDismissed, setBannerGrandeDismissed] = useState(false)
   const [flotaSinRevisar, setFlotaSinRevisar] = useState(false)
   const [contadorSinVuelta, setContadorSinVuelta] = useState(0)
+  const [contadorTransferencias, setContadorTransferencias] = useState(0)
+  const [transferencias, setTransferencias] = useState<any[]>([])
+  const [camionesTransfer, setCamionesTransfer] = useState<Camion[]>([])
+  const [recalculandoTodos, setRecalculandoTodos] = useState(false)
+  const dragTransferRef = useRef<Pedido | null>(null)
+  // Pre-programación y consolidación
+  const [consolidaciones, setConsolidaciones] = useState<ConsolidacionGrupo[]>([])
+  const [consolidacionDescartados, setConsolidacionDescartados] = useState<Set<string>>(new Set())
+  const [pedidosEnRiesgo, setPedidosEnRiesgo] = useState<PedidoEnRiesgo[]>([])
+  const [pedidosParaSeparar, setPedidosParaSeparar] = useState<PedidoParaSeparar[]>([])
+  const [flotaConsolidacion, setFlotaConsolidacion] = useState<ConsolidacionCamionBase[]>([])
   const [modalRutas, setModalRutas] = useState(false)
+  const [vultasCerradasManual, setVultasCerradasManual] = useState<Set<number>>(new Set())
+  const [camionesBlockeados, setCamionesBlockeados] = useState<Set<string>>(() => {
+    try {
+      const raw = localStorage.getItem('camionesBlockeados')
+      return raw ? new Set<string>(JSON.parse(raw)) : new Set<string>()
+    } catch { return new Set<string>() }
+  })
   const enrichGenRef = useRef(0)
+  // Guarda la última sugerencia IA para comparar con la confirmación final
+  const ultimaSugerenciaRef = useRef<{ asigs: Record<string, string | null>; timestamp: string } | null>(null)
+  // Orden de visitas optimizado devuelto por Google Route Opt (pedido_id → posición en ruta)
+  const ordenGoogleRef = useRef<Record<string, number>>({})
 
   const showToast = (msg: string, tipo: 'ok' | 'err' = 'ok') => { setToast({ msg, tipo }); setTimeout(() => setToast(null), 3000) }
 
@@ -846,15 +1959,333 @@ function ProgramacionInner() {
     })
   }, [])
 
+  // Cargar transferencias en paralelo (independiente de la vuelta activa)
+  useEffect(() => { cargarTransferencias() }, [fecha, sucursal])
   useEffect(() => { cargarDatos() }, [fecha, sucursal, vueltaActiva])
+  useEffect(() => { setConsolidacionDescartados(new Set()); detectarConsolidaciones() }, [fecha, sucursal])
+
+  async function detectarConsolidaciones() {
+    try {
+      // Queries en paralelo: pedidos sin asignar + pedidos ya asignados (para carga actual) + flota
+      const [{ data }, { data: asignados }, { data: flotaDia }] = await Promise.all([
+        supabase.from('pedidos')
+          .select('id, nv, id_despacho, cliente, direccion, latitud, longitud, vuelta, requiere_volcador, peso_total_kg, volumen_total_m3')
+          .eq('fecha_entrega', fecha).eq('sucursal', sucursal)
+          .in('estado', ['pendiente', 'programado'])
+          .gt('vuelta', 0).is('camion_id', null).is('grupo_confirmacion', null),
+        supabase.from('pedidos')
+          .select('camion_id, vuelta, volumen_total_m3, peso_total_kg')
+          .eq('fecha_entrega', fecha).eq('sucursal', sucursal)
+          .in('estado', ['pendiente', 'programado']).not('camion_id', 'is', null),
+        supabase.from('flota_dia').select('camion_codigo')
+          .eq('fecha', fecha).eq('activo', true)
+          .or(`sucursal.eq.${sucursal},sucursal_extra.eq.${sucursal}`),
+      ])
+
+      // ── Flota disponible ─────────────────────────────────────────────────────
+      let codigos: string[] = (flotaDia ?? []).map((f: any) => f.camion_codigo)
+      if (codigos.length === 0) {
+        const { data: base } = await supabase.from('camiones_flota').select('codigo').eq('sucursal', sucursal).eq('activo', true)
+        codigos = (base ?? []).map((b: any) => b.codigo)
+      }
+      let flotaBase: ConsolidacionCamionBase[] = []
+      if (codigos.length > 0) {
+        const { data: cd } = await supabase.from('camiones_flota')
+          .select('codigo, tipo_unidad, posiciones_total, tonelaje_max_kg, volcador, grua_hidraulica').in('codigo', codigos).eq('activo', true)
+        flotaBase = (cd ?? []).sort((a: any, b: any) => a.codigo.localeCompare(b.codigo, undefined, { numeric: true, sensitivity: 'base' }))
+      }
+
+      // ── Carga actual por (camión × vuelta) ──────────────────────────────────
+      const cargaActual: Record<string, Record<number, { pos: number; kg: number }>> = {}
+      for (const p of asignados ?? []) {
+        if (!p.camion_id) continue
+        if (!cargaActual[p.camion_id]) cargaActual[p.camion_id] = {}
+        if (!cargaActual[p.camion_id][p.vuelta]) cargaActual[p.camion_id][p.vuelta] = { pos: 0, kg: 0 }
+        cargaActual[p.camion_id][p.vuelta].pos += p.volumen_total_m3 ?? 0
+        cargaActual[p.camion_id][p.vuelta].kg += p.peso_total_kg ?? 0
+      }
+
+      // Helper: qué vueltas tiene libre un camión para las necesidades dadas
+      const VUELTAS_DIA = [1, 2, 3, 4, 5]
+      function vueltasLibresCamion(c: ConsolidacionCamionBase, posNeeded: number, kgNeeded: number): number[] {
+        return VUELTAS_DIA.filter(v => {
+          const carga = cargaActual[c.codigo]?.[v] ?? { pos: 0, kg: 0 }
+          const libreKg  = c.tonelaje_max_kg - carga.kg
+          const librePos = c.posiciones_total - carga.pos
+          return libreKg >= kgNeeded && (c.posiciones_total === 0 || posNeeded === 0 || librePos >= posNeeded)
+        })
+      }
+
+      if (!data || data.length < 1) { setConsolidaciones([]); setPedidosEnRiesgo([]); setPedidosParaSeparar([]); return }
+
+      // ── Detectar pedidos volcador demasiado grandes para un solo camión ─────
+      // Se usan TODOS los pedidos del día (incluso los ya asignados) para avisar
+      const flotaVolcador = flotaBase.filter(c => c.volcador)
+      if (flotaVolcador.length >= 2) {
+        const maxIndKg = Math.max(...flotaVolcador.map(c => c.tonelaje_max_kg))
+        const sumaKg = flotaVolcador.reduce((s, c) => s + c.tonelaje_max_kg, 0)
+        const paraSep: PedidoParaSeparar[] = []
+        for (const p of data.filter((p: any) => p.requiere_volcador)) {
+          const kg = p.peso_total_kg ?? 0
+          if (kg > maxIndKg && kg <= sumaKg) {
+            const nPartes = Math.ceil(kg / maxIndKg)
+            const camsOk = flotaVolcador
+              .filter(c => c.tonelaje_max_kg >= Math.ceil(kg / nPartes))
+              .sort((a, b) => b.tonelaje_max_kg - a.tonelaje_max_kg)
+              .slice(0, nPartes)
+            paraSep.push({
+              id: p.id, nv: p.nv, cliente: p.cliente, vuelta: p.vuelta,
+              peso: kg, posiciones: p.volumen_total_m3 ?? null,
+              nPartes, pesoXParte: Math.round(kg / nPartes),
+              camionesVolcador: camsOk,
+            })
+          }
+        }
+        setPedidosParaSeparar(paraSep)
+      } else {
+        setPedidosParaSeparar([])
+      }
+
+      // ── Filtrar volcador + granel ─────────────────────────────────────────────
+      const conFlag = data.filter((p: any) => !p.requiere_volcador)
+      let pedidosConGranel = new Set<string>()
+      if (conFlag.length > 0) {
+        const { data: itemsGranel } = await supabase
+          .from('pedido_items').select('pedido_id, nombre')
+          .in('pedido_id', conFlag.map((p: any) => p.id))
+        const GRANEL_KW = ['granel', 'estabilizado', 'cascote', 'gravilla', 'pedregullo', 'tosca', 'arena fina', 'arena gruesa']
+        pedidosConGranel = new Set(
+          (itemsGranel ?? [])
+            .filter((it: any) => GRANEL_KW.some(kw => it.nombre.toLowerCase().includes(kw)))
+            .map((it: any) => it.pedido_id as string)
+        )
+      }
+      const elegibles = conFlag.filter((p: any) => !pedidosConGranel.has(p.id))
+
+      const normCliente = (s: string) => s.toLowerCase()
+        .normalize('NFD').replace(/[̀-ͯ]/g, '')
+        .replace(/\b(s\.?a\.?|s\.?r\.?l\.?|sas|sa|srl)\b/g, '')
+        .replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim()
+
+      const toItem = (p: any): ConsolidacionItem => ({
+        id: p.id, nv: p.nv, idDespacho: p.id_despacho ?? null,
+        cliente: p.cliente, vuelta: p.vuelta, direccion: p.direccion ?? '',
+        peso: p.peso_total_kg ?? null, posiciones: p.volumen_total_m3 ?? null,
+        latitud: p.latitud ?? null, longitud: p.longitud ?? null,
+      })
+
+      // ── Paso 1: mismo cliente, ≥2 vueltas ────────────────────────────────────
+      const clienteMap = new Map<string, any[]>()
+      for (const p of elegibles) {
+        const key = normCliente(p.cliente)
+        if (!clienteMap.has(key)) clienteMap.set(key, [])
+        clienteMap.get(key)!.push(p)
+      }
+      const sugerencias: ConsolidacionGrupo[] = []
+      for (const [, grupo] of clienteMap) {
+        if (new Set(grupo.map((p: any) => p.vuelta)).size > 1) {
+          sugerencias.push({
+            key: `cliente-${normCliente(grupo[0].cliente)}`,
+            tipo: 'mismo_cliente', etiqueta: grupo[0].cliente,
+            pedidos: grupo.map(toItem).sort((a, b) => a.vuelta - b.vuelta),
+            camionesCompatibles: [],
+          })
+        }
+      }
+
+      // ── Paso 2: proximidad entre grupos de distintos clientes ────────────────
+      interface Entidad { clienteKey: string; lat: number; lng: number; pedidos: any[] }
+      const entidades: Entidad[] = []
+      for (const [key, grupo] of clienteMap) {
+        const cc = grupo.filter((p: any) => p.latitud != null && p.longitud != null)
+        if (!cc.length) continue
+        entidades.push({
+          clienteKey: key,
+          lat: cc.reduce((s: number, p: any) => s + p.latitud, 0) / cc.length,
+          lng: cc.reduce((s: number, p: any) => s + p.longitud, 0) / cc.length,
+          pedidos: grupo,
+        })
+      }
+      for (let i = 0; i < entidades.length; i++) {
+        for (let j = i + 1; j < entidades.length; j++) {
+          const ea = entidades[i], eb = entidades[j]
+          const vueltasA = new Set(ea.pedidos.map((p: any) => p.vuelta))
+          const vueltasB = new Set(eb.pedidos.map((p: any) => p.vuelta))
+          if (![...vueltasA].some(v => !vueltasB.has(v))) continue
+          const dist = distanciaKm(ea.lat, ea.lng, eb.lat, eb.lng)
+          if (dist < 3) {
+            sugerencias.push({
+              key: `prox-${ea.clienteKey}|${eb.clienteKey}`,
+              tipo: 'proximidad',
+              etiqueta: `${ea.pedidos[0].cliente} ↔ ${eb.pedidos[0].cliente}`,
+              distanciaKm: Math.round(dist * 10) / 10,
+              pedidos: [...ea.pedidos, ...eb.pedidos].map(toItem).sort((a, b) => a.vuelta - b.vuelta),
+              camionesCompatibles: [],
+            })
+          }
+        }
+      }
+
+      // ── Paso 3: factibilidad con capacidad RESTANTE + camionesCompatibles ────
+      const factibles = sugerencias
+        .map(grupo => {
+          const totalPos = grupo.pedidos.reduce((s, p) => s + (p.posiciones ?? 0), 0)
+          const totalKg  = grupo.pedidos.reduce((s, p) => s + (p.peso ?? 0), 0)
+          const camionesCompatibles: ConsolidacionCamion[] = flotaBase
+            .map(c => {
+              const vl = vueltasLibresCamion(c, totalPos, totalKg)
+              return vl.length > 0 ? { ...c, vueltasLibres: vl } : null
+            })
+            .filter(Boolean) as ConsolidacionCamion[]
+          return { ...grupo, camionesCompatibles }
+        })
+        .filter(g => flotaBase.length === 0 || g.camionesCompatibles.length > 0)
+
+      factibles.sort((a, b) => {
+        const posA = a.pedidos.reduce((s, p) => s + (p.posiciones ?? 0), 0)
+        const posB = b.pedidos.reduce((s, p) => s + (p.posiciones ?? 0), 0)
+        if (posB !== posA) return posB - posA
+        return b.pedidos.reduce((s, p) => s + (p.peso ?? 0), 0) - a.pedidos.reduce((s, p) => s + (p.peso ?? 0), 0)
+      })
+      setConsolidaciones(factibles)
+      setFlotaConsolidacion(flotaBase)
+
+      // ── Pedidos en riesgo — capacidad restante ≤ 2 camiones ─────────────────
+      // Usa conFlag (todos los pedidos no-volcador del día, incluidos ya asignados)
+      // para advertir incluso de los que ya tienen camión pero podrían afectar la planificación
+      if (flotaBase.length > 0) {
+        const enRiesgo: PedidoEnRiesgo[] = []
+        for (const p of conFlag) {
+          const pos = p.volumen_total_m3 ?? 0
+          const kg  = p.peso_total_kg ?? 0
+          if (pos === 0 && kg === 0) continue
+          const camionVueltasLibres: Record<string, number[]> = {}
+          for (const c of flotaBase) {
+            const vl = vueltasLibresCamion(c, pos, kg)
+            if (vl.length > 0) camionVueltasLibres[c.codigo] = vl
+          }
+          const trucksOk = Object.keys(camionVueltasLibres)
+          if (trucksOk.length > 0 && trucksOk.length <= 2) {
+            enRiesgo.push({
+              id: p.id, nv: p.nv, cliente: p.cliente, vuelta: p.vuelta,
+              posiciones: pos > 0 ? pos : null, peso: kg > 0 ? kg : null,
+              camionesIds: trucksOk,
+              camionVueltasLibres,
+            })
+          }
+        }
+        enRiesgo.sort((a, b) => a.camionesIds.length - b.camionesIds.length || (b.posiciones ?? 0) - (a.posiciones ?? 0))
+        setPedidosEnRiesgo(enRiesgo)
+      } else {
+        setPedidosEnRiesgo([])
+      }
+    } catch { /* silencioso */ }
+  }
+
+  async function cargarTransferencias() {
+    try {
+      const [res, { data: fd }] = await Promise.all([
+        fetch(`/api/requerimientos?tab=pendientes&sucursal_origen=${encodeURIComponent(sucursal)}`),
+        // Incluir camiones propios de la sucursal + camiones de otra sucursal disponibles acá (sucursal_extra)
+        supabase.from('flota_dia').select('camion_codigo, sucursal_extra, sucursal_extra_desde_vuelta')
+          .eq('fecha', fecha).eq('activo', true)
+          .or(`sucursal.eq.${sucursal},sucursal_extra.eq.${sucursal}`),
+      ])
+      const data = await res.json()
+      const list = Array.isArray(data) ? data : []
+      setTransferencias(list)
+      setContadorTransferencias(list.length)
+      // Cargar camiones para el kanban de transferencias
+      let codigos = (fd ?? []).map((f: any) => f.camion_codigo)
+      if (codigos.length === 0) {
+        const { data: baseData } = await supabase.from('camiones_flota').select('codigo').eq('sucursal', sucursal).eq('activo', true)
+        codigos = (baseData ?? []).map((b: any) => b.codigo)
+      }
+      if (codigos.length > 0) {
+        const { data: cd } = await supabase.from('camiones_flota').select('*').in('codigo', codigos).eq('activo', true)
+        setCamionesTransfer(
+          (cd ?? []).sort((a: any, b: any) => a.codigo.localeCompare(b.codigo, undefined, { numeric: true, sensitivity: 'base' }))
+        )
+      } else {
+        setCamionesTransfer([])
+      }
+    } catch {}
+  }
+
+  function transferToPedido(req: any): Pedido {
+    return {
+      id: req.id,
+      nv: req.nv ?? '—',
+      id_despacho: null,
+      cliente: req.cliente ? `${req.cliente}` : `→ ${req.sucursal_destino}`,
+      direccion: `🔀 Transferencia → ${req.sucursal_destino}`,
+      sucursal: req.sucursal_origen,
+      fecha_entrega: req.fecha_solicitada ?? fecha,
+      vuelta: req.vuelta ?? 1,
+      estado: req.estado,
+      estado_pago: 'cuenta_corriente',
+      peso_total_kg: null,
+      volumen_total_m3: null,
+      notas: req.notas ?? null,
+      camion_id: req.cod_vehiculo ?? null,
+      orden_entrega: null,
+      latitud: null,
+      longitud: null,
+      tipo: 'transferencia',
+      items: (req.requerimiento_items ?? []).map((it: any) => ({
+        nombre: it.nombre_producto,
+        cantidad: it.cantidad_solicitada,
+        unidad: '',
+      })),
+      prioridad: false,
+      barrio_cerrado: false,
+      requiere_volcador: false,
+    }
+  }
+
+  async function asignarCamionTransfer(reqId: string, codigoCamion: string | null) {
+    await fetch('/api/requerimientos', {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: reqId, cod_vehiculo: codigoCamion }),
+    })
+    setTransferencias(prev => prev.map(r => r.id === reqId ? { ...r, cod_vehiculo: codigoCamion } : r))
+  }
+
+  async function cambiarVueltaTransfer(reqId: string, vuelta: number) {
+    await fetch('/api/requerimientos', {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: reqId, vuelta }),
+    })
+    setTransferencias(prev => prev.map(r => r.id === reqId ? { ...r, vuelta } : r))
+  }
+
+  async function reprogramarTransfer(reqId: string, nuevaFecha: string, vuelta: number, _motivo: string) {
+    await fetch('/api/requerimientos', {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: reqId, fecha_solicitada: nuevaFecha, vuelta }),
+    })
+    setTransferencias(prev => prev.map(r => r.id === reqId ? { ...r, fecha_solicitada: nuevaFecha, vuelta } : r))
+    showToast('Transferencia reprogramada')
+  }
+
+  async function cancelarTransfer(reqId: string) {
+    if (!confirm('¿Cancelar esta transferencia?')) return
+    await fetch('/api/requerimientos', {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: reqId, estado: 'rechazado' }),
+    })
+    setTransferencias(prev => prev.filter(r => r.id !== reqId))
+    setContadorTransferencias(prev => Math.max(0, prev - 1))
+  }
 
   async function cargarDatos() {
+    if (vueltaActiva === VUELTA_TRANSFERENCIAS) { setCargando(false); return }
     setCargando(true); setConfirmado(false)
     let q = supabase.from('pedidos')
       .select('*, prioridad, barrio_cerrado')
       .eq('fecha_entrega', fecha).eq('sucursal', sucursal)
-      .in('estado', ['pendiente', 'programado']).order('cliente')
-    q = vueltaActiva === VUELTA_FUERA ? q.is('vuelta', null) : q.eq('vuelta', vueltaActiva)
+      .in('estado', ['pendiente', 'programado', 'en_camino', 'entregado', 'entregado_parcial', 'rechazado']).order('cliente')
+    q = vueltaActiva === VUELTA_FUERA ? q.eq('vuelta', 0) : q.eq('vuelta', vueltaActiva)
     const { data: pd } = await q
     const pedidosBase = pd ?? []
     // Fetch items via API (admin key, bypasses RLS)
@@ -914,17 +2345,88 @@ function ProgramacionInner() {
 
     const { data: cd } = todosCodigos.length > 0 ? await supabase.from('camiones_flota').select('*').in('codigo', todosCodigos).eq('activo', true) : { data: [] }
 
-    // Enriquecer con metadata de sucursal extra
-    const cams = (cd ?? []).map((c: any) => {
-      const extra = fdExtra.find((f: any) => f.camion_codigo === c.codigo)
-      return extra
-        ? { ...c, _desde_sucursal: extra.sucursal, _disponible_desde_vuelta: extra.sucursal_extra_desde_vuelta ?? 2 }
-        : c
-    })
+    // Enriquecer con metadata de sucursal extra y ordenar por código
+    const cams = (cd ?? [])
+      .map((c: any) => {
+        const extra  = fdExtra.find((f: any) => f.camion_codigo === c.codigo)
+        const propio = fd.find((f: any) => f.camion_codigo === c.codigo)
+        if (extra) {
+          // Camión que viene de otra sucursal: disponible desde vuelta X
+          return { ...c, _desde_sucursal: extra.sucursal, _disponible_desde_vuelta: extra.sucursal_extra_desde_vuelta ?? 2 }
+        }
+        if (propio?.sucursal_extra) {
+          // Camión local que se va a otra sucursal desde vuelta X
+          return { ...c, _sale_a_sucursal: propio.sucursal_extra, _sale_desde_vuelta: propio.sucursal_extra_desde_vuelta ?? 2 }
+        }
+        return c
+      })
+      .sort((a: any, b: any) => a.codigo.localeCompare(b.codigo, undefined, { numeric: true, sensitivity: 'base' }))
     setFlotaSinRevisar(flotaSinRevisar)
 
+    // Cargar vueltas cerradas manualmente para esta fecha/sucursal
+    const { data: vcmData } = await supabase
+      .from('vueltas_cerradas_manual')
+      .select('vuelta')
+      .eq('fecha', fecha)
+      .eq('sucursal', sucursal)
+    // vuelta=0 en DB = VUELTA_FUERA (-1) en UI
+    const cerradasDB = new Set<number>((vcmData ?? []).map((r: any) => r.vuelta === 0 ? VUELTA_FUERA : r.vuelta as number))
+    // Sábados: V3 y V4 cerradas por defecto (el ruteador puede abrirlas manualmente si necesita)
+    if (esSabado(fecha)) { cerradasDB.add(3); cerradasDB.add(4) }
+    setVultasCerradasManual(cerradasDB)
+
+    // Marcar camiones posiblemente en ruta según distancia máxima en vueltas pasadas
+    let camsConAviso = cams
+    if (vueltaActiva > 1) {
+      const { data: pedPasados } = await supabase
+        .from('pedidos')
+        .select('camion_id, vuelta, latitud, longitud')
+        .eq('fecha_entrega', fecha)
+        .eq('sucursal', sucursal)
+        .eq('estado', 'programado')
+        .lt('vuelta', vueltaActiva)
+        .not('camion_id', 'is', null)
+
+      const deposito = DEPOSITOS[sucursal] ?? { lat: -34.9205, lng: -57.9536 }
+      // cod → { vuelta, distKm } de la vuelta pasada más reciente que genera aviso
+      const enRuta: Record<string, { vuelta: number; distKm: number }> = {}
+
+      if (pedPasados && pedPasados.length > 0) {
+        const porCamionVuelta: Record<string, Record<number, { lat: number; lng: number }[]>> = {}
+        for (const p of pedPasados) {
+          if (!p.camion_id || !p.vuelta) continue
+          if (!porCamionVuelta[p.camion_id]) porCamionVuelta[p.camion_id] = {}
+          if (!porCamionVuelta[p.camion_id][p.vuelta]) porCamionVuelta[p.camion_id][p.vuelta] = []
+          if (p.latitud && p.longitud) {
+            porCamionVuelta[p.camion_id][p.vuelta].push({ lat: p.latitud, lng: p.longitud })
+          }
+        }
+        for (const [camionCod, vueltas] of Object.entries(porCamionVuelta)) {
+          for (const [vStr, coords] of Object.entries(vueltas)) {
+            const v = parseInt(vStr)
+            if (coords.length === 0) continue
+            const maxDist = Math.max(...coords.map(c => distanciaKm(deposito.lat, deposito.lng, c.lat, c.lng)))
+            const maxVueltas = maxVueltasPorDistancia(maxDist)
+            const vultasASkip = Math.ceil(5 / maxVueltas) - 1
+            if (vultasASkip > 0 && vueltaActiva <= v + vultasASkip) {
+              // Guardar la vuelta más reciente que genera el aviso
+              if (!enRuta[camionCod] || v > enRuta[camionCod].vuelta) {
+                enRuta[camionCod] = { vuelta: v, distKm: Math.round(maxDist) }
+              }
+            }
+          }
+        }
+      }
+
+      // Marcar camiones con aviso (siempre se muestran, nunca se ocultan)
+      camsConAviso = cams.map(c => enRuta[c.codigo]
+        ? { ...c, _en_ruta: true, _en_ruta_desde_vuelta: enRuta[c.codigo].vuelta, _en_ruta_dist_km: enRuta[c.codigo].distKm }
+        : c
+      )
+    }
+
     const conLocalidad = todosConItems.map((p: any) => ({ ...p, localidad: localidadDeDireccion(p.direccion) }))
-    setPedidos(conLocalidad); setCamiones(cams); construirColumnas(conLocalidad, cams); setCargando(false)
+    setPedidos(conLocalidad); setCamiones(camsConAviso); construirColumnas(conLocalidad, camsConAviso); setCargando(false)
     enrichLocalidades(conLocalidad)
   }
 
@@ -967,15 +2469,104 @@ function ProgramacionInner() {
     }
   }
 
-  function handleSugerir() {
+  async function handleSugerir() {
     const sin = pedidos.filter(p => !p.camion_id)
     if (!sin.length) return
-    const asigs = sugerirAsignacion(sin, camiones, pedidos.filter(p => p.camion_id), sucursal)
+    const camionesLibres = camiones.filter(c => !camionesBlockeados.has(c.codigo))
+    const ya = pedidos.filter(p => p.camion_id)
+
+    const useGoogleRoute = process.env.NEXT_PUBLIC_USE_GOOGLE_ROUTE_OPT === 'true'
+
+    // Capa 1 solo cuando NO está Google activo
+    let asigs: Record<string, string | null> = {}
+    if (!useGoogleRoute) {
+      // Mostrar clusters detectados para feedback visual
+      const clusters = buildClusters(sin).filter(c => c.length > 1)
+      if (clusters.length > 0) {
+        const desc = clusters.map(c => c.map(p => p.cliente.split(' ')[0]).join('+') ).join(' | ')
+        showToast(`🗂️ ${clusters.length} grupo${clusters.length > 1 ? 's' : ''} detectado${clusters.length > 1 ? 's' : ''}: ${desc}`)
+      }
+      asigs = sugerirAsignacion(sin, camionesLibres, ya, sucursal)
+    }
+
+    // Capa 2: Google Route Optimization o Claude Haiku
+    setCargando(true)
+    try {
+      const res = await fetch('/api/sugerir-asignacion', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pedidos: sin, camiones: camionesLibres, ya_asignados: ya, sugerencia: asigs, sucursal }),
+      })
+      if (res.ok) {
+        const data = await res.json()
+        if (data.asignacion) {
+          Object.assign(asigs, data.asignacion)
+          // Guardar orden de visitas optimizado de Google para usarlo en Confirmar
+          if (data.ordenEntrega && Object.keys(data.ordenEntrega).length > 0) {
+            ordenGoogleRef.current = data.ordenEntrega
+          }
+          const isGoogle = (data.engine ?? '').includes('google')
+          const engineLabel = isGoogle ? '🗺️ Google Route Opt.' : '🤖 IA (Claude)'
+          if (data.cambios?.length) {
+            showToast(`${engineLabel} — ${data.cambios.length} cambio${data.cambios.length > 1 ? 's' : ''}`)
+          } else if (isGoogle) {
+            const asignados = Object.values(data.asignacion as Record<string, string | null>).filter(Boolean).length
+            showToast(`${engineLabel} — ${asignados} pedidos asignados`)
+          }
+        }
+      }
+    } catch { /* si falla, usamos la sugerencia que tengamos (vacía si Google, Layer 1 si Claude) */ }
+    setCargando(false)
+
     const act = pedidos.map(p => ({ ...p, camion_id: p.id in asigs ? asigs[p.id] : p.camion_id }))
     setPedidos(act); construirColumnas(act, camiones)
-    // Detectar overflow (no entraron en ningún camión)
     const overflow = act.filter(p => asigs[p.id] === null)
     setOverflowPedidos(vueltaActiva < 4 ? overflow : [])
+
+    // Guardar sugerencia para comparar con confirmación final
+    ultimaSugerenciaRef.current = { asigs, timestamp: new Date().toISOString() }
+
+    // Log de auditoría con detalle de la sugerencia
+    if (userId) {
+      const asignados = Object.entries(asigs).filter(([, c]) => c !== null)
+      const sinCamionIA = Object.entries(asigs).filter(([, c]) => c === null)
+      logAuditoria(userId, userNombre, 'Aplicó sugerencia IA', 'Programación', {
+        fecha, sucursal, vuelta: vueltaActiva,
+        total_sin_asignar_antes: sin.length,
+        asignados_por_ia: asignados.length,
+        sin_camion_ia: sinCamionIA.length,
+        sugerencia: sin.map(p => ({
+          id: p.id,
+          nv: p.nv,
+          cliente: p.cliente,
+          localidad: p.localidad ?? null,
+          peso_kg: p.peso_total_kg ?? 0,
+          posiciones: p.volumen_total_m3 ?? 0,
+          camion_sugerido: asigs[p.id] ?? null,
+        })),
+      })
+    }
+  }
+
+  async function handleLimpiar() {
+    const conAsignacion = pedidos.filter(p => p.camion_id)
+    // Limpiar estado local inmediatamente
+    const limpio = pedidos.map(p => ({ ...p, camion_id: null }))
+    setPedidos(limpio); construirColumnas(limpio, camiones); setConfirmado(false)
+    ordenGoogleRef.current = {} // descartar orden guardado de Google
+    // Limpiar DB si había algo confirmado
+    if (conAsignacion.length > 0) {
+      setGuardando(true)
+      try {
+        await Promise.all(conAsignacion.map(p =>
+          supabase.from('pedidos').update({ camion_id: null, estado: 'pendiente', orden_entrega: null }).eq('id', p.id)
+        ))
+      } catch (e: any) {
+        showToast(`Error al limpiar: ${e.message}`, 'err')
+      } finally {
+        setGuardando(false)
+      }
+    }
   }
 
   async function handleMoverOverflow() {
@@ -1017,9 +2608,17 @@ function ProgramacionInner() {
     })
 
     const ordenes: Record<string, number> = {}
+    const ordenGoogle = ordenGoogleRef.current
     Object.entries(porCamion).forEach(([, pedidosCamion]) => {
-      const orden = calcularOrdenRuta(pedidosCamion, sucursal)
-      Object.assign(ordenes, orden)
+      // Filtrar el orden de Google solo para los pedidos de este camión
+      // Si el ruteador movió algún pedido manualmente (no está en ordenGoogle), calcularOrdenRuta
+      // detectará que ese pedido no tiene orden y caerá al final — o bien recalculará todo si
+      // ningún pedido del camión tiene orden de Google
+      const tieneOrdenGoogle = pedidosCamion.some(p => ordenGoogle[p.id] != null)
+      const ordenCamion = tieneOrdenGoogle
+        ? calcularOrdenRuta(pedidosCamion, sucursal, ordenGoogle)
+        : calcularOrdenRuta(pedidosCamion, sucursal)
+      Object.assign(ordenes, ordenCamion)
     })
 
     try {
@@ -1047,7 +2646,44 @@ function ProgramacionInner() {
       } else {
         setConfirmado(true)
         showToast('Programación confirmada')
-        if (userId) logAuditoria(userId, userNombre, 'Confirmó programación', 'Programación', { fecha, sucursal, vuelta: vueltaActiva, total_pedidos: pedidos.length, total_camiones: Object.keys(columnas.reduce((acc, col) => { if (col.pedidos.length > 0) acc[col.camion.codigo] = true; return acc }, {} as Record<string, boolean>)).length })
+        if (userId) {
+          const ultimaSug = ultimaSugerenciaRef.current
+          // Calcular cuántos pedidos el ruteador movió respecto a la sugerencia IA
+          const movimientos = ultimaSug
+            ? asignados.filter(p => {
+                const sugerido = ultimaSug.asigs[p.id]
+                return sugerido !== undefined && sugerido !== p.camion_id
+              }).map(p => ({
+                nv: p.nv,
+                cliente: p.cliente,
+                localidad: p.localidad ?? null,
+                camion_sugerido: ultimaSug.asigs[p.id] ?? null,
+                camion_final: p.camion_id,
+              }))
+            : []
+
+          logAuditoria(userId, userNombre, 'Confirmó programación', 'Programación', {
+            fecha, sucursal, vuelta: vueltaActiva,
+            total_pedidos: pedidos.filter(p => p.estado === 'pendiente' || p.estado === 'programado').length,
+            total_camiones: Object.keys(columnas.reduce((acc, col) => { if (col.pedidos.length > 0) acc[col.camion.codigo] = true; return acc }, {} as Record<string, boolean>)).length,
+            uso_sugerencia_ia: !!ultimaSug,
+            sugerencia_timestamp: ultimaSug?.timestamp ?? null,
+            movimientos_respecto_ia: movimientos.length,
+            asignaciones_finales: asignados.map(p => ({
+              id: p.id,
+              nv: p.nv,
+              cliente: p.cliente,
+              localidad: p.localidad ?? null,
+              peso_kg: p.peso_total_kg ?? 0,
+              posiciones: p.volumen_total_m3 ?? 0,
+              camion: p.camion_id,
+            })),
+            // Solo los movimientos donde el ruteador discrepó con la IA
+            correcciones_al_ia: movimientos,
+          })
+          // Reset para el próximo ciclo
+          ultimaSugerenciaRef.current = null
+        }
       }
     } catch (e: any) {
       showToast(`Error inesperado: ${e.message}`, 'err')
@@ -1075,6 +2711,50 @@ function ProgramacionInner() {
       showToast('Peso y posiciones actualizados')
       if (userId && pedido) logAuditoria(userId, userNombre, 'Editó peso/posiciones', 'Programación', { nv: pedido.nv, cliente: pedido.cliente, peso_anterior: pedido.peso_total_kg, peso_nuevo: peso, pos_anterior: pedido.volumen_total_m3, pos_nuevo: posiciones })
     } catch { showToast('Error al actualizar', 'err') }
+  }
+
+  async function handleRecalcularTodos() {
+    if (pedidos.length === 0) return
+    setRecalculandoTodos(true)
+    try {
+      const ids = pedidos.map(p => p.id)
+      const res = await fetch('/api/recalcular-posiciones', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pedido_ids: ids }),
+      })
+      const data = await res.json()
+      if (data.error) {
+        showToast(`Error: ${data.error}`, 'err')
+      } else {
+        const resultados: { id: string; posiciones: number; peso_kg: number; items_sin_match: string[] }[] = data.resultados ?? []
+        const act = pedidos.map(p => {
+          const r = resultados.find(r => r.id === p.id)
+          return r ? { ...p, peso_total_kg: r.peso_kg, volumen_total_m3: r.posiciones, pedido_grande: false } : p
+        })
+        setPedidos(act); construirColumnas(act, camiones)
+        // Guardar explícitamente (respaldo ante cargarDatos() concurrente)
+        await Promise.allSettled(resultados.map(r =>
+          patchPedido(r.id, { peso_total_kg: r.peso_kg, volumen_total_m3: r.posiciones, pedido_grande: false })
+        ))
+        const sinMatch = resultados.filter(r => r.items_sin_match?.length > 0).length
+        showToast(`↺ ${resultados.length} recalculados${sinMatch > 0 ? ` · ${sinMatch} con items sin match` : ''}`)
+        if (userId) logAuditoria(userId, userNombre, 'Recalculó posiciones (masivo)', 'Programación', { fecha, sucursal, vuelta: vueltaActiva, cantidad: resultados.length, sin_match: sinMatch })
+      }
+    } catch (e: any) { showToast(`Error: ${e.message}`, 'err') }
+    setRecalculandoTodos(false)
+  }
+
+  async function handleRecalcularPosiciones(id: string, peso: number, posiciones: number) {
+    const pedido = pedidos.find(p => p.id === id)
+    const act = pedidos.map(p => p.id === id ? { ...p, peso_total_kg: peso, volumen_total_m3: posiciones, pedido_grande: false } : p)
+    setPedidos(act); construirColumnas(act, camiones)
+    // Guardar explícitamente para evitar que cargarDatos() posterior sobrescriba con valores viejos
+    try {
+      await patchPedido(id, { peso_total_kg: peso, volumen_total_m3: posiciones, pedido_grande: false })
+    } catch { /* el API de recalcular ya guardó, este patch es respaldo */ }
+    showToast(`↺ Recalculado: ${peso} kg · ${posiciones} pos.`)
+    if (userId && pedido) logAuditoria(userId, userNombre, 'Recalculó posiciones', 'Programación', { nv: pedido.nv, cliente: pedido.cliente, peso_nuevo: peso, pos_nuevo: posiciones })
   }
 
   async function patchPedido(id: string, updates: Record<string, any>) {
@@ -1125,6 +2805,72 @@ function ProgramacionInner() {
     } catch { showToast('Error al mover sucursal', 'err') }
   }
 
+  async function handleAceptarConsolidacion(key: string, pedidoIds: string[], targetVuelta: number) {
+    const grupoId = crypto.randomUUID()
+    try {
+      await Promise.all(pedidoIds.map(id =>
+        patchPedido(id, { vuelta: targetVuelta, camion_id: null, estado: 'pendiente', orden_entrega: null, grupo_confirmacion: grupoId })
+      ))
+      setConsolidacionDescartados(prev => new Set([...prev, key]))
+      showToast(`${pedidoIds.length} pedidos consolidados en V${targetVuelta}`)
+      detectarConsolidaciones()
+      cargarDatos()
+      if (userId) logAuditoria(userId, userNombre, 'Consolidó pedidos de misma zona', 'Programación', { fecha, sucursal, vuelta_destino: targetVuelta, cantidad: pedidoIds.length, grupo_id: grupoId })
+    } catch (e: any) { showToast(`Error: ${e.message}`, 'err') }
+  }
+
+  async function handleSepararGranel(pedidoId: string, nPartes: number) {
+    try {
+      const res = await fetch('/api/separar-pedido-granel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pedido_id: pedidoId, n_partes: nPartes, _usuario_id: userId, _usuario_nombre: userNombre }),
+      })
+      const data = await res.json()
+      if (!data.success) throw new Error(data.error)
+      showToast(`Pedido separado en ${nPartes} partes iguales`)
+      setPedidosParaSeparar(prev => prev.filter(p => p.id !== pedidoId))
+      detectarConsolidaciones()
+      cargarDatos()
+    } catch (e: any) { showToast(`Error: ${e.message}`, 'err') }
+  }
+
+  async function handleAsignarRestricto(pedidoId: string, camionCodigo: string, vuelta: number) {
+    try {
+      await patchPedido(pedidoId, { vuelta, camion_id: camionCodigo, estado: 'programado', orden_entrega: null })
+      showToast(`Pedido asignado a ${camionCodigo} en V${vuelta}`)
+      detectarConsolidaciones()
+      cargarDatos()
+      if (userId) logAuditoria(userId, userNombre, 'Asignó pedido restricto', 'Programación', { fecha, sucursal, camion: camionCodigo, vuelta })
+    } catch (e: any) { showToast(`Error: ${e.message}`, 'err') }
+  }
+
+  async function handleAsignarGrupoConsolidacion(key: string, pedidoIds: string[], targetVuelta: number, camionCodigo: string) {
+    const grupoId = crypto.randomUUID()
+    try {
+      await Promise.all(pedidoIds.map(id =>
+        patchPedido(id, { vuelta: targetVuelta, camion_id: camionCodigo, estado: 'programado', orden_entrega: null, grupo_confirmacion: grupoId })
+      ))
+      setConsolidacionDescartados(prev => new Set([...prev, key]))
+      showToast(`${pedidoIds.length} pedidos asignados a ${camionCodigo} en V${targetVuelta}`)
+      detectarConsolidaciones()
+      cargarDatos()
+      if (userId) logAuditoria(userId, userNombre, 'Asignó grupo consolidado a camión', 'Programación', { fecha, sucursal, camion: camionCodigo, vuelta_destino: targetVuelta, cantidad: pedidoIds.length, grupo_id: grupoId })
+    } catch (e: any) { showToast(`Error: ${e.message}`, 'err') }
+  }
+
+  async function handleEditarPosicionesConsolidacion(pedidoId: string, posiciones: number) {
+    await patchPedido(pedidoId, { volumen_total_m3: posiciones })
+    // Actualizar el estado local de consolidaciones para reflejar el nuevo valor
+    setConsolidaciones(prev => prev.map(grupo => ({
+      ...grupo,
+      pedidos: grupo.pedidos.map(p => p.id === pedidoId ? { ...p, posiciones } : p),
+    })))
+    // También actualizar el kanban si el pedido está en la vuelta activa
+    const act = pedidos.map(p => p.id === pedidoId ? { ...p, volumen_total_m3: posiciones } : p)
+    setPedidos(act); construirColumnas(act, camiones)
+  }
+
   async function handleSepararPedido(id: string, itemsNuevo: any[], itemsMantener: any[]) {
     try {
       const res = await fetch('/api/separar-pedido', {
@@ -1164,23 +2910,35 @@ function ProgramacionInner() {
   }
 
   async function handleReprogramarVuelta() {
-    if (!reprogVueltaFecha || pedidos.length === 0) return
-    setGuardando(true)
+    if (!reprogVueltaFecha) return
+
+    // Solo reprogramar pedidos activos (excluir finalizados: en_camino, entregado, etc.)
+    const activos = pedidos.filter(p => p.estado === 'pendiente' || p.estado === 'programado')
     const aReprogramar = camionParaReprog
-      ? pedidos.filter(p => p.camion_id === camionParaReprog)
-      : pedidos
+      ? activos.filter(p => p.camion_id === camionParaReprog)
+      : activos
+
+    if (aReprogramar.length === 0) {
+      showToast('No hay pedidos activos para reprogramar', 'err')
+      return
+    }
+
+    setGuardando(true)
     try {
       const contexto = camionParaReprog ? `camión ${camionParaReprog}` : `vuelta completa`
       const nota = `⚡ Reprog. ${contexto} desde ${fecha} V${vueltaActiva}`
-      await Promise.all(aReprogramar.map(p =>
-        fetch('/api/pedidos', {
+      const resultados = await Promise.all(aReprogramar.map(async p => {
+        const res = await fetch('/api/pedidos', {
           method: 'PATCH', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ id: p.id, fecha_entrega: reprogVueltaFecha, vuelta: reprogVueltaNueva, camion_id: null, orden_entrega: null, estado: 'pendiente', notas: p.notas ? `${p.notas} | ${nota}` : nota })
         })
-      ))
+        const data = await res.json()
+        if (!res.ok) throw new Error(data.error ?? `Error en pedido ${p.nv}`)
+        return true
+      }))
       setModalReprogVuelta(false)
-      showToast(`${aReprogramar.length} pedidos reprogramados`)
-      if (userId) logAuditoria(userId, userNombre, 'Reprogramó vuelta completa', 'Programación', { fecha, vuelta: vueltaActiva, pedidos_count: aReprogramar.length, fecha_destino: reprogVueltaFecha })
+      showToast(`${resultados.length} pedidos reprogramados`)
+      if (userId) logAuditoria(userId, userNombre, 'Reprogramó vuelta completa', 'Programación', { fecha, vuelta: vueltaActiva, pedidos_count: resultados.length, fecha_destino: reprogVueltaFecha })
       cargarDatos()
     } catch (e: any) { showToast(`Error: ${e.message}`, 'err') }
     setGuardando(false)
@@ -1197,6 +2955,27 @@ function ProgramacionInner() {
       setPedidos(act); construirColumnas(act, camiones)
       showToast(`Pedido de ${pedido.cliente} reprogramado para el ${fecha}`)
       if (userId) logAuditoria(userId, userNombre, 'Reprogramó pedido', 'Programación', { nv: pedido.nv, cliente: pedido.cliente, fecha_nueva: fecha, vuelta_nueva: vuelta, motivo })
+    } catch (e: any) { showToast(`Error: ${e.message}`, 'err') }
+  }
+
+  async function handleToggleVueltaCerrada(vueltaUI: number) {
+    // En la UI "Fuera de prog." es -1, en la DB se guarda como 0 (igual que los pedidos)
+    const vueltaDB = vueltaUI === VUELTA_FUERA ? 0 : vueltaUI
+    const label = vueltaUI === VUELTA_FUERA ? 'Fuera de prog.' : `Vuelta ${vueltaUI}`
+    const estaCerrada = vultasCerradasManual.has(vueltaUI)
+    try {
+      if (estaCerrada) {
+        await supabase.from('vueltas_cerradas_manual')
+          .delete().eq('fecha', fecha).eq('sucursal', sucursal).eq('vuelta', vueltaDB)
+        setVultasCerradasManual(prev => { const s = new Set(prev); s.delete(vueltaUI); return s })
+        showToast(`${label} abierta`)
+      } else {
+        await supabase.from('vueltas_cerradas_manual')
+          .insert({ fecha, sucursal, vuelta: vueltaDB, cerrada_por: userId || null })
+        setVultasCerradasManual(prev => new Set([...prev, vueltaUI]))
+        showToast(`${label} cerrada manualmente`)
+      }
+      if (userId) logAuditoria(userId, userNombre, estaCerrada ? 'Abrió vuelta manualmente' : 'Cerró vuelta manualmente', 'Programación', { fecha, sucursal, vuelta: vueltaDB })
     } catch (e: any) { showToast(`Error: ${e.message}`, 'err') }
   }
 
@@ -1267,8 +3046,8 @@ function ProgramacionInner() {
         <div className="px-4 md:px-6">
           <div className="h-14 flex items-center justify-between gap-3 flex-wrap">
             <div className="flex items-center gap-3">
-              <button onClick={() => router.push('/dashboard')} className="flex items-center gap-1.5 text-sm font-medium px-3 py-1.5 rounded-lg shrink-0"
-                style={{ color: '#254A96', background: '#e8edf8' }}>← Volver</button>
+              <Link href="/dashboard" className="flex items-center gap-1.5 text-sm font-medium px-3 py-1.5 rounded-lg shrink-0"
+                style={{ color: '#254A96', background: '#e8edf8' }}>← Volver</Link>
               <img src="/logo.png" alt="Construyo al Costo" className="h-7 w-auto rounded-lg hidden sm:block" />
               <div className="hidden sm:block">
                 <span className="font-semibold text-sm" style={{ color: '#254A96' }}>Programación</span>
@@ -1284,27 +3063,60 @@ function ProgramacionInner() {
               </select>
             </div>
           </div>
-          <div className="flex gap-1.5 pb-3 flex-wrap">
+          <div className="flex gap-1.5 pb-3 flex-wrap items-center">
             {VUELTAS.map(v => {
               const activo = vueltaActiva === v.num
               const esFuera = v.num === VUELTA_FUERA
+              const esTransferencias = v.num === VUELTA_TRANSFERENCIAS
               const badge = esFuera && contadorSinVuelta > 0
+              const badgeTransf = esTransferencias && contadorTransferencias > 0
+              const cerradaManual = !esFuera && !esTransferencias && vultasCerradasManual.has(v.num)
               return (
-                <button key={v.num} onClick={() => setVueltaActiva(v.num)}
-                  className="relative px-4 py-1.5 rounded-lg text-sm font-medium transition-colors"
-                  style={{
-                    background: activo ? '#254A96' : '#f4f4f3',
-                    color: activo ? 'white' : '#666',
-                  }}>
-                  {v.label}
-                  {v.horario && <span className="text-xs opacity-70 ml-1">{v.horario}</span>}
-                  {badge && (
-                    <span className="absolute -top-1.5 -right-1.5 flex items-center justify-center rounded-full font-bold text-white"
-                      style={{ minWidth: 17, height: 17, fontSize: 9, padding: '0 3px', background: '#E52322' }}>
-                      {contadorSinVuelta}
-                    </span>
+                <div key={v.num} className="flex items-center gap-0.5">
+                  <button onClick={() => setVueltaActiva(v.num)}
+                    className="relative px-4 py-1.5 rounded-lg text-sm font-medium transition-colors"
+                    style={{
+                      background: activo
+                        ? esTransferencias ? '#f97316' : '#254A96'
+                        : cerradaManual ? '#fde8e8'
+                        : esTransferencias ? '#fff7ed'
+                        : '#f4f4f3',
+                      color: activo ? 'white'
+                        : cerradaManual ? '#E52322'
+                        : esTransferencias ? '#ea580c'
+                        : '#666',
+                    }}>
+                    {v.label}
+                    {cerradaManual && <span className="ml-1 text-xs">🔒</span>}
+                    {v.horario && !cerradaManual && <span className="text-xs opacity-70 ml-1">{v.horario}</span>}
+                    {badge && (
+                      <span className="absolute -top-1.5 -right-1.5 flex items-center justify-center rounded-full font-bold text-white"
+                        style={{ minWidth: 17, height: 17, fontSize: 9, padding: '0 3px', background: '#E52322' }}>
+                        {contadorSinVuelta}
+                      </span>
+                    )}
+                    {badgeTransf && (
+                      <span className="absolute -top-1.5 -right-1.5 flex items-center justify-center rounded-full font-bold text-white"
+                        style={{ minWidth: 17, height: 17, fontSize: 9, padding: '0 3px', background: '#f97316' }}>
+                        {contadorTransferencias}
+                      </span>
+                    )}
+                  </button>
+                  {puedeEditarProg && !esTransferencias && (
+                    <button
+                      onClick={() => handleToggleVueltaCerrada(v.num)}
+                      title={cerradaManual
+                        ? `Abrir ${esFuera ? 'Fuera de prog.' : `vuelta ${v.num}`}`
+                        : `Cerrar ${esFuera ? 'Fuera de prog.' : `vuelta ${v.num}`} manualmente`}
+                      className="px-1.5 py-1 rounded text-xs transition-colors"
+                      style={{
+                        color: cerradaManual ? '#E52322' : '#B9BBB7',
+                        background: cerradaManual ? '#fde8e8' : '#f4f4f3',
+                      }}>
+                      {cerradaManual ? '🔒' : '🔓'}
+                    </button>
                   )}
-                </button>
+                </div>
               )
             })}
           </div>
@@ -1326,7 +3138,7 @@ function ProgramacionInner() {
               🗺️ Ver rutas
             </button>
             {puedeEditarProg && vueltaActiva !== VUELTA_FUERA && <>
-              <button onClick={() => { const l = pedidos.map(p => ({ ...p, camion_id: null })); setPedidos(l); construirColumnas(l, camiones); setConfirmado(false) }}
+              <button onClick={handleLimpiar}
                 disabled={cargando || guardando}
                 className="px-3 py-2 text-sm rounded-lg border transition-colors disabled:opacity-40"
                 style={{ borderColor: '#e8edf8', color: '#666' }}>Limpiar</button>
@@ -1334,10 +3146,31 @@ function ProgramacionInner() {
                 disabled={cargando || guardando || pedidos.length === 0}
                 className="px-3 py-2 text-sm rounded-lg border transition-colors disabled:opacity-40"
                 style={{ borderColor: '#fbbf24', color: '#b45309', background: '#fef3c7' }}>📅 Reprog. vuelta</button>
+              <button onClick={handleRecalcularTodos} disabled={cargando || guardando || recalculandoTodos || pedidos.length === 0}
+                className="px-3 py-2 text-sm font-medium rounded-lg transition-colors disabled:opacity-40"
+                style={{ background: '#f0fdf4', color: '#065f46', border: '1px solid #bbf7d0' }}
+                title="Recalcula posiciones y peso de todos los pedidos visibles">
+                {recalculandoTodos ? '⏳…' : '♻️ Recalcular'}
+              </button>
+              {(pedidosParaSeparar.length > 0 || pedidosEnRiesgo.filter(p => p.camionesIds.length === 1).length > 0 || consolidaciones.filter(g => !consolidacionDescartados.has(g.key)).length > 0) && (
+                <button onClick={() => setConsolidacionDescartados(new Set())}
+                  className="px-3 py-2 text-sm font-medium rounded-lg transition-colors"
+                  style={{
+                    background: pedidosParaSeparar.length > 0 ? '#fce7f3' : pedidosEnRiesgo.some(p => p.camionesIds.length === 1) ? '#fde8e8' : '#fffbeb',
+                    color: pedidosParaSeparar.length > 0 ? '#9d174d' : pedidosEnRiesgo.some(p => p.camionesIds.length === 1) ? '#E52322' : '#b45309',
+                    border: `1px solid ${pedidosParaSeparar.length > 0 ? '#f9a8d4' : pedidosEnRiesgo.some(p => p.camionesIds.length === 1) ? '#fca5a5' : '#fde68a'}`,
+                  }}
+                  title="Ver panel de pre-programación">
+                  ⚙️ Pre-prog.
+                  {pedidosParaSeparar.length > 0 && ` ✂️${pedidosParaSeparar.length}`}
+                  {pedidosEnRiesgo.filter(p => p.camionesIds.length === 1).length > 0 && ` ⚡${pedidosEnRiesgo.filter(p => p.camionesIds.length === 1).length}`}
+                  {consolidaciones.filter(g => !consolidacionDescartados.has(g.key)).length > 0 && ` 🔀${consolidaciones.filter(g => !consolidacionDescartados.has(g.key)).length}`}
+                </button>
+              )}
               <button onClick={handleSugerir} disabled={cargando || guardando || totalSin === 0}
                 className="px-4 py-2 text-sm font-medium rounded-lg text-white transition-colors disabled:opacity-40"
                 style={{ background: '#7c3aed' }}>✦ Sugerir</button>
-              <button onClick={handleConfirmar} disabled={cargando || guardando || totalAsig === 0 || confirmado}
+              <button onClick={handleConfirmar} disabled={cargando || guardando || totalAsig === 0}
                 className="px-4 py-2 text-sm font-semibold rounded-lg transition-colors disabled:opacity-40"
                 style={{ background: confirmado ? '#d1fae5' : '#254A96', color: confirmado ? '#065f46' : 'white' }}>
                 {guardando ? 'Guardando…' : confirmado ? '✓ Confirmado' : 'Confirmar'}
@@ -1417,7 +3250,97 @@ function ProgramacionInner() {
           </div>
         )}
 
-        {cargando ? (
+        {/* Banner consolidación */}
+        <PreProgramacionPanel
+          grupos={consolidaciones}
+          descartados={consolidacionDescartados}
+          onDescartar={key => setConsolidacionDescartados(prev => new Set([...prev, key]))}
+          onAceptar={handleAceptarConsolidacion}
+          onAsignar={handleAsignarGrupoConsolidacion}
+          onEditarPosiciones={handleEditarPosicionesConsolidacion}
+          onAsignarRestricto={handleAsignarRestricto}
+          onSepararGranel={handleSepararGranel}
+          pedidosEnRiesgo={pedidosEnRiesgo}
+          pedidosParaSeparar={pedidosParaSeparar}
+          flota={flotaConsolidacion}
+          fecha={fecha}
+          sucursal={sucursal}
+        />
+
+        {vueltaActiva === VUELTA_TRANSFERENCIAS ? (
+          /* ── Vista transferencias: kanban igual al principal ── */
+          <div className="flex-1 overflow-hidden flex flex-col">
+            <div className="px-4 py-2 flex items-center gap-3 shrink-0" style={{ borderBottom: '1px solid #f0f0f0' }}>
+              <p className="text-xs font-medium" style={{ color: '#B9BBB7' }}>
+                {transferencias.length} transferencia{transferencias.length !== 1 ? 's' : ''} pendiente{transferencias.length !== 1 ? 's' : ''} desde {sucursal}
+              </p>
+              <button onClick={cargarTransferencias} className="text-xs px-3 py-1.5 rounded-lg" style={{ color: '#ea580c', background: '#fff7ed' }}>
+                Actualizar
+              </button>
+            </div>
+            {transferencias.length === 0 ? (
+              <div className="flex flex-col items-center justify-center flex-1" style={{ color: '#B9BBB7' }}>
+                <div className="text-4xl mb-3">🔄</div>
+                <p>No hay transferencias pendientes desde {sucursal}</p>
+              </div>
+            ) : (
+              <div className="flex-1 overflow-hidden flex gap-2 p-4">
+                {/* Sin asignar — fija a la izquierda */}
+                <div className="shrink-0 h-full" style={{ zIndex: 10 }}>
+                  <ColumnaCamion sinAsignar esTransferencia
+                    columna={{ camion: { codigo: '', sucursal, tipo_unidad: '', posiciones_total: 0, tonelaje_max_kg: 0, grua_hidraulica: false, volcador: false }, pedidos: transferencias.filter((r: any) => !r.cod_vehiculo).map(transferToPedido), pesoTotal: 0, posTotal: 0 }}
+                    onDrop={(e) => { e.preventDefault(); if (dragTransferRef.current) { asignarCamionTransfer(dragTransferRef.current.id, null); dragTransferRef.current = null } setDragOver(null) }}
+                    onDragOver={(e) => { e.preventDefault(); setDragOver('__sin_asignar_transfer__') }}
+                    onDragLeave={() => setDragOver(null)}
+                    onDragStart={(e, p) => { dragTransferRef.current = p; e.dataTransfer.effectAllowed = 'move' }}
+                    isDragOver={dragOver === '__sin_asignar_transfer__'}
+                    onCancelar={cancelarTransfer}
+                    onCambiarVuelta={cambiarVueltaTransfer}
+                    onReprogramar={reprogramarTransfer}
+                    onEditarPeso={() => {}}
+                    onRecalcularPosiciones={() => {}}
+                    onToggleVolcador={() => {}}
+                    onSepararPedido={() => {}}
+                    onMoverSucursal={() => {}}
+                    onIncidenciaStock={() => {}}
+                    soloVer={!puedeEditarProg}
+                  />
+                </div>
+                <div className="w-px shrink-0 self-stretch" style={{ background: '#e8edf8' }} />
+                {/* Columnas por camión */}
+                <div className="flex-1 overflow-x-auto overflow-y-hidden h-full">
+                  <div className="flex gap-2 h-full pr-2">
+                    {camionesTransfer.map(c => (
+                      <ColumnaCamion key={c.codigo} esTransferencia
+                        columna={{ camion: c, pedidos: transferencias.filter((r: any) => r.cod_vehiculo === c.codigo).map(transferToPedido), pesoTotal: 0, posTotal: 0 }}
+                        onDrop={(e) => { e.preventDefault(); if (dragTransferRef.current) { asignarCamionTransfer(dragTransferRef.current.id, c.codigo); dragTransferRef.current = null } setDragOver(null) }}
+                        onDragOver={(e) => { e.preventDefault(); setDragOver(c.codigo + '__transfer__') }}
+                        onDragLeave={() => setDragOver(null)}
+                        onDragStart={(e, p) => { dragTransferRef.current = p; e.dataTransfer.effectAllowed = 'move' }}
+                        isDragOver={dragOver === c.codigo + '__transfer__'}
+                        onCancelar={cancelarTransfer}
+                        onCambiarVuelta={cambiarVueltaTransfer}
+                        onReprogramar={reprogramarTransfer}
+                        onEditarPeso={() => {}}
+                        onRecalcularPosiciones={() => {}}
+                        onToggleVolcador={() => {}}
+                        onSepararPedido={() => {}}
+                        onMoverSucursal={() => {}}
+                        onIncidenciaStock={() => {}}
+                        soloVer={!puedeEditarProg}
+                      />
+                    ))}
+                    {camionesTransfer.length === 0 && (
+                      <div className="flex flex-col items-center justify-center flex-1 py-16" style={{ color: '#B9BBB7' }}>
+                        <p className="text-sm">No hay camiones activos para {sucursal} hoy</p>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        ) : cargando ? (
           <div className="flex justify-center py-24">
             <div className="w-6 h-6 border-2 border-t-transparent rounded-full animate-spin" style={{ borderColor: '#254A96', borderTopColor: 'transparent' }} />
           </div>
@@ -1477,7 +3400,7 @@ function ProgramacionInner() {
           <div className="flex flex-col items-center justify-center py-24" style={{ color: '#B9BBB7' }}>
             <div className="text-5xl mb-4">🚛</div>
             <p className="font-medium">No hay camiones configurados para esta fecha</p>
-            <button onClick={() => router.push('/flota')} className="mt-3 text-sm font-medium" style={{ color: '#254A96' }}>Ir a Flota del día →</button>
+            <Link href="/flota" className="mt-3 text-sm font-medium" style={{ color: '#254A96' }}>Ir a Flota del día →</Link>
           </div>
         ) : (
           <div className="flex-1 overflow-hidden flex gap-2">
@@ -1494,6 +3417,7 @@ function ProgramacionInner() {
                 onCambiarVuelta={handleCambiarVuelta}
                 onReprogramar={handleReprogramar}
                 onEditarPeso={handleEditarPeso}
+                onRecalcularPosiciones={handleRecalcularPosiciones}
                 onToggleVolcador={handleToggleVolcador}
                 onSepararPedido={handleSepararPedido}
                 onMoverSucursal={handleMoverSucursal}
@@ -1504,25 +3428,41 @@ function ProgramacionInner() {
             {/* Camiones — scroll horizontal */}
             <div className="flex-1 overflow-x-auto overflow-y-hidden h-full">
               <div className="flex gap-2 h-full pr-2">
-                {columnas.map(col => (
+                {columnas.map(col => {
+                  const camEx: any = col.camion
+                  // Truck that leaves to another sucursal from vuelta X: block when vueltaActiva >= X
+                  // Truck that comes from another sucursal from vuelta X: block when vueltaActiva < X
+                  const noDisponible =
+                    (camEx._sale_desde_vuelta != null && vueltaActiva >= camEx._sale_desde_vuelta) ||
+                    (camEx._disponible_desde_vuelta != null && vueltaActiva < camEx._disponible_desde_vuelta)
+                  return (
                   <ColumnaCamion key={col.camion.codigo} columna={col}
-                    onDrop={handleDrop}
-                    onDragOver={(e, cod) => { e.preventDefault(); setDragOver(cod ?? 'sin_asignar') }}
+                    onDrop={noDisponible ? (e) => e.preventDefault() : handleDrop}
+                    onDragOver={noDisponible ? (e) => e.preventDefault() : (e, cod) => { e.preventDefault(); setDragOver(cod ?? 'sin_asignar') }}
                     onDragLeave={() => setDragOver(null)}
                     onDragStart={(e, p) => { dragPedido.current = p; e.dataTransfer.effectAllowed = 'move' }}
-                    isDragOver={dragOver === col.camion.codigo}
+                    isDragOver={!noDisponible && dragOver === col.camion.codigo}
                     onCancelar={handleCancelar}
                     onCambiarVuelta={handleCambiarVuelta}
                     onReprogramar={handleReprogramar}
                     onEditarPeso={handleEditarPeso}
+                    onRecalcularPosiciones={handleRecalcularPosiciones}
                     onToggleVolcador={handleToggleVolcador}
                     onSepararPedido={handleSepararPedido}
                     onMoverSucursal={handleMoverSucursal}
                     onIncidenciaStock={handleIncidenciaStock}
                     onReprogramarCamion={codigo => { setCamionParaReprog(codigo); setModalReprogVuelta(true); setReprogVueltaFecha(''); setReprogVueltaNueva(1) }}
                     deposito={DEPOSITOS[sucursal]}
-                    soloVer={!puedeEditarProg} />
-                ))}
+                    soloVer={noDisponible || !puedeEditarProg}
+                    bloqueado={!noDisponible && camionesBlockeados.has(col.camion.codigo)}
+                    onToggleLock={!noDisponible && puedeEditarProg ? () => setCamionesBlockeados(prev => {
+                      const s = new Set(prev)
+                      s.has(col.camion.codigo) ? s.delete(col.camion.codigo) : s.add(col.camion.codigo)
+                      try { localStorage.setItem('camionesBlockeados', JSON.stringify([...s])) } catch {}
+                      return s
+                    }) : undefined} />
+                  )
+                })}
               </div>
             </div>
           </div>
@@ -1554,12 +3494,15 @@ function ModalRutas({ columnas, sinAsignar, sucursal, onClose }: {
   const mapRef = useRef<HTMLDivElement>(null)
   const leafletRef = useRef<any>(null)
 
+  // Filtrar SOLO camiones con al menos un pedido geocodificado — se usa para mapa Y leyenda (índices consistentes)
+  const colsConPedidos = columnas.filter(c => c.pedidos.some(p => p.latitud && p.longitud))
+  const sinAsignarConCoords = sinAsignar.filter(p => p.latitud && p.longitud)
+  const totalConCoords = colsConPedidos.reduce((a, c) => a + c.pedidos.filter(p => p.latitud && p.longitud).length, 0) + sinAsignarConCoords.length
+
   useEffect(() => {
-    // Inject Leaflet CSS once
     if (!document.getElementById('leaflet-css')) {
       const link = document.createElement('link')
-      link.id = 'leaflet-css'
-      link.rel = 'stylesheet'
+      link.id = 'leaflet-css'; link.rel = 'stylesheet'
       link.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'
       document.head.appendChild(link)
     }
@@ -1567,7 +3510,6 @@ function ModalRutas({ columnas, sinAsignar, sucursal, onClose }: {
     function initMap() {
       if (!mapRef.current) return
       const L = (window as any).L
-
       if (leafletRef.current) { leafletRef.current.remove(); leafletRef.current = null }
 
       const depot = DEPOSITOS[sucursal] ?? { lat: -34.9205, lng: -57.9536 }
@@ -1577,59 +3519,97 @@ function ModalRutas({ columnas, sinAsignar, sucursal, onClose }: {
         maxZoom: 18,
       }).addTo(map)
 
-      // Depot marker
       L.marker([depot.lat, depot.lng], {
         icon: L.divIcon({
           html: `<div style="background:#1a1a1a;color:white;padding:3px 7px;border-radius:6px;font-size:11px;font-weight:bold;white-space:nowrap;box-shadow:0 2px 6px rgba(0,0,0,0.4)">🏭 ${sucursal}</div>`,
-          className: '',
-          iconSize: [90, 24],
-          iconAnchor: [45, 12],
+          className: '', iconSize: [90, 24], iconAnchor: [45, 12],
         })
       }).addTo(map)
 
       const boundsPoints: [number, number][] = [[depot.lat, depot.lng]]
 
-      // Routes per truck
-      columnas.forEach((col, idx) => {
+      // Agrupar pedidos por ubicación exacta (4 decimales ≈ 11m) para no superponer marcadores
+      function locKey(p: Pedido) { return `${Math.round(p.latitud! * 1e4)},${Math.round(p.longitud! * 1e4)}` }
+
+      // Offset para marcadores de distintos camiones que caen en el mismo punto
+      // Cada camión que pase por una posición ocupada se desplaza ~25m
+      const ocupados = new Map<string, number>() // locKey → cantidad de camiones ya puestos ahí
+      const OFFSETS: [number, number][] = [[0,0],[0.00023,0],[-0.00023,0],[0,0.00035],[0,-0.00035],[0.00023,0.00035],[-0.00023,-0.00035]]
+      function posicionConOffset(lat: number, lng: number, camionIdx: number): [number, number] {
+        const k = locKey({ latitud: lat, longitud: lng } as Pedido)
+        const slot = ocupados.get(k) ?? 0
+        if (slot === 0) ocupados.set(k, 1)
+        else ocupados.set(k, slot + 1)
+        const off = OFFSETS[camionIdx % OFFSETS.length]
+        return [lat + (slot > 0 ? off[0] : 0), lng + (slot > 0 ? off[1] : 0)]
+      }
+
+      // Popup completo para uno o varios pedidos en la misma ubicación
+      function buildPopup(color: string, camion: string, peds: Pedido[], ordenes: number[]) {
+        return peds.map((p, gi) => {
+          const itemsHtml = p.items && p.items.length > 0
+            ? `<div style="margin-top:4px;border-top:1px solid #f0f0f0;padding-top:4px">${p.items.map(it =>
+                `<div style="font-size:11px;color:#555">• ${it.nombre} × ${it.cantidad} ${it.unidad}</div>`
+              ).join('')}</div>`
+            : ''
+          return `<div style="min-width:220px;max-width:280px${gi > 0 ? ';border-top:2px solid #e5e7eb;margin-top:10px;padding-top:10px' : ''}">
+            <div style="font-weight:700;color:${color};font-size:13px">${camion} · Parada ${ordenes[gi]}</div>
+            <div style="font-weight:700;font-size:13px;margin-top:3px">${p.cliente}</div>
+            <div style="font-size:11px;color:#6b7280;margin-top:1px">NV ${p.nv}${p.id_despacho ? ` · SD ${p.id_despacho}` : ''}</div>
+            <div style="font-size:11px;color:#374151;margin-top:3px">${p.direccion}</div>
+            ${p.localidad ? `<div style="font-size:11px;color:#1e40af;margin-top:1px">📍 ${p.localidad}</div>` : ''}
+            ${itemsHtml}
+            <div style="font-size:11px;color:#9ca3af;margin-top:4px">${p.peso_total_kg ?? '?'} kg · ${p.volumen_total_m3 ?? '?'} pos</div>
+          </div>`
+        }).join('')
+      }
+
+      // Iterar colsConPedidos (ya filtrado) — mismo índice que la leyenda → colores consistentes
+      colsConPedidos.forEach((col, idx) => {
         const color = TRUCK_COLORS[idx % TRUCK_COLORS.length]
         const peds = col.pedidos
           .filter(p => p.latitud && p.longitud)
           .sort((a, b) => (a.orden_entrega ?? 999) - (b.orden_entrega ?? 999))
-        if (peds.length === 0) return
 
-        // Dashed polyline: depot → stops → depot
         L.polyline(
           [[depot.lat, depot.lng], ...peds.map(p => [p.latitud!, p.longitud!] as [number, number]), [depot.lat, depot.lng]],
           { color, weight: 3, opacity: 0.85, dashArray: '8,5' }
         ).addTo(map)
 
-        // Numbered markers
+        // Agrupar por ubicación para mostrar todos los pedidos en un solo marcador
+        const grupos = new Map<string, { peds: Pedido[]; ordenes: number[] }>()
         peds.forEach((p, i) => {
-          L.marker([p.latitud!, p.longitud!], {
+          const k = locKey(p)
+          if (!grupos.has(k)) grupos.set(k, { peds: [], ordenes: [] })
+          grupos.get(k)!.peds.push(p)
+          grupos.get(k)!.ordenes.push(i + 1)
+        })
+
+        grupos.forEach(({ peds: gp, ordenes }) => {
+          const label = ordenes.join('·')
+          const w = Math.max(26, 14 + label.length * 8)
+          const [mLat, mLng] = posicionConOffset(gp[0].latitud!, gp[0].longitud!, idx)
+          L.marker([mLat, mLng], {
             icon: L.divIcon({
-              html: `<div style="background:${color};color:white;width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:bold;border:2px solid white;box-shadow:0 1px 5px rgba(0,0,0,0.35)">${i + 1}</div>`,
-              className: '',
-              iconSize: [26, 26],
-              iconAnchor: [13, 13],
+              html: `<div style="background:${color};color:white;min-width:${w}px;height:26px;border-radius:13px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:bold;border:2px solid white;box-shadow:0 1px 5px rgba(0,0,0,0.35);padding:0 5px">${label}</div>`,
+              className: '', iconSize: [w, 26], iconAnchor: [w / 2, 13],
             })
           })
-            .bindPopup(`<b style="color:${color}">${col.camion.codigo}</b><br><b>${p.cliente}</b><br><small style="color:#666">${p.direccion}</small>${p.localidad ? `<br><small style="color:#1e40af">📍 ${p.localidad}</small>` : ''}<br><small>${p.peso_total_kg ?? '?'} kg · ${p.volumen_total_m3 ?? '?'} pos</small>`)
+            .bindPopup(buildPopup(color, col.camion.codigo, gp, ordenes), { maxWidth: 300 })
             .addTo(map)
-          boundsPoints.push([p.latitud!, p.longitud!])
+          boundsPoints.push([mLat, mLng])
         })
       })
 
-      // Sin asignar — gray markers
-      sinAsignar.filter(p => p.latitud && p.longitud).forEach(p => {
+      // Sin asignar
+      sinAsignarConCoords.forEach(p => {
         L.marker([p.latitud!, p.longitud!], {
           icon: L.divIcon({
             html: `<div style="background:#9ca3af;color:white;width:22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:bold;border:2px solid white;box-shadow:0 1px 4px rgba(0,0,0,0.3)">?</div>`,
-            className: '',
-            iconSize: [22, 22],
-            iconAnchor: [11, 11],
+            className: '', iconSize: [22, 22], iconAnchor: [11, 11],
           })
         })
-          .bindPopup(`<b>Sin asignar</b><br>${p.cliente}<br><small style="color:#666">${p.direccion}</small>`)
+          .bindPopup(`<div style="min-width:180px"><b>Sin asignar</b><br><b>${p.cliente}</b><br><span style="font-size:11px;color:#6b7280">NV ${p.nv}${p.id_despacho ? ` · SD ${p.id_despacho}` : ''}</span><br><span style="font-size:11px;color:#374151">${p.direccion}</span></div>`)
           .addTo(map)
         boundsPoints.push([p.latitud!, p.longitud!])
       })
@@ -1638,27 +3618,18 @@ function ModalRutas({ columnas, sinAsignar, sucursal, onClose }: {
       leafletRef.current = map
     }
 
-    if ((window as any).L) {
-      setTimeout(initMap, 50)
-    } else {
+    if ((window as any).L) { setTimeout(initMap, 50) }
+    else {
       const script = document.createElement('script')
       script.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'
       script.onload = () => setTimeout(initMap, 50)
       document.body.appendChild(script)
     }
-
-    return () => {
-      if (leafletRef.current) { leafletRef.current.remove(); leafletRef.current = null }
-    }
-  }, [columnas, sinAsignar, sucursal])
-
-  const colsConPedidos = columnas.filter(c => c.pedidos.filter(p => p.latitud && p.longitud).length > 0)
-  const sinAsignarConCoords = sinAsignar.filter(p => p.latitud && p.longitud)
-  const totalConCoords = columnas.reduce((a, c) => a + c.pedidos.filter(p => p.latitud && p.longitud).length, 0) + sinAsignarConCoords.length
+    return () => { if (leafletRef.current) { leafletRef.current.remove(); leafletRef.current = null } }
+  }, [columnas, sinAsignar, sucursal]) // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div className="fixed inset-0 z-50 flex flex-col bg-white" style={{ fontFamily: 'Barlow, sans-serif' }}>
-      {/* Header */}
       <div className="px-5 py-3 flex items-center justify-between gap-4 shrink-0 border-b" style={{ borderColor: '#f0f0f0' }}>
         <div>
           <p className="font-bold text-sm" style={{ color: '#254A96' }}>🗺️ Previsualización de rutas</p>
@@ -1666,7 +3637,6 @@ function ModalRutas({ columnas, sinAsignar, sucursal, onClose }: {
             {totalConCoords} paradas con ubicación · líneas de puntos = ruta en orden de entrega
           </p>
         </div>
-        {/* Legend */}
         <div className="flex flex-wrap gap-x-4 gap-y-1.5 flex-1 justify-center">
           {colsConPedidos.map((col, idx) => (
             <div key={col.camion.codigo} className="flex items-center gap-1.5">
@@ -1687,8 +3657,73 @@ function ModalRutas({ columnas, sinAsignar, sucursal, onClose }: {
         </div>
         <button onClick={onClose} className="text-2xl leading-none px-2 shrink-0" style={{ color: '#B9BBB7' }}>×</button>
       </div>
-      {/* Map container */}
       <div ref={mapRef} style={{ flex: 1, minHeight: 0 }} />
+    </div>
+  )
+}
+
+// ─── Tarjeta de transferencia (visible en tab 🔄 Transferencias) ────────────────
+// Visualmente naranja para diferenciarse de las tarjetas de pedidos (azul)
+// y de los reprogramados (amarillo #fbbf24).
+function TransferCard({ req }: { req: any }) {
+  const ESTADO_COLOR: Record<string, string> = {
+    pendiente:   '#fef3c7',
+    conf_stock:  '#e0f2fe',
+    preparacion: '#ede9fe',
+    en_transito: '#dbeafe',
+    entregado:   '#d1fae5',
+    rechazado:   '#fde8e8',
+  }
+  const ESTADO_TEXT: Record<string, string> = {
+    pendiente:   '#b45309',
+    conf_stock:  '#0369a1',
+    preparacion: '#7c3aed',
+    en_transito: '#1d4ed8',
+    entregado:   '#065f46',
+    rechazado:   '#E52322',
+  }
+  const ESTADO_LABEL: Record<string, string> = {
+    pendiente:   'Pendiente',
+    conf_stock:  'Conf. Stock',
+    preparacion: 'En preparación',
+    en_transito: 'En tránsito',
+    entregado:   'Entregado',
+    rechazado:   'Rechazado',
+  }
+  const items = req.requerimiento_items ?? []
+  const resumen = items.slice(0, 3).map((it: any) => it.nombre_producto).join(', ')
+    + (items.length > 3 ? ` +${items.length - 3} más` : '')
+
+  return (
+    <div className="bg-white rounded-xl border px-4 py-3"
+      style={{ borderColor: '#f0f0f0', borderLeft: '4px solid #f97316' }}>
+      <div className="flex items-start justify-between gap-3 flex-wrap">
+        <div className="flex items-center gap-2 flex-wrap">
+          {/* Badge estado */}
+          <span className="text-xs px-2 py-0.5 rounded-full font-medium"
+            style={{ background: ESTADO_COLOR[req.estado] ?? '#f4f4f3', color: ESTADO_TEXT[req.estado] ?? '#666' }}>
+            {ESTADO_LABEL[req.estado] ?? req.estado}
+          </span>
+          {req.nv && <span className="text-xs font-medium" style={{ color: '#254A96' }}>NV {req.nv}</span>}
+          {req.cliente && <span className="text-xs" style={{ color: '#B9BBB7' }}>{req.cliente}</span>}
+        </div>
+        <div className="flex items-center gap-2 text-xs shrink-0" style={{ color: '#B9BBB7' }}>
+          {req.cod_vehiculo && (
+            <span className="font-medium px-2 py-0.5 rounded" style={{ background: '#fff7ed', color: '#ea580c' }}>
+              🚛 {req.cod_vehiculo}
+            </span>
+          )}
+          {req.fecha_solicitada && <span>Límite: {req.fecha_solicitada}</span>}
+        </div>
+      </div>
+      <div className="flex items-center gap-2 mt-2">
+        <span className="text-sm font-semibold" style={{ color: '#f97316' }}>{req.sucursal_origen}</span>
+        <span className="text-sm" style={{ color: '#B9BBB7' }}>→</span>
+        <span className="text-sm font-semibold" style={{ color: '#254A96' }}>{req.sucursal_destino}</span>
+      </div>
+      {resumen && (
+        <p className="text-xs mt-1.5 leading-tight" style={{ color: '#B9BBB7' }}>{resumen}</p>
+      )}
     </div>
   )
 }

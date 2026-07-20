@@ -3,9 +3,11 @@
 import { useEffect, useState } from 'react'
 import { supabase } from '../supabase'
 import { useRouter } from 'next/navigation'
+import Link from 'next/link'
 import { puedeEditar } from '../lib/permisos'
 import { FRANJAS, vultaCerrada, vueltasCerradasPara } from '../lib/franjas'
 import { logAuditoria } from '../lib/auditoria'
+import type { jsPDF as JsPDFType } from 'jspdf'
 
 function detectarSucursal(sucursalObra: string, deposito: string): string {
   const obra = sucursalObra?.toUpperCase() || ''
@@ -57,6 +59,7 @@ export default function NuevoDespacho() {
   const [cuposDisponibles, setCuposDisponibles] = useState<number[]>([])
   const [vueltasSinCupoConFlota, setVueltasSinCupoConFlota] = useState<number[]>([])
   const [vueltasCerradas, setVueltasCerradas] = useState<number[]>([])
+  const [fueraProgramacionCerrada, setFueraProgramacionCerrada] = useState(false)
   const [flotaSinRevisar, setFlotaSinRevisar] = useState(false)
   const [maxCamionPosiciones, setMaxCamionPosiciones] = useState(0)
   const [pedidoGrande, setPedidoGrande] = useState(false)
@@ -83,7 +86,7 @@ export default function NuevoDespacho() {
   const [tabActivo, setTabActivo] = useState<'despacho' | 'retiro'>('despacho')
 
   // ── Retiro state ──────────────────────────────────────────
-  const RETIRO_FORM_INICIAL = { cliente: '', telefono: '', direccion: '', sucursal: '', fecha_estimada: '', notas: '' }
+  const RETIRO_FORM_INICIAL = { nv: '', cliente: '', telefono: '', direccion: '', sucursal: '', fecha_estimada: '', notas: '' }
   const [formRetiro, setFormRetiro] = useState(RETIRO_FORM_INICIAL)
   const [itemsRetiro, setItemsRetiro] = useState<{ nombre_producto: string; cantidad: number; id_producto: number | null; _codigo?: string; _encontrado?: boolean; _noEncontrado?: boolean }[]>(
     [{ nombre_producto: '', cantidad: 1, id_producto: null, _codigo: '', _encontrado: false, _noEncontrado: false }]
@@ -174,11 +177,25 @@ export default function NuevoDespacho() {
     const sinCupoConFlota: number[] = []
 
     // Calcular vueltas cerradas por horario
-    const cerradas = FRANJAS.filter(f => vultaCerrada(form.fecha_entrega, f)).map(f => f.vuelta)
+    const cerradasHorario = FRANJAS.filter(f => vultaCerrada(form.fecha_entrega, f)).map(f => f.vuelta)
+
+    // También verificar cierres manuales del programador
+    const { data: vcmData } = await supabase
+      .from('vueltas_cerradas_manual')
+      .select('vuelta')
+      .eq('fecha', form.fecha_entrega)
+      .eq('sucursal', form.sucursal)
+    const cerradasManual = (vcmData ?? []).map((r: any) => r.vuelta as number)
+    // vuelta=0 en DB = "fuera de programación"
+    const fueraCerrada = cerradasManual.includes(0)
+    setFueraProgramacionCerrada(fueraCerrada)
+    const cerradas = [...new Set([...cerradasHorario, ...cerradasManual.filter(v => v !== 0)])]
     setVueltasCerradas(cerradas)
-    // Si todas las vueltas cerraron, auto-seleccionar "fuera de programación"
-    if (cerradas.length === FRANJAS.length) {
+    // Si todas las vueltas cerraron, auto-seleccionar "fuera de prog" solo si no está cerrada también
+    if (cerradas.length === FRANJAS.length && !fueraCerrada) {
       setForm(prev => ({ ...prev, vuelta: 'fuera_prog' }))
+    } else if (fueraCerrada && form.vuelta === 'fuera_prog') {
+      setForm(prev => ({ ...prev, vuelta: '' }))
     } else if (form.vuelta && form.vuelta !== 'fuera_prog') {
       // Si la vuelta ya seleccionada quedó cerrada, resetearla
       const vueltaSeleccionada = parseInt(form.vuelta)
@@ -270,7 +287,11 @@ export default function NuevoDespacho() {
     try {
       const res = await fetch('/api/leer-nv', { method: 'POST', body: formData })
       const data = await res.json()
-      if (!data.success) { setError('No se pudo leer el PDF.'); setLeyendoPDF(false); return }
+      if (!data.success) {
+        setError(data.error || 'No se pudo leer el archivo.')
+        setLeyendoPDF(false)
+        return
+      }
 
       const { datos } = data
       const sucursal = detectarSucursal(datos.sucursal_obra || '', datos.deposito || '')
@@ -287,38 +308,84 @@ export default function NuevoDespacho() {
       }))
 
       if (datos.productos?.length > 0) {
-  const { data: todosMateriales } = await supabase
-    .from('materiales')
-    .select('*')
+        const [{ data: todosMateriales }, { data: todosAliases }] = await Promise.all([
+          supabase.from('materiales').select('*'),
+          supabase.from('material_aliases').select('descripcion_pdf, material_id').eq('resuelto', true),
+        ])
 
-  const normalizar = (s: string) =>
-    s.toLowerCase()
-      .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-      .replace(/(\d),(\d)/g, '$1.$2')
-      .replace(/\s*x\s*/g, 'x')
-      .replace(/(\d)\s*(mt|kg|cm|mm|m)\b/g, '$1$2')
-      .replace(/\s+/g, ' ').trim()
+        const normalizar = (s: string) =>
+          s.toLowerCase()
+            .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+            .replace(/(\d),(\d)/g, '$1.$2')
+            .replace(/\s*x\s*/g, 'x')
+            .replace(/(\d)\s*(mt|kg|cm|mm|m)\b/g, '$1$2')
+            .replace(/\s+/g, ' ').trim()
 
-  const productosConDatos = datos.productos.map((p: any) => {
-    const nombrePDF = normalizar(p.descripcion)
-    // Preferir el match más específico (nombre más largo)
-    const candidatos = (todosMateriales ?? []).filter((m: any) => {
-      const nombreTabla = normalizar(m.nombre)
-      return nombreTabla === nombrePDF ||
-             nombreTabla.includes(nombrePDF) ||
-             nombrePDF.includes(nombreTabla)
-    }).sort((a: any, b: any) => b.nombre.length - a.nombre.length)
-    const material = candidatos[0] ?? null
-    const pesoUnitario = material && material.cant_x_unid_log > 0
-      ? material.peso_kg_x_posicion / material.cant_x_unid_log : 0
-    const posiciones = material && material.cant_x_unid_log > 0
-      ? Math.ceil(p.cantidad / material.cant_x_unid_log) * material.posiciones_x_unid_log : 0
-    return { ...p, material, posiciones, peso: material ? p.cantidad * pesoUnitario : 0 }
-  })
-  setProductosNV(productosConDatos)
-  setPosicionesTotal(productosConDatos.reduce((acc: number, p: any) => acc + p.posiciones, 0))
-  setPesoTotal(productosConDatos.reduce((acc: number, p: any) => acc + p.peso, 0))
-}
+        // Map alias: descripcion_normalizada → material_id
+        const aliasMap: Record<string, number> = {}
+        for (const a of todosAliases ?? []) {
+          if (a.material_id) aliasMap[normalizar(a.descripcion_pdf)] = a.material_id
+        }
+
+        // Similitud por tokens: fracción de tokens del string más corto que aparecen en el más largo
+        const tokenSim = (a: string, b: string): number => {
+          const ta = a.split(/\s+/).filter(t => t.length > 1)
+          const tb = b.split(/\s+/).filter(t => t.length > 1)
+          if (!ta.length || !tb.length) return 0
+          const [shorter, longer] = ta.length <= tb.length ? [ta, tb] : [tb, ta]
+          const hits = shorter.filter(t => longer.some(lt => lt === t || lt.startsWith(t) || t.startsWith(lt)))
+          return hits.length / shorter.length
+        }
+
+        const sinMatch: string[] = []
+        const productosConDatos = datos.productos.map((p: any) => {
+          const nombrePDF = normalizar(p.descripcion)
+          // 1. Check alias (human-confirmed)
+          const aliasMatId = aliasMap[nombrePDF]
+          const materialFromAlias = aliasMatId
+            ? (todosMateriales ?? []).find((m: any) => m.id === aliasMatId) ?? null
+            : null
+          // 2. Fallback: fuzzy scoring
+          const material = materialFromAlias ?? (() => {
+            const candidatos = (todosMateriales ?? [])
+              .map((m: any) => {
+                const nt = normalizar(m.nombre)
+                let score = 0
+                if (nt === nombrePDF) score = 1.0
+                else if (nt.includes(nombrePDF) || nombrePDF.includes(nt)) score = 0.9
+                else { const s = tokenSim(nombrePDF, nt); if (s >= 0.6) score = s }
+                return { m, score }
+              })
+              .filter(({ score }: { score: number }) => score > 0)
+              .sort((a: any, b: any) => b.score - a.score || b.m.nombre.length - a.m.nombre.length)
+            return candidatos[0]?.m ?? null
+          })()
+          if (!material) sinMatch.push(p.descripcion)
+          const pesoUnitario = material && material.cant_x_unid_log > 0
+            ? material.peso_kg_x_posicion / material.cant_x_unid_log : 0
+          const posiciones = material && material.cant_x_unid_log > 0
+            ? Math.ceil(p.cantidad / material.cant_x_unid_log) * material.posiciones_x_unid_log : 0
+          return { ...p, material, posiciones, peso: material ? p.cantidad * pesoUnitario : 0 }
+        })
+
+        // Log unmatched descriptions to material_aliases for review
+        for (const desc of [...new Set(sinMatch)]) {
+          const { data: existing } = await supabase
+            .from('material_aliases')
+            .select('id, veces_visto')
+            .eq('descripcion_pdf', desc)
+            .maybeSingle()
+          if (existing) {
+            await supabase.from('material_aliases').update({ veces_visto: existing.veces_visto + 1 }).eq('id', existing.id)
+          } else {
+            await supabase.from('material_aliases').insert({ descripcion_pdf: desc, veces_visto: 1 })
+          }
+        }
+
+        setProductosNV(productosConDatos)
+        setPosicionesTotal(productosConDatos.reduce((acc: number, p: any) => acc + p.posiciones, 0))
+        setPesoTotal(productosConDatos.reduce((acc: number, p: any) => acc + p.peso, 0))
+      }
       setPdfListo(true)
     } catch { setError('Error al procesar el PDF.') }
     setLeyendoPDF(false)
@@ -326,17 +393,57 @@ export default function NuevoDespacho() {
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>) => {
     const { name, value, type } = e.target
-    setForm(prev => ({ ...prev, [name]: type === 'checkbox' ? (e.target as HTMLInputElement).checked : value }))
+    const newValue = type === 'checkbox' ? (e.target as HTMLInputElement).checked : value
+    setForm(prev => {
+      const next = { ...prev, [name]: newValue }
+      // Si se activa barrio_cerrado y la vuelta seleccionada no es válida, limpiarla
+      if (name === 'barrio_cerrado' && newValue === true) {
+        const vueltaNum = parseInt(prev.vuelta)
+        if (prev.vuelta === 'fuera_prog' || (!isNaN(vueltaNum) && vueltaNum > 3)) {
+          next.vuelta = ''
+        }
+      }
+      return next
+    })
   }
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault(); setLoading(true); setError('')
 
-    // Validar que la vuelta seleccionada no esté cerrada por horario
+    // Re-consultar bloqueos al momento del submit para evitar estado desactualizado
+    const { data: vcmFresh } = await supabase
+      .from('vueltas_cerradas_manual')
+      .select('vuelta')
+      .eq('fecha', form.fecha_entrega)
+      .eq('sucursal', form.sucursal)
+    const cerradasManualFresh = (vcmFresh ?? []).map((r: any) => r.vuelta as number)
+    const fueraCerradaFresh = cerradasManualFresh.includes(0)
+    const cerradasFresh = cerradasManualFresh.filter(v => v !== 0)
+
+    // Validar barrio cerrado: solo V1, V2, V3
+    if (form.barrio_cerrado) {
+      const vueltaNum = form.vuelta === 'fuera_prog' ? 0 : parseInt(form.vuelta)
+      if (form.vuelta === 'fuera_prog' || vueltaNum > 3) {
+        setError('Los pedidos de barrio cerrado solo se pueden cargar en V1, V2 o V3 (solo vamos hasta las 15hs).')
+        setLoading(false)
+        return
+      }
+    }
+
+    // Validar que "fuera de programación" no esté cerrada manualmente
+    if (form.vuelta === 'fuera_prog' && fueraCerradaFresh) {
+      setError('La carga de pedidos fuera de programación está cerrada para esta fecha y sucursal.')
+      setLoading(false)
+      return
+    }
+
+    // Validar que la vuelta seleccionada no esté cerrada (por horario o manualmente)
     if (form.vuelta && form.vuelta !== 'fuera_prog') {
       const vueltaNum = parseInt(form.vuelta)
       const franja = FRANJAS.find(f => f.vuelta === vueltaNum)
-      if (franja && vultaCerrada(form.fecha_entrega, franja)) {
+      const cerradaPorHorario = franja && vultaCerrada(form.fecha_entrega, franja)
+      const cerradaManualmente = cerradasFresh.includes(vueltaNum)
+      if (cerradaPorHorario || cerradaManualmente) {
         setError('Esta vuelta ya cerró. Seleccioná "Fuera de programación" para que el ruteador lo asigne a la franja disponible.')
         setLoading(false)
         return
@@ -396,6 +503,13 @@ export default function NuevoDespacho() {
     toast('Solicitud de despacho guardada correctamente')
     if (userId) logAuditoria(userId, userNombre, 'Creó pedido', 'Despachos', { nv: form.nv, id_despacho: form.id_despacho, cliente: form.cliente, sucursal: form.sucursal, fecha_entrega: form.fecha_entrega, peso_total_kg: pesoTotal })
     setExito(true); setLoading(false)
+  }
+
+  // Permite corregir posiciones por producto cuando el match automático es incorrecto o nulo
+  function editarPosicionesItem(idx: number, valor: number) {
+    const nuevo = productosNV.map((p: any, i: number) => i === idx ? { ...p, posiciones: valor } : p)
+    setProductosNV(nuevo)
+    setPosicionesTotal(nuevo.reduce((a: number, p: any) => a + p.posiciones, 0))
   }
 
   const resetForm = () => {
@@ -496,6 +610,7 @@ export default function NuevoDespacho() {
     }
 
     const { data: pedidoInsertado, error: errIns } = await supabase.from('pedidos').insert({
+      nv: Number(formRetiro.nv),
       cliente: formRetiro.cliente,
       telefono: formRetiro.telefono,
       direccion: formRetiro.direccion,
@@ -532,6 +647,153 @@ export default function NuevoDespacho() {
     setLoadingRetiro(false)
   }
 
+  const generarPdfRetiro = async () => {
+    const { jsPDF } = await import('jspdf')
+    const doc: JsPDFType = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' })
+
+    const azul: [number, number, number]    = [37, 74, 150]
+    const verde: [number, number, number]   = [15, 118, 110]
+    const gris: [number, number, number]    = [100, 100, 100]
+    const grisClaro: [number, number, number] = [245, 245, 247]
+    const blanco: [number, number, number]  = [255, 255, 255]
+    const negro: [number, number, number]   = [26, 26, 26]
+
+    const margenIzq = 14
+    const ancho = 182
+    let y = 15
+
+    const ahora = new Date()
+    const fechaGen = ahora.toLocaleDateString('es-AR', { day: '2-digit', month: '2-digit', year: 'numeric' })
+    const horaGen  = ahora.toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' })
+
+    // ── Encabezado ──────────────────────────────────────────────────────────
+    doc.setFillColor(...azul)
+    doc.rect(margenIzq, y, ancho, 18, 'F')
+    doc.setTextColor(...blanco)
+    doc.setFontSize(15)
+    doc.setFont('helvetica', 'bold')
+    doc.text('SOLICITUD DE RETIRO', margenIzq + 4, y + 8)
+    doc.setFontSize(9)
+    doc.setFont('helvetica', 'normal')
+    doc.text('CAC — Centro de Abastecimiento Cerámico', margenIzq + 4, y + 14)
+    doc.text(`Generado: ${fechaGen} ${horaGen}`, margenIzq + ancho - 2, y + 14, { align: 'right' })
+    y += 24
+
+    // ── Datos del cliente ────────────────────────────────────────────────────
+    doc.setFillColor(...grisClaro)
+    doc.rect(margenIzq, y, ancho, 7, 'F')
+    doc.setTextColor(...azul)
+    doc.setFontSize(9)
+    doc.setFont('helvetica', 'bold')
+    doc.text('DATOS DEL CLIENTE', margenIzq + 3, y + 4.8)
+    y += 9
+
+    const camposDatos: [string, string][] = [
+      ['NV (Nota de Venta)', formRetiro.nv || '—'],
+      ['Cliente', formRetiro.cliente || '—'],
+      ['Teléfono', formRetiro.telefono || '—'],
+      ['Dirección de retiro', formRetiro.direccion || '—'],
+      ['Sucursal', formRetiro.sucursal || '—'],
+      ['Fecha estimada', formRetiro.fecha_estimada ? new Date(formRetiro.fecha_estimada + 'T12:00:00').toLocaleDateString('es-AR', { day: '2-digit', month: '2-digit', year: 'numeric' }) : '—'],
+    ]
+
+    camposDatos.forEach(([label, valor], i) => {
+      if (i % 2 === 0) {
+        doc.setFillColor(...blanco)
+      } else {
+        doc.setFillColor(250, 250, 252)
+      }
+      doc.rect(margenIzq, y, ancho, 6.5, 'F')
+      doc.setTextColor(...gris)
+      doc.setFontSize(8)
+      doc.setFont('helvetica', 'normal')
+      doc.text(label + ':', margenIzq + 3, y + 4.4)
+      doc.setTextColor(...negro)
+      doc.setFont('helvetica', 'bold')
+      doc.text(valor, margenIzq + 55, y + 4.4)
+      y += 6.5
+    })
+    y += 5
+
+    // ── Productos ────────────────────────────────────────────────────────────
+    doc.setFillColor(...verde)
+    doc.rect(margenIzq, y, ancho, 7, 'F')
+    doc.setTextColor(...blanco)
+    doc.setFontSize(9)
+    doc.setFont('helvetica', 'bold')
+    doc.text('PRODUCTOS A RETIRAR', margenIzq + 3, y + 4.8)
+    y += 9
+
+    // Cabecera tabla
+    doc.setFillColor(...azul)
+    doc.rect(margenIzq, y, ancho, 6.5, 'F')
+    doc.setTextColor(...blanco)
+    doc.setFontSize(8)
+    doc.setFont('helvetica', 'bold')
+    doc.text('#', margenIzq + 3, y + 4.4)
+    doc.text('Código', margenIzq + 12, y + 4.4)
+    doc.text('Producto', margenIzq + 32, y + 4.4)
+    doc.text('Cant.', margenIzq + ancho - 5, y + 4.4, { align: 'right' })
+    y += 6.5
+
+    const itemsValidos = itemsRetiro.filter(it => it.nombre_producto.trim())
+    itemsValidos.forEach((item, i) => {
+      if (y + 7 > 275) { doc.addPage(); y = 15 }
+      const par = i % 2 === 0
+      doc.setFillColor(par ? 255 : 248, par ? 255 : 250, par ? 255 : 255)
+      doc.rect(margenIzq, y, ancho, 6.5, 'F')
+      doc.setTextColor(...gris)
+      doc.setFontSize(8)
+      doc.setFont('helvetica', 'normal')
+      doc.text(String(i + 1), margenIzq + 3, y + 4.4)
+      doc.text(item.id_producto ? String(item.id_producto) : '—', margenIzq + 12, y + 4.4)
+      doc.setTextColor(...negro)
+      doc.setFont('helvetica', 'normal')
+      // Truncar nombre si es muy largo
+      const nombre = item.nombre_producto.length > 55 ? item.nombre_producto.substring(0, 52) + '…' : item.nombre_producto
+      doc.text(nombre, margenIzq + 32, y + 4.4)
+      doc.setFont('helvetica', 'bold')
+      doc.setTextColor(...azul)
+      doc.text(String(item.cantidad), margenIzq + ancho - 5, y + 4.4, { align: 'right' })
+      y += 6.5
+    })
+    y += 5
+
+    // ── Notas ────────────────────────────────────────────────────────────────
+    if (formRetiro.notas?.trim()) {
+      if (y + 20 > 275) { doc.addPage(); y = 15 }
+      doc.setFillColor(...grisClaro)
+      doc.rect(margenIzq, y, ancho, 7, 'F')
+      doc.setTextColor(...azul)
+      doc.setFontSize(9)
+      doc.setFont('helvetica', 'bold')
+      doc.text('NOTAS', margenIzq + 3, y + 4.8)
+      y += 9
+      doc.setTextColor(...negro)
+      doc.setFontSize(8.5)
+      doc.setFont('helvetica', 'normal')
+      const lineas = doc.splitTextToSize(formRetiro.notas.trim(), ancho - 6)
+      doc.text(lineas, margenIzq + 3, y + 4)
+      y += lineas.length * 5 + 4
+    }
+
+    // ── Footer ───────────────────────────────────────────────────────────────
+    const totalPags = (doc as any).internal.getNumberOfPages()
+    for (let p = 1; p <= totalPags; p++) {
+      doc.setPage(p)
+      doc.setDrawColor(220, 220, 220)
+      doc.line(margenIzq, 285, margenIzq + ancho, 285)
+      doc.setFontSize(7.5)
+      doc.setTextColor(...gris)
+      doc.setFont('helvetica', 'normal')
+      doc.text(`Solicitud de retiro NV ${formRetiro.nv} — ${formRetiro.cliente} · ${fechaGen}`, margenIzq, 290)
+      doc.text(`Pág. ${p} / ${totalPags}`, margenIzq + ancho, 290, { align: 'right' })
+    }
+
+    const fileName = `retiro_NV${formRetiro.nv}_${formRetiro.cliente.replace(/[^a-zA-Z0-9]/g, '_').toLowerCase()}.pdf`
+    doc.save(fileName)
+  }
+
   const resetRetiro = () => {
     setExitoRetiro(false)
     setFormRetiro(RETIRO_FORM_INICIAL)
@@ -556,9 +818,9 @@ export default function NuevoDespacho() {
           <button onClick={resetForm} className="px-6 py-2.5 rounded-lg text-sm font-medium text-white" style={{ background: '#254A96' }}>
             Nuevo pedido
           </button>
-          <button onClick={() => router.push('/dashboard')} className="px-6 py-2.5 rounded-lg text-sm font-medium" style={{ background: '#f4f4f3', color: '#666' }}>
+          <Link href="/dashboard" className="px-6 py-2.5 rounded-lg text-sm font-medium" style={{ background: '#f4f4f3', color: '#666' }}>
             Ir al panel
-          </button>
+          </Link>
         </div>
       </div>
     </div>
@@ -569,14 +831,27 @@ export default function NuevoDespacho() {
       <div className="bg-white rounded-2xl shadow-lg p-10 text-center max-w-md w-full mx-4">
         <div className="w-16 h-16 rounded-full flex items-center justify-center text-3xl mx-auto mb-6" style={{ background: '#d1fae5' }}>🔄</div>
         <h2 className="text-2xl font-semibold mb-2" style={{ color: '#254A96' }}>Retiro solicitado</h2>
-        <p className="text-sm mb-8" style={{ color: '#B9BBB7' }}>La solicitud de retiro fue registrada. El ruteador definirá cuándo pasamos a buscarlo.</p>
-        <div className="flex gap-3 justify-center">
-          <button onClick={resetRetiro} className="px-6 py-2.5 rounded-lg text-sm font-medium text-white" style={{ background: '#254A96' }}>
-            Nueva solicitud
+        <p className="text-sm mb-2" style={{ color: '#B9BBB7' }}>La solicitud de retiro fue registrada. El ruteador definirá cuándo pasamos a buscarlo.</p>
+        {/* Resumen rápido */}
+        <div className="rounded-xl px-4 py-3 mb-6 text-left text-sm space-y-1" style={{ background: '#f4f4f3' }}>
+          <p style={{ color: '#1a1a1a' }}><strong>NV:</strong> {formRetiro.nv} · <strong>Cliente:</strong> {formRetiro.cliente}</p>
+          <p style={{ color: '#666' }}>{formRetiro.sucursal}{formRetiro.fecha_estimada ? ` · ${new Date(formRetiro.fecha_estimada + 'T12:00:00').toLocaleDateString('es-AR', { day: '2-digit', month: '2-digit', year: 'numeric' })}` : ''}</p>
+          <p style={{ color: '#666' }}>{itemsRetiro.filter(i => i.nombre_producto).length} producto{itemsRetiro.filter(i => i.nombre_producto).length !== 1 ? 's' : ''} a retirar</p>
+        </div>
+        <div className="flex flex-col gap-2.5">
+          <button onClick={generarPdfRetiro}
+            className="w-full py-2.5 rounded-xl text-sm font-semibold text-white flex items-center justify-center gap-2"
+            style={{ background: '#0f766e' }}>
+            📄 Generar PDF para logística
           </button>
-          <button onClick={() => router.push('/dashboard')} className="px-6 py-2.5 rounded-lg text-sm font-medium" style={{ background: '#f4f4f3', color: '#666' }}>
-            Ir al panel
-          </button>
+          <div className="flex gap-3">
+            <button onClick={resetRetiro} className="flex-1 py-2.5 rounded-xl text-sm font-medium text-white" style={{ background: '#254A96' }}>
+              Nueva solicitud
+            </button>
+            <Link href="/dashboard" className="flex-1 py-2.5 rounded-xl text-sm font-medium" style={{ background: '#f4f4f3', color: '#666' }}>
+              Ir al panel
+            </Link>
+          </div>
         </div>
       </div>
     </div>
@@ -596,11 +871,11 @@ export default function NuevoDespacho() {
       {/* Navbar */}
       <nav className="bg-white border-b sticky top-0 z-40" style={{ borderColor: '#e8edf8' }}>
         <div className="max-w-3xl mx-auto px-4 md:px-6 h-14 flex items-center gap-4">
-          <button onClick={() => router.push('/dashboard')}
+          <Link href="/dashboard"
             className="flex items-center gap-1.5 text-sm font-medium px-3 py-1.5 rounded-lg"
             style={{ color: '#254A96', background: '#e8edf8' }}>
             ← Volver
-          </button>
+          </Link>
           <div className="w-px h-5 bg-gray-200" />
           <img src="/logo.png" alt="Construyo al Costo" className="h-7 w-auto rounded-lg hidden sm:block" />
           <span className="font-semibold text-sm" style={{ color: '#254A96' }}>
@@ -734,6 +1009,12 @@ export default function NuevoDespacho() {
               </div>
             )}
           </label>
+          {error && !pdfListo && (
+            <div className="mt-3 rounded-lg px-4 py-3 text-sm font-medium flex items-center gap-2" style={{ background: '#fde8e8', color: '#E52322' }}>
+              <span>⚠️</span>
+              <span>{error}</span>
+            </div>
+          )}
         </div>
 
         {/* Productos */}
@@ -742,16 +1023,33 @@ export default function NuevoDespacho() {
             <h2 className="font-semibold text-sm mb-4" style={{ color: '#254A96' }}>📦 Productos del pedido</h2>
             <div className="space-y-2">
               {productosNV.map((p, i) => (
-                <div key={i} className="flex justify-between items-center text-sm py-2 border-b last:border-0" style={{ borderColor: '#f4f4f3' }}>
-                  <div>
+                <div key={i} className="flex justify-between items-start gap-3 text-sm py-2.5 border-b last:border-0" style={{ borderColor: '#f4f4f3' }}>
+                  <div className="flex-1 min-w-0">
                     <span className="font-medium" style={{ color: '#1a1a1a' }}>{p.descripcion}</span>
                     <span className="ml-2 text-xs" style={{ color: '#B9BBB7' }}>×{p.cantidad}</span>
+                    {!p.material && (
+                      <span className="ml-2 text-xs font-medium" style={{ color: '#f59e0b' }}>⚠ sin match en maestro</span>
+                    )}
                   </div>
-                  <div className="text-right text-xs" style={{ color: '#B9BBB7' }}>
-                    {p.material ? (
-                      <span>{p.posiciones.toFixed(1)} pos · {(p.peso / 1000).toFixed(1)} tn</span>
-                    ) : (
-                      <span style={{ color: '#E52322' }}>Sin datos logísticos</span>
+                  <div className="shrink-0 flex items-center gap-2">
+                    <div className="flex items-center gap-1" title="Posiciones logísticas — editá si el cálculo automático es incorrecto">
+                      <input
+                        type="number"
+                        min={0}
+                        step={0.5}
+                        value={p.posiciones}
+                        onChange={e => editarPosicionesItem(i, parseFloat(e.target.value) || 0)}
+                        className="w-16 text-right border rounded-lg px-2 py-0.5 text-xs focus:outline-none"
+                        style={{
+                          borderColor: p.posiciones === 0 ? '#fca5a5' : '#e8edf8',
+                          color: p.posiciones === 0 ? '#E52322' : '#254A96',
+                          fontWeight: 600,
+                        }}
+                      />
+                      <span className="text-xs" style={{ color: '#B9BBB7' }}>pos</span>
+                    </div>
+                    {p.material && (
+                      <span className="text-xs" style={{ color: '#B9BBB7' }}>{(p.peso / 1000).toFixed(1)} tn</span>
                     )}
                   </div>
                 </div>
@@ -863,14 +1161,17 @@ export default function NuevoDespacho() {
                     {FRANJAS.map((franja) => {
                       const { vuelta, label, horario } = franja
                       const cerrada = vueltasCerradas.includes(vuelta)
+                      const bloqueadaBarrio = form.barrio_cerrado && vuelta > 3
                       const tieneFlota = vueltasSinCupoConFlota.includes(vuelta)
                       const disponible = cuposDisponibles.includes(vuelta)
-                      if (cerrada) return <option key={vuelta} value={vuelta} disabled>{label} — ⛔ Fuera de horario</option>
+                      if (cerrada || bloqueadaBarrio) return <option key={vuelta} value={vuelta} disabled>{label} — {bloqueadaBarrio ? '🏘️ No disponible para barrio cerrado' : '⛔ Fuera de horario'}</option>
                       if (disponible) return <option key={vuelta} value={vuelta}>{label} — {horario}</option>
                       if (tieneFlota) return <option key={vuelta} value={vuelta}>{label} — ⚠️ Sin cupo (cargar igual)</option>
                       return <option key={vuelta} value={vuelta} disabled>{label} — Sin cupo</option>
                     })}
-                    <option value="fuera_prog">Pedido fuera de programación</option>
+                    <option value="fuera_prog" disabled={fueraProgramacionCerrada || form.barrio_cerrado}>
+                      {fueraProgramacionCerrada ? 'Fuera de prog. — 🔒 Cerrado' : form.barrio_cerrado ? 'Fuera de prog. — 🏘️ No disponible para barrio cerrado' : 'Pedido fuera de programación'}
+                    </option>
                   </select>
 
                   {/* Aviso todas las vueltas cerradas */}
@@ -965,6 +1266,13 @@ export default function NuevoDespacho() {
             <div className="bg-white rounded-xl shadow-sm p-6 space-y-4">
               <p className="text-xs font-semibold uppercase tracking-widest" style={{ color: '#B9BBB7' }}>Datos del cliente</p>
 
+              <div>
+                <label className="block text-xs font-medium mb-1.5" style={{ color: '#254A96' }}>NV (Nota de Venta) <span style={{ color: '#E52322' }}>*</span></label>
+                <input type="number" value={formRetiro.nv} onChange={e => setFormRetiro(p => ({ ...p, nv: e.target.value }))} required
+                  placeholder="Número de NV del pedido original"
+                  className={inputClass} style={inputStyle} />
+              </div>
+
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div>
                   <label className="block text-xs font-medium mb-1.5" style={{ color: '#254A96' }}>Cliente <span style={{ color: '#E52322' }}>*</span></label>
@@ -992,7 +1300,7 @@ export default function NuevoDespacho() {
                   Link de Google Maps <span style={{ color: '#B9BBB7', fontWeight: 400 }}>(opcional)</span>
                 </label>
                 <div className="relative">
-                  <input type="url" value={linkMapsRetiro}
+                  <input type="text" value={linkMapsRetiro}
                     onChange={e => handleLinkMapsRetiro(e.target.value)}
                     placeholder="https://maps.google.com/..."
                     className={inputClass}

@@ -71,6 +71,7 @@ function pesoColumna(ps: Pedido[]) { return ps.filter(p => ESTADOS_ACTIVOS.has(p
 function posColumna(ps: Pedido[]) { return ps.filter(p => ESTADOS_ACTIVOS.has(p.estado)).reduce((a, p) => a + (p.volumen_total_m3 ?? 0), 0) }
 function pct(peso: number, max: number) { return max === 0 ? 0 : Math.round(peso / max * 100) }
 function colorBarra(p: number) { return p >= 90 ? '#E52322' : p >= 70 ? '#f59e0b' : '#10b981' }
+function colorOcupacion(p: number) { return p >= 80 ? '#10b981' : p >= 60 ? '#f59e0b' : '#E52322' }
 
 function localidadDeDireccion(dir: string): string {
   if (!dir) return ''
@@ -2407,7 +2408,7 @@ function ProgramacionInner() {
             if (coords.length === 0) continue
             const maxDist = Math.max(...coords.map(c => distanciaKm(deposito.lat, deposito.lng, c.lat, c.lng)))
             const maxVueltas = maxVueltasPorDistancia(maxDist)
-            const vultasASkip = Math.ceil(5 / maxVueltas) - 1
+            const vultasASkip = Math.max(0, 3 - maxVueltas)
             if (vultasASkip > 0 && vueltaActiva <= v + vultasASkip) {
               // Guardar la vuelta más reciente que genera el aviso
               if (!enRuta[camionCod] || v > enRuta[camionCod].vuelta) {
@@ -2994,6 +2995,23 @@ function ProgramacionInner() {
   const totalAsig = pedidos.filter(p => p.camion_id).length
   const totalSin = pedidos.length - totalAsig
 
+  const pesoAsig     = columnas.reduce((a, c) => a + c.pesoTotal, 0)
+  const posAsig      = columnas.reduce((a, c) => a + c.posTotal, 0)
+  const pesoSinAsig  = sinAsignar.filter(p => ESTADOS_ACTIVOS.has(p.estado)).reduce((a, p) => a + (p.peso_total_kg ?? 0), 0)
+  const posSinAsig   = sinAsignar.filter(p => ESTADOS_ACTIVOS.has(p.estado)).reduce((a, p) => a + (p.volumen_total_m3 ?? 0), 0)
+  const pesoTotalVuelta = pesoAsig + pesoSinAsig
+  const posTotalVuelta  = posAsig + posSinAsig
+  const maxPesoVuelta = columnas.reduce((a, c) => a + c.camion.tonelaje_max_kg, 0)
+  const maxPosVuelta  = columnas.reduce((a, c) => a + (c.camion.posiciones_total > 0 ? c.camion.posiciones_total : 0), 0)
+  const pesoDisp = Math.max(0, maxPesoVuelta - pesoAsig)
+  const posDisp  = Math.max(0, maxPosVuelta - posAsig)
+  const pctPosTotal  = pct(posTotalVuelta, maxPosVuelta)
+  const pctPesoTotal = pct(pesoTotalVuelta, maxPesoVuelta)
+  const pctPosAsig   = pct(posAsig, maxPosVuelta)
+  const pctPesoAsig  = pct(pesoAsig, maxPesoVuelta)
+  const pctPosLibre  = pct(posDisp, maxPosVuelta)
+  const pctPesoLibre = pct(pesoDisp, maxPesoVuelta)
+
   return (
     <div className="h-screen flex flex-col overflow-hidden bg-gray-50" style={{ fontFamily: 'Barlow, sans-serif' }}>
       {toast && (
@@ -3138,10 +3156,34 @@ function ProgramacionInner() {
       {/* Barra acciones */}
       <div className="bg-white border-b shrink-0 px-4 md:px-6 py-2.5" style={{ borderColor: '#f0f0f0' }}>
         <div className="flex items-center justify-between flex-wrap gap-3">
-          <div className="flex items-center gap-5 text-sm" style={{ color: '#B9BBB7' }}>
-            <span>Total: <strong style={{ color: '#254A96' }}>{pedidos.length}</strong></span>
-            <span>Asignados: <strong style={{ color: '#10b981' }}>{totalAsig}</strong></span>
-            <span>Sin asignar: <strong style={{ color: totalSin > 0 ? '#E52322' : '#B9BBB7' }}>{totalSin}</strong></span>
+          <div className="flex items-start gap-5 text-sm" style={{ color: '#B9BBB7' }}>
+            <div className="flex flex-col gap-0.5">
+              <span>Total: <strong style={{ color: '#254A96' }}>{pedidos.length}</strong></span>
+              {maxPesoVuelta > 0 && (
+                <span className="text-xs" style={{ color: '#aaa' }}>
+                  {maxPosVuelta > 0 && <>{Math.round(posTotalVuelta)} / {maxPosVuelta} pos <span style={{ color: colorOcupacion(pctPosTotal) }}>({pctPosTotal}%)</span> · </>}
+                  {(pesoTotalVuelta / 1000).toFixed(1)} / {(maxPesoVuelta / 1000).toFixed(1)} tn <span style={{ color: colorOcupacion(pctPesoTotal) }}>({pctPesoTotal}%)</span>
+                </span>
+              )}
+            </div>
+            <div className="flex flex-col gap-0.5">
+              <span>Asignados: <strong style={{ color: '#10b981' }}>{totalAsig}</strong></span>
+              {maxPesoVuelta > 0 && (
+                <span className="text-xs" style={{ color: '#aaa' }}>
+                  {maxPosVuelta > 0 && <>{Math.round(posAsig)} / {maxPosVuelta} pos <span style={{ color: colorOcupacion(pctPosAsig) }}>({pctPosAsig}%)</span> · </>}
+                  {(pesoAsig / 1000).toFixed(1)} / {(maxPesoVuelta / 1000).toFixed(1)} tn <span style={{ color: colorOcupacion(pctPesoAsig) }}>({pctPesoAsig}%)</span>
+                </span>
+              )}
+            </div>
+            <div className="flex flex-col gap-0.5">
+              <span>Sin asignar: <strong style={{ color: totalSin > 0 ? '#E52322' : '#B9BBB7' }}>{totalSin}</strong></span>
+              {maxPesoVuelta > 0 && (
+                <span className="text-xs" style={{ color: '#aaa' }}>
+                  {maxPosVuelta > 0 && <>{Math.round(posDisp)} / {maxPosVuelta} pos libres <span style={{ color: colorBarra(pctPosLibre) }}>({pctPosLibre}%)</span> · </>}
+                  {(pesoDisp / 1000).toFixed(1)} / {(maxPesoVuelta / 1000).toFixed(1)} tn libres <span style={{ color: colorBarra(pctPesoLibre) }}>({pctPesoLibre}%)</span>
+                </span>
+              )}
+            </div>
           </div>
           <div className="flex items-center gap-2">
             <button onClick={() => setModalRutas(true)} disabled={cargando || pedidos.length === 0}

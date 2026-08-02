@@ -108,19 +108,23 @@ const VUELTA_LABEL: Record<number, string> = {
   4: 'V4 · 15–17hs', 5: 'V5 · Fuera de hora',
 }
 
-function calcularDistanciaRuta(pedidos: { latitud: number | null; longitud: number | null; orden_entrega: number | null }[], depot: { lat: number; lng: number }): number {
+function calcularDistanciaRuta(
+  pedidos: { latitud: number | null; longitud: number | null; orden_entrega: number | null }[],
+  depotInicio: { lat: number; lng: number },
+  depotFin?: { lat: number; lng: number },
+): number {
+  const fin = depotFin ?? depotInicio
   const conUbicacion = pedidos
     .filter(p => p.latitud && p.longitud)
     .sort((a, b) => (a.orden_entrega ?? 999) - (b.orden_entrega ?? 999))
   if (conUbicacion.length === 0) return 0
   let dist = 0
-  let latPrev = depot.lat, lngPrev = depot.lng
+  let latPrev = depotInicio.lat, lngPrev = depotInicio.lng
   for (const p of conUbicacion) {
     dist += distanciaKm(latPrev, lngPrev, p.latitud!, p.longitud!)
     latPrev = p.latitud!; lngPrev = p.longitud!
   }
-  // vuelta al depósito
-  dist += distanciaKm(latPrev, lngPrev, depot.lat, depot.lng)
+  dist += distanciaKm(latPrev, lngPrev, fin.lat, fin.lng)
   return Math.round(dist)
 }
 
@@ -591,17 +595,23 @@ export default function MetricasPage() {
       }
       const porVueltaRows = Object.values(vueltaGroupsEx)
         .sort((a, b) => a.fecha.localeCompare(b.fecha) || a.camion.localeCompare(b.camion) || a.vuelta - b.vuelta)
-        .map(g => {
+        .map((g, idx, arr) => {
           const cam = camionMap[g.camion]
           const flota = flotaMapEx[`${g.camion}|${g.fecha}`]
           const esTrailerEx = /trailer|semi/i.test(cam?.tipo_unidad ?? '')
-          const depot = DEPOSITOS[cam?.sucursal ?? ''] ?? { lat: -34.9205, lng: -57.9536 }
+          const depotCam = DEPOSITOS[cam?.sucursal ?? ''] ?? { lat: -34.9205, lng: -57.9536 }
+          const depot = DEPOSITOS[g.peds[0]?.sucursal] ?? depotCam
+          const gNext = arr[idx + 1]
+          const depotFin = (gNext && gNext.camion === g.camion && gNext.fecha === g.fecha)
+            ? (DEPOSITOS[gNext.peds[0]?.sucursal] ?? depotCam)
+            : depotCam
 
           const kg = g.peds.reduce((a: number, p: any) => a + (p.peso_total_kg ?? 0), 0)
           const pos = g.peds.reduce((a: number, p: any) => a + (p.volumen_total_m3 ?? 0), 0)
           const distKmEx = calcularDistanciaRuta(
             g.peds.map((p: any) => ({ latitud: p.latitud, longitud: p.longitud, orden_entrega: p.orden_entrega })),
-            depot
+            depot,
+            depotFin,
           )
 
           const detEx: PedidoDetalle[] = g.peds.map((p: any) => ({
@@ -758,11 +768,15 @@ export default function MetricasPage() {
       const depot = DEPOSITOS[camion.sucursal] ?? { lat: -34.9205, lng: -57.9536 }
 
       const vueltasSet = [...new Set(pedidosCamion.map((p: any) => p.vuelta as number))].sort((a, b) => a - b)
-      const vueltas: DatosVuelta[] = vueltasSet.map(v => {
+      const vueltas: DatosVuelta[] = vueltasSet.map((v, idx) => {
         const pv = pedidosCamion.filter((p: any) => p.vuelta === v)
         const kg = pv.reduce((a: number, p: any) => a + (p.peso_total_kg ?? 0), 0)
         const pos = pv.reduce((a: number, p: any) => a + (p.volumen_total_m3 ?? 0), 0)
-        const dist = calcularDistanciaRuta(pv, depot)
+        const depotVuelta = DEPOSITOS[pv[0]?.sucursal] ?? depot
+        const nextV = vueltasSet[idx + 1]
+        const pvNext = nextV != null ? pedidosCamion.filter((p: any) => p.vuelta === nextV) : null
+        const depotFin = pvNext ? (DEPOSITOS[pvNext[0]?.sucursal] ?? depot) : depot
+        const dist = calcularDistanciaRuta(pv, depotVuelta, depotFin)
         return {
           vuelta: v,
           pedidos: pv.length,
@@ -793,7 +807,7 @@ export default function MetricasPage() {
         }
       })
 
-      const distanciaTotalKm = calcularDistanciaRuta(pedidosCamion, depot)
+      const distanciaTotalKm = vueltas.reduce((sum, v) => sum + v.distanciaKm, 0)
       const numVueltas = vueltas.length || 1
       const capacidadKgDia = camion.tonelaje_max_kg * numVueltas
       const capacidadPosDia = camion.posiciones_total * numVueltas
@@ -1837,7 +1851,7 @@ function VistaDiaria({ datos, fecha, camionesNoActivados }: {
                           const trasMin = v.tiempoTrasladoMin
                           // Fallback: estimación de traslado desde km en línea recta
                           // (factor 1.3 de desvío de ruta × vel promedio según sucursal)
-                          const velKmh = getVelFallback(d.sucursal)
+                          const velKmh = getVelFallback(v.detalle[0]?.sucursal ?? d.sucursal)
                           const trasEst = trasMin === null && v.distanciaKm > 0
                             ? Math.round(v.distanciaKm * 1.3 / velKmh * 60)
                             : null

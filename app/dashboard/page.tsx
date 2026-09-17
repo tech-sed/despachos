@@ -21,6 +21,7 @@ const TODAS_LAS_CARDS = [
   { href: '/metricas',       icon: '📊', titulo: 'Métricas',           descripcion: 'Ocupación de flota y tiempos de ruta',       disponible: true, roles: ['gerencia','ruteador','admin_flota'] },
   { href: '/usuarios',       icon: '👥', titulo: 'Usuarios',           descripcion: 'Gestión de usuarios y permisos',             disponible: true, roles: ['gerencia'] },
   { href: '/stock',          icon: '🏷️', titulo: 'Stock',              descripcion: 'Consulta de stock por sucursal',             disponible: true, roles: ['gerencia','admin_flota','ruteador','deposito','comercial'] },
+  { href: '/pallets',        icon: '📦', titulo: 'Pallets',            descripcion: 'Devolución y reintegro de pallets',          disponible: true, roles: ['gerencia','admin_flota','ruteador','deposito','comercial'] },
   { href: '/ayuda',          icon: '📖', titulo: 'Manual de uso',      descripcion: 'Guía paso a paso y diagramas de flujo',      disponible: true, roles: ['gerencia','admin_flota','ruteador','deposito','comercial','confirmador','chofer'] },
 ]
  
@@ -104,6 +105,7 @@ export default function Dashboard() {
 
       if (userData?.rol === 'chofer') { router.push('/ruteo'); return }
       if (userData?.rol === 'confirmador') { router.push('/confirmaciones'); return }
+      if (userData?.rol === 'guardia') { router.push('/guardia'); return }
 
       setUsuario(user)
       setRolUsuario(userData?.rol ?? '')
@@ -141,6 +143,17 @@ export default function Dashboard() {
     const franja = FRANJAS.find(f => f.vuelta === vuelta)
     if (franja && vultaCerrada(fecha, franja)) {
       showToast('Esta vuelta ya cerró para esa fecha. Elegí una franja disponible.', 'err')
+      return
+    }
+    // Verificar bloqueo manual del ruteador (candadito)
+    const { data: vcmData } = await supabase
+      .from('vueltas_cerradas_manual')
+      .select('vuelta')
+      .eq('fecha', fecha)
+      .eq('sucursal', p.sucursal)
+    const cerradasManual = (vcmData ?? []).map((r: any) => r.vuelta as number).filter((v: number) => v !== 0)
+    if (cerradasManual.includes(vuelta)) {
+      showToast('Esa vuelta está cerrada por logística. Elegí otra franja o contactalos.', 'err')
       return
     }
     const nota = `⚡ Reprogramado desde ${p.fecha_entrega} V${p.vuelta}${motivo ? ` — ${motivo}` : ''}`

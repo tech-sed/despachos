@@ -16,7 +16,7 @@ const CATEGORIAS: Record<string, string[]> = {
 
 const MAX_FOTOS = 5
 
-type Accion = 'home' | 'salida' | 'ingreso' | 'devolucion'
+type Accion = 'home' | 'salida' | 'ingreso' | 'devolucion' | 'inicio_carga' | 'fin_carga'
 
 interface FotoItem {
   file: File
@@ -25,17 +25,49 @@ interface FotoItem {
 
 function hoy() { return new Date().toISOString().split('T')[0] }
 function horaLocal() { return new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' }) }
-function genUUID() {
-  return crypto.randomUUID()
+
+function toCSV(rows: any[]): string {
+  if (!rows.length) return ''
+  const cols = [
+    'fecha', 'hora', 'tipo', 'camion_codigo', 'cant_pedidos',
+    'tipo_ingreso', 'deposito_desde',
+    'chofer_apellido', 'categoria', 'motivo', 'remito', 'nv', 'observacion',
+    'cant_posiciones', 'paquetes_hierro',
+  ]
+  const header = cols.join(';')
+  const lines = rows.map(r => {
+    const hora = r.created_at
+      ? new Date(r.created_at).toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' })
+      : ''
+    const vals: Record<string, any> = { ...r, hora }
+    return cols.map(c => {
+      const v = vals[c] ?? ''
+      const s = String(v).replace(/"/g, '""')
+      return s.includes(';') || s.includes('\n') ? `"${s}"` : s
+    }).join(';')
+  })
+  return [header, ...lines].join('\n')
+}
+
+function descargarCSV(content: string, nombre: string) {
+  const bom = '﻿'
+  const blob = new Blob([bom + content], { type: 'text/csv;charset=utf-8;' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url; a.download = nombre; a.click()
+  URL.revokeObjectURL(url)
 }
 
 export default function GuardiaPage() {
   const router = useRouter()
   const [userId, setUserId] = useState<string | null>(null)
+  const [rol, setRol] = useState<string>('')
   const [cargando, setCargando] = useState(true)
   const [camiones, setCamiones] = useState<string[]>([])
+  const [tab, setTab] = useState<'guardia' | 'deposito'>('guardia')
   const [accion, setAccion] = useState<Accion>('home')
   const [guardando, setGuardando] = useState(false)
+  const [exportando, setExportando] = useState(false)
   const [toast, setToast] = useState<{ msg: string; tipo: 'ok' | 'err' } | null>(null)
   const [ultimoEvento, setUltimoEvento] = useState<string | null>(null)
 
@@ -61,6 +93,14 @@ export default function GuardiaPage() {
   const [devFotos, setDevFotos] = useState<FotoItem[]>([])
   const devFileRef = useRef<HTMLInputElement>(null)
 
+  // Inicio de carga
+  const [icCamion, setIcCamion] = useState('')
+  const [icPosiciones, setIcPosiciones] = useState('')
+  const [icHierro, setIcHierro] = useState('')
+
+  // Fin de carga
+  const [fcCamion, setFcCamion] = useState('')
+
   const showToast = (msg: string, tipo: 'ok' | 'err' = 'ok') => {
     setToast({ msg, tipo })
     setTimeout(() => setToast(null), 3000)
@@ -70,9 +110,12 @@ export default function GuardiaPage() {
     supabase.auth.getUser().then(async ({ data: { user } }) => {
       if (!user) { router.push('/'); return }
       const { data: perfil } = await supabase.from('usuarios').select('rol').eq('id', user.id).single()
-      const rolesPermitidos = ['guardia', 'gerencia', 'admin_flota', 'ruteador']
+      const rolesPermitidos = ['guardia', 'gerencia', 'admin_flota', 'ruteador', 'deposito']
       if (!rolesPermitidos.includes(perfil?.rol ?? '')) { router.push('/dashboard'); return }
       setUserId(user.id)
+      const r = perfil?.rol ?? ''
+      setRol(r)
+      if (r === 'deposito') setTab('deposito')
 
       const { data: flota } = await supabase
         .from('camiones_flota')
@@ -123,6 +166,21 @@ export default function GuardiaPage() {
     setDevRemito(''); setDevNV(''); setDevObs('')
     devFotos.forEach(f => URL.revokeObjectURL(f.preview))
     setDevFotos([])
+    setIcCamion(''); setIcPosiciones(''); setIcHierro('')
+    setFcCamion('')
+  }
+
+  const exportarRegistros = async () => {
+    setExportando(true)
+    const { data, error } = await supabase
+      .from('guardia_eventos')
+      .select('*')
+      .order('created_at', { ascending: false })
+    setExportando(false)
+    if (error || !data?.length) { showToast('Sin registros para exportar', 'err'); return }
+    const csv = toCSV(data)
+    descargarCSV(csv, `guardia_${hoy()}.csv`)
+    showToast(`${data.length} registros exportados`)
   }
 
   const registrarSalida = async () => {
@@ -130,26 +188,19 @@ export default function GuardiaPage() {
     if (salFotos.length === 0) { showToast('Agregá al menos 1 foto', 'err'); return }
     setGuardando(true)
     try {
-      const eventoId = genUUID()
+      const eventoId = crypto.randomUUID()
       const fotosUrls = await subirFotos(salFotos, eventoId)
       const { error } = await supabase.from('guardia_eventos').insert({
-        id: eventoId,
-        fecha: hoy(),
-        tipo: 'salida',
-        camion_codigo: salCamion,
-        cant_pedidos: Number(salCant),
-        fotos_urls: fotosUrls,
-        registrado_por: userId,
+        id: eventoId, fecha: hoy(), tipo: 'salida',
+        camion_codigo: salCamion, cant_pedidos: Number(salCant),
+        fotos_urls: fotosUrls, registrado_por: userId,
       })
       if (error) throw error
       setUltimoEvento(`✅ ${salCamion} salió con ${salCant} pedido${Number(salCant) !== 1 ? 's' : ''} — ${horaLocal()}`)
       resetForms(); setAccion('home')
       showToast(`Salida registrada — ${salCamion}`)
-    } catch {
-      showToast('Error al guardar', 'err')
-    } finally {
-      setGuardando(false)
-    }
+    } catch { showToast('Error al guardar', 'err') }
+    finally { setGuardando(false) }
   }
 
   const registrarIngreso = async () => {
@@ -157,11 +208,8 @@ export default function GuardiaPage() {
     if (ingTipo === 'con_transferencia' && !ingDeposito) { showToast('Indicá el depósito de origen', 'err'); return }
     setGuardando(true)
     const { error } = await supabase.from('guardia_eventos').insert({
-      fecha: hoy(),
-      tipo: 'ingreso',
-      camion_codigo: ingCamion,
-      tipo_ingreso: ingTipo,
-      deposito_desde: ingTipo === 'con_transferencia' ? ingDeposito : null,
+      fecha: hoy(), tipo: 'ingreso', camion_codigo: ingCamion,
+      tipo_ingreso: ingTipo, deposito_desde: ingTipo === 'con_transferencia' ? ingDeposito : null,
       registrado_por: userId,
     })
     setGuardando(false)
@@ -179,31 +227,53 @@ export default function GuardiaPage() {
     if (devFotos.length === 0) { showToast('Agregá al menos 1 foto', 'err'); return }
     setGuardando(true)
     try {
-      const eventoId = genUUID()
+      const eventoId = crypto.randomUUID()
       const fotosUrls = await subirFotos(devFotos, eventoId)
       const { error } = await supabase.from('guardia_eventos').insert({
-        id: eventoId,
-        fecha: hoy(),
-        tipo: 'devolucion',
-        camion_codigo: devCamion,
-        chofer_apellido: devChofer,
-        categoria: devCategoria,
-        motivo: devMotivo,
-        remito: devRemito || null,
-        nv: devNV || null,
-        observacion: devObs || null,
-        fotos_urls: fotosUrls,
-        registrado_por: userId,
+        id: eventoId, fecha: hoy(), tipo: 'devolucion',
+        camion_codigo: devCamion, chofer_apellido: devChofer,
+        categoria: devCategoria, motivo: devMotivo,
+        remito: devRemito || null, nv: devNV || null, observacion: devObs || null,
+        fotos_urls: fotosUrls, registrado_por: userId,
       })
       if (error) throw error
       setUltimoEvento(`✅ Devolución ${devCamion} — ${devCategoria} — ${horaLocal()}`)
       resetForms(); setAccion('home')
       showToast(`Devolución registrada — ${devCamion}`)
-    } catch {
-      showToast('Error al guardar', 'err')
-    } finally {
-      setGuardando(false)
-    }
+    } catch { showToast('Error al guardar', 'err') }
+    finally { setGuardando(false) }
+  }
+
+  const registrarInicioCarga = async () => {
+    if (!icCamion) { showToast('Seleccioná el camión', 'err'); return }
+    if (!icPosiciones && !icHierro) { showToast('Ingresá posiciones o paquetes de hierro', 'err'); return }
+    setGuardando(true)
+    const { error } = await supabase.from('guardia_eventos').insert({
+      fecha: hoy(), tipo: 'inicio_carga', camion_codigo: icCamion,
+      cant_posiciones: icPosiciones ? Number(icPosiciones) : null,
+      paquetes_hierro: icHierro ? Number(icHierro) : null,
+      registrado_por: userId,
+    })
+    setGuardando(false)
+    if (error) { showToast('Error al guardar', 'err'); return }
+    const detalle = [icPosiciones && `${icPosiciones} pos.`, icHierro && `${icHierro} paq. hierro`].filter(Boolean).join(' + ')
+    setUltimoEvento(`✅ Inicio carga ${icCamion} — ${detalle} — ${horaLocal()}`)
+    resetForms(); setAccion('home')
+    showToast(`Inicio de carga registrado — ${icCamion}`)
+  }
+
+  const registrarFinCarga = async () => {
+    if (!fcCamion) { showToast('Seleccioná el camión', 'err'); return }
+    setGuardando(true)
+    const { error } = await supabase.from('guardia_eventos').insert({
+      fecha: hoy(), tipo: 'fin_carga', camion_codigo: fcCamion,
+      registrado_por: userId,
+    })
+    setGuardando(false)
+    if (error) { showToast('Error al guardar', 'err'); return }
+    setUltimoEvento(`✅ Fin de carga ${fcCamion} — ${horaLocal()}`)
+    resetForms(); setAccion('home')
+    showToast(`Fin de carga registrado — ${fcCamion}`)
   }
 
   if (cargando) {
@@ -213,6 +283,11 @@ export default function GuardiaPage() {
       </div>
     )
   }
+
+  const esDeposito = rol === 'deposito'
+  const verTabs = !['guardia', 'deposito'].includes(rol)
+  // Roles que tienen dashboard al que volver
+  const tieneDashboard = !['guardia', 'deposito'].includes(rol)
 
   const inputStyle: React.CSSProperties = {
     width: '100%', padding: '14px 12px', fontSize: 16, borderRadius: 12,
@@ -232,68 +307,57 @@ export default function GuardiaPage() {
     cursor: 'pointer', marginTop: 8,
   }
 
+  const accionTitulo: Record<Accion, string> = {
+    home: '🔒 Guardia y Cargas',
+    salida: '🚛 Salida de camión',
+    ingreso: '🏠 Ingreso de camión',
+    devolucion: '📋 Devolución',
+    inicio_carga: '📦 Inicio de carga',
+    fin_carga: '✅ Fin de carga',
+  }
+
   const FotoSection = ({
-    fotos,
-    setter,
-    fileRef,
-    color,
+    fotos, setter, fileRef, color,
   }: {
     fotos: FotoItem[]
     setter: React.Dispatch<React.SetStateAction<FotoItem[]>>
-    fileRef: React.RefObject<HTMLInputElement>
+    fileRef: React.RefObject<HTMLInputElement | null>
     color: string
   }) => (
     <div style={fieldStyle}>
       <label style={labelStyle}>
         Fotos <span style={{ color: '#999' }}>({fotos.length}/{MAX_FOTOS}) — mín. 1 requerida</span>
       </label>
-
-      {/* Thumbnails */}
       {fotos.length > 0 && (
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 10 }}>
           {fotos.map((f, i) => (
             <div key={i} style={{ position: 'relative', width: 80, height: 80 }}>
               {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                src={f.preview}
-                alt={`foto ${i + 1}`}
-                style={{ width: 80, height: 80, objectFit: 'cover', borderRadius: 10, border: '1.5px solid #e0e0e0' }}
-              />
-              <button
-                onClick={() => quitarFoto(i, setter)}
+              <img src={f.preview} alt={`foto ${i + 1}`}
+                style={{ width: 80, height: 80, objectFit: 'cover', borderRadius: 10, border: '1.5px solid #e0e0e0' }} />
+              <button onClick={() => quitarFoto(i, setter)}
                 style={{
                   position: 'absolute', top: -6, right: -6,
                   background: '#ef4444', color: '#fff', border: 'none',
                   borderRadius: '50%', width: 22, height: 22, fontSize: 13,
                   cursor: 'pointer', lineHeight: '22px', textAlign: 'center', padding: 0,
-                }}
-              >×</button>
+                }}>×</button>
             </div>
           ))}
         </div>
       )}
-
-      {/* Add button */}
       {fotos.length < MAX_FOTOS && (
         <>
-          <input
-            ref={fileRef}
-            type="file"
-            accept="image/*"
-            capture="environment"
-            multiple
+          <input ref={fileRef} type="file" accept="image/*" capture="environment" multiple
             style={{ display: 'none' }}
-            onChange={e => agregarFotos(e.target.files, setter, fotos)}
-          />
-          <button
-            onClick={() => fileRef.current?.click()}
+            onChange={e => agregarFotos(e.target.files, setter, fotos)} />
+          <button onClick={() => fileRef.current?.click()}
             style={{
               display: 'flex', alignItems: 'center', gap: 8,
               padding: '12px 16px', borderRadius: 12, fontSize: 15, fontWeight: 600,
               border: `2px dashed ${color}`, background: '#fafafa', color,
               cursor: 'pointer', width: '100%', justifyContent: 'center',
-            }}
-          >
+            }}>
             <span style={{ fontSize: 20 }}>📷</span>
             {fotos.length === 0 ? 'Agregar foto' : 'Agregar otra foto'}
           </button>
@@ -305,22 +369,41 @@ export default function GuardiaPage() {
   return (
     <div style={{ minHeight: '100dvh', background: '#f4f4f3', fontFamily: 'system-ui, sans-serif' }}>
       {/* Header */}
-      <div style={{ background: '#254A96', padding: '20px 20px 16px', position: 'sticky', top: 0, zIndex: 10 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-          {accion !== 'home' && (
-            <button onClick={() => { setAccion('home'); resetForms() }}
-              style={{ background: 'rgba(255,255,255,0.2)', border: 'none', color: '#fff', borderRadius: 10, padding: '6px 12px', fontSize: 18, cursor: 'pointer' }}>
-              ‹
+      <div style={{ background: '#254A96', padding: '16px 20px', position: 'sticky', top: 0, zIndex: 10 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', maxWidth: 900, margin: '0 auto' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            {accion !== 'home' ? (
+              <button onClick={() => { setAccion('home'); resetForms() }}
+                style={{ background: 'rgba(255,255,255,0.2)', border: 'none', color: '#fff', borderRadius: 10, padding: '6px 12px', fontSize: 18, cursor: 'pointer' }}>
+                ‹
+              </button>
+            ) : tieneDashboard ? (
+              <button onClick={() => router.push('/dashboard')}
+                style={{ background: 'rgba(255,255,255,0.15)', border: 'none', color: '#fff', borderRadius: 10, padding: '6px 12px', fontSize: 13, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap' }}>
+                ← Dashboard
+              </button>
+            ) : null}
+            <div>
+              <p style={{ color: 'rgba(255,255,255,0.7)', fontSize: 12, margin: 0 }}>
+                {new Date().toLocaleDateString('es-AR', { weekday: 'long', day: 'numeric', month: 'long' })}
+              </p>
+              <h1 style={{ color: '#fff', fontSize: 20, fontWeight: 700, margin: 0 }}>
+                {accionTitulo[accion]}
+              </h1>
+            </div>
+          </div>
+
+          {/* Exportar — solo en home y para roles con acceso completo */}
+          {accion === 'home' && tieneDashboard && (
+            <button onClick={exportarRegistros} disabled={exportando}
+              style={{
+                background: 'rgba(255,255,255,0.15)', border: '1px solid rgba(255,255,255,0.3)',
+                color: '#fff', borderRadius: 10, padding: '8px 14px', fontSize: 13,
+                fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap', opacity: exportando ? 0.6 : 1,
+              }}>
+              {exportando ? 'Exportando…' : '↓ Exportar CSV'}
             </button>
           )}
-          <div>
-            <p style={{ color: 'rgba(255,255,255,0.7)', fontSize: 12, margin: 0 }}>
-              {new Date().toLocaleDateString('es-AR', { weekday: 'long', day: 'numeric', month: 'long' })}
-            </p>
-            <h1 style={{ color: '#fff', fontSize: 20, fontWeight: 700, margin: 0 }}>
-              {accion === 'home' ? '🏠 Guardia' : accion === 'salida' ? '🚛 Salida de camión' : accion === 'ingreso' ? '🏠 Ingreso de camión' : '📋 Devolución'}
-            </h1>
-          </div>
         </div>
       </div>
 
@@ -341,38 +424,83 @@ export default function GuardiaPage() {
         {accion === 'home' && (
           <>
             {ultimoEvento && (
-              <div style={{ background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 12, padding: '12px 16px', marginBottom: 20, fontSize: 14, color: '#166534' }}>
+              <div style={{ background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 12, padding: '12px 16px', marginBottom: 16, fontSize: 14, color: '#166534' }}>
                 {ultimoEvento}
               </div>
             )}
 
+            {/* Tabs (solo para roles que ven ambos sectores) */}
+            {verTabs && (
+              <div style={{ display: 'flex', gap: 8, marginBottom: 18 }}>
+                {(['guardia', 'deposito'] as const).map(t => (
+                  <button key={t} onClick={() => { setTab(t) }}
+                    style={{
+                      flex: 1, padding: '12px 8px', borderRadius: 12, fontSize: 15, fontWeight: 700,
+                      border: tab === t ? '2px solid #254A96' : '1.5px solid #e0e0e0',
+                      background: tab === t ? '#254A96' : '#fff',
+                      color: tab === t ? '#fff' : '#666', cursor: 'pointer',
+                    }}>
+                    {t === 'guardia' ? '🔒 Guardia' : '🏭 Depósito'}
+                  </button>
+                ))}
+              </div>
+            )}
+
             <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-              <button onClick={() => setAccion('salida')} style={{
-                background: '#fff', border: '2px solid #254A96', borderRadius: 16, padding: '22px 20px',
-                textAlign: 'left', cursor: 'pointer',
-              }}>
-                <div style={{ fontSize: 32, marginBottom: 6 }}>🚛</div>
-                <div style={{ fontSize: 18, fontWeight: 700, color: '#254A96' }}>Salida</div>
-                <div style={{ fontSize: 13, color: '#666', marginTop: 4 }}>Registrar salida de camión con pedidos</div>
-              </button>
+              {/* Tab Guardia */}
+              {(tab === 'guardia' || !verTabs) && !esDeposito && (
+                <>
+                  <button onClick={() => setAccion('salida')} style={{
+                    background: '#fff', border: '2px solid #254A96', borderRadius: 16, padding: '22px 20px',
+                    textAlign: 'left', cursor: 'pointer',
+                  }}>
+                    <div style={{ fontSize: 32, marginBottom: 6 }}>🚛</div>
+                    <div style={{ fontSize: 18, fontWeight: 700, color: '#254A96' }}>Salida</div>
+                    <div style={{ fontSize: 13, color: '#666', marginTop: 4 }}>Registrar salida de camión con pedidos</div>
+                  </button>
 
-              <button onClick={() => setAccion('ingreso')} style={{
-                background: '#fff', border: '2px solid #059669', borderRadius: 16, padding: '22px 20px',
-                textAlign: 'left', cursor: 'pointer',
-              }}>
-                <div style={{ fontSize: 32, marginBottom: 6 }}>🏠</div>
-                <div style={{ fontSize: 18, fontWeight: 700, color: '#059669' }}>Ingreso</div>
-                <div style={{ fontSize: 13, color: '#666', marginTop: 4 }}>Registrar ingreso de camión</div>
-              </button>
+                  <button onClick={() => setAccion('ingreso')} style={{
+                    background: '#fff', border: '2px solid #059669', borderRadius: 16, padding: '22px 20px',
+                    textAlign: 'left', cursor: 'pointer',
+                  }}>
+                    <div style={{ fontSize: 32, marginBottom: 6 }}>🏠</div>
+                    <div style={{ fontSize: 18, fontWeight: 700, color: '#059669' }}>Ingreso</div>
+                    <div style={{ fontSize: 13, color: '#666', marginTop: 4 }}>Registrar ingreso de camión</div>
+                  </button>
 
-              <button onClick={() => setAccion('devolucion')} style={{
-                background: '#fff', border: '2px solid #b45309', borderRadius: 16, padding: '22px 20px',
-                textAlign: 'left', cursor: 'pointer',
-              }}>
-                <div style={{ fontSize: 32, marginBottom: 6 }}>📋</div>
-                <div style={{ fontSize: 18, fontWeight: 700, color: '#b45309' }}>Devolución</div>
-                <div style={{ fontSize: 13, color: '#666', marginTop: 4 }}>Registrar pedido devuelto</div>
-              </button>
+                  <button onClick={() => setAccion('devolucion')} style={{
+                    background: '#fff', border: '2px solid #b45309', borderRadius: 16, padding: '22px 20px',
+                    textAlign: 'left', cursor: 'pointer',
+                  }}>
+                    <div style={{ fontSize: 32, marginBottom: 6 }}>📋</div>
+                    <div style={{ fontSize: 18, fontWeight: 700, color: '#b45309' }}>Devolución</div>
+                    <div style={{ fontSize: 13, color: '#666', marginTop: 4 }}>Registrar pedido devuelto</div>
+                  </button>
+                </>
+              )}
+
+              {/* Tab Depósito */}
+              {(tab === 'deposito' || esDeposito) && (
+                <>
+                  <button onClick={() => setAccion('inicio_carga')} style={{
+                    background: '#fff', border: '2px solid #0891b2', borderRadius: 16, padding: '22px 20px',
+                    textAlign: 'left', cursor: 'pointer',
+                  }}>
+                    <div style={{ fontSize: 32, marginBottom: 6 }}>📦</div>
+                    <div style={{ fontSize: 18, fontWeight: 700, color: '#0891b2' }}>Inicio de carga</div>
+                    <div style={{ fontSize: 13, color: '#666', marginTop: 4 }}>Registrar inicio de carga de un camión</div>
+                  </button>
+
+                  <button onClick={() => setAccion('fin_carga')} style={{
+                    background: '#fff', border: '2px solid #059669', borderRadius: 16, padding: '22px 20px',
+                    textAlign: 'left', cursor: 'pointer',
+                  }}>
+                    <div style={{ fontSize: 32, marginBottom: 6 }}>✅</div>
+                    <div style={{ fontSize: 18, fontWeight: 700, color: '#059669' }}>Fin de carga</div>
+                    <div style={{ fontSize: 13, color: '#666', marginTop: 4 }}>Registrar que el camión terminó de cargar</div>
+                  </button>
+                </>
+              )}
             </div>
           </>
         )}
@@ -387,18 +515,13 @@ export default function GuardiaPage() {
                 {camiones.map(c => <option key={c} value={c}>{c}</option>)}
               </select>
             </div>
-
             <div style={fieldStyle}>
               <label style={labelStyle}>Cantidad de pedidos</label>
-              <input
-                type="number" inputMode="numeric" min={0}
+              <input type="number" inputMode="numeric" min={0}
                 value={salCant} onChange={e => setSalCant(e.target.value)}
-                placeholder="ej: 5" style={inputStyle}
-              />
+                placeholder="ej: 5" style={inputStyle} />
             </div>
-
             <FotoSection fotos={salFotos} setter={setSalFotos} fileRef={salFileRef} color="#254A96" />
-
             <button onClick={registrarSalida} disabled={guardando} style={btnPrimary}>
               {guardando ? 'Guardando…' : 'Registrar salida'}
             </button>
@@ -416,7 +539,6 @@ export default function GuardiaPage() {
                 {camiones.map(c => <option key={c} value={c}>{c}</option>)}
               </select>
             </div>
-
             <div style={fieldStyle}>
               <label style={labelStyle}>Tipo de ingreso</label>
               <div style={{ display: 'flex', gap: 10 }}>
@@ -433,7 +555,6 @@ export default function GuardiaPage() {
                 ))}
               </div>
             </div>
-
             {ingTipo === 'con_transferencia' && (
               <div style={fieldStyle}>
                 <label style={labelStyle}>Depósito de origen</label>
@@ -443,7 +564,6 @@ export default function GuardiaPage() {
                 </select>
               </div>
             )}
-
             <button onClick={registrarIngreso} disabled={guardando} style={{ ...btnPrimary, background: '#059669' }}>
               {guardando ? 'Guardando…' : 'Registrar ingreso'}
             </button>
@@ -461,15 +581,11 @@ export default function GuardiaPage() {
                 {camiones.map(c => <option key={c} value={c}>{c}</option>)}
               </select>
             </div>
-
             <div style={fieldStyle}>
               <label style={labelStyle}>Apellido del chofer</label>
-              <input
-                type="text" value={devChofer} onChange={e => setDevChofer(e.target.value)}
-                placeholder="ej: Soto" style={inputStyle} autoCapitalize="words"
-              />
+              <input type="text" value={devChofer} onChange={e => setDevChofer(e.target.value)}
+                placeholder="ej: Soto" style={inputStyle} autoCapitalize="words" />
             </div>
-
             <div style={fieldStyle}>
               <label style={labelStyle}>Categoría</label>
               <select value={devCategoria} onChange={e => { setDevCategoria(e.target.value); setDevMotivo('') }} style={inputStyle}>
@@ -477,7 +593,6 @@ export default function GuardiaPage() {
                 {Object.keys(CATEGORIAS).map(cat => <option key={cat} value={cat}>{cat}</option>)}
               </select>
             </div>
-
             {devCategoria && (
               <div style={fieldStyle}>
                 <label style={labelStyle}>Motivo</label>
@@ -487,37 +602,71 @@ export default function GuardiaPage() {
                 </select>
               </div>
             )}
-
             <div style={fieldStyle}>
               <label style={labelStyle}>Remito (opcional)</label>
-              <input
-                type="text" inputMode="numeric" value={devRemito} onChange={e => setDevRemito(e.target.value)}
-                placeholder="Número de remito" style={inputStyle}
-              />
+              <input type="text" inputMode="numeric" value={devRemito} onChange={e => setDevRemito(e.target.value)}
+                placeholder="Número de remito" style={inputStyle} />
             </div>
-
             <div style={fieldStyle}>
               <label style={labelStyle}>Nota de venta (opcional)</label>
-              <input
-                type="text" inputMode="numeric" value={devNV} onChange={e => setDevNV(e.target.value)}
-                placeholder="Número de NV" style={inputStyle}
-              />
+              <input type="text" inputMode="numeric" value={devNV} onChange={e => setDevNV(e.target.value)}
+                placeholder="Número de NV" style={inputStyle} />
             </div>
-
             <div style={fieldStyle}>
               <label style={labelStyle}>Observación (opcional)</label>
-              <textarea
-                value={devObs} onChange={e => setDevObs(e.target.value)}
-                placeholder="Detalle adicional…"
-                rows={3}
-                style={{ ...inputStyle, resize: 'none' }}
-              />
+              <textarea value={devObs} onChange={e => setDevObs(e.target.value)}
+                placeholder="Detalle adicional…" rows={3}
+                style={{ ...inputStyle, resize: 'none' }} />
             </div>
-
             <FotoSection fotos={devFotos} setter={setDevFotos} fileRef={devFileRef} color="#b45309" />
-
             <button onClick={registrarDevolucion} disabled={guardando} style={{ ...btnPrimary, background: '#b45309' }}>
               {guardando ? 'Guardando…' : 'Registrar devolución'}
+            </button>
+            <button onClick={() => { setAccion('home'); resetForms() }} style={btnSecondary}>Cancelar</button>
+          </div>
+        )}
+
+        {/* INICIO DE CARGA */}
+        {accion === 'inicio_carga' && (
+          <div style={{ background: '#fff', borderRadius: 16, padding: '20px 16px', border: '1px solid #e0e0e0' }}>
+            <div style={fieldStyle}>
+              <label style={labelStyle}>Camión</label>
+              <select value={icCamion} onChange={e => setIcCamion(e.target.value)} style={inputStyle}>
+                <option value="">Seleccioná el camión</option>
+                {camiones.map(c => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </div>
+            <div style={fieldStyle}>
+              <label style={labelStyle}>Cantidad de posiciones <span style={{ color: '#999' }}>(opcional si hay hierro)</span></label>
+              <input type="number" inputMode="numeric" min={0}
+                value={icPosiciones} onChange={e => setIcPosiciones(e.target.value)}
+                placeholder="ej: 12" style={inputStyle} />
+            </div>
+            <div style={fieldStyle}>
+              <label style={labelStyle}>Paquetes de hierro <span style={{ color: '#999' }}>(opcional si hay posiciones)</span></label>
+              <input type="number" inputMode="numeric" min={0}
+                value={icHierro} onChange={e => setIcHierro(e.target.value)}
+                placeholder="ej: 3" style={inputStyle} />
+            </div>
+            <button onClick={registrarInicioCarga} disabled={guardando} style={{ ...btnPrimary, background: '#0891b2' }}>
+              {guardando ? 'Guardando…' : 'Registrar inicio de carga'}
+            </button>
+            <button onClick={() => { setAccion('home'); resetForms() }} style={btnSecondary}>Cancelar</button>
+          </div>
+        )}
+
+        {/* FIN DE CARGA */}
+        {accion === 'fin_carga' && (
+          <div style={{ background: '#fff', borderRadius: 16, padding: '20px 16px', border: '1px solid #e0e0e0' }}>
+            <div style={fieldStyle}>
+              <label style={labelStyle}>Camión</label>
+              <select value={fcCamion} onChange={e => setFcCamion(e.target.value)} style={inputStyle}>
+                <option value="">Seleccioná el camión</option>
+                {camiones.map(c => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </div>
+            <button onClick={registrarFinCarga} disabled={guardando} style={{ ...btnPrimary, background: '#059669' }}>
+              {guardando ? 'Guardando…' : 'Registrar fin de carga'}
             </button>
             <button onClick={() => { setAccion('home'); resetForms() }} style={btnSecondary}>Cancelar</button>
           </div>

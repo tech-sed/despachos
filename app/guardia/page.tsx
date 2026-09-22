@@ -71,9 +71,15 @@ export default function GuardiaPage() {
   const [toast, setToast] = useState<{ msg: string; tipo: 'ok' | 'err' } | null>(null)
   const [ultimoEvento, setUltimoEvento] = useState<string | null>(null)
 
+  // Matriz de actividad
+  const [matrizFecha, setMatrizFecha] = useState(hoy())
+  const [matrizData, setMatrizData] = useState<any[]>([])
+  const [matrizLoading, setMatrizLoading] = useState(false)
+
   // Salida
   const [salCamion, setSalCamion] = useState('')
   const [salCant, setSalCant] = useState('')
+  const [salVacio, setSalVacio] = useState(false)
   const [salFotos, setSalFotos] = useState<FotoItem[]>([])
   const salFileRef = useRef<HTMLInputElement>(null)
 
@@ -158,7 +164,7 @@ export default function GuardiaPage() {
   }
 
   const resetForms = () => {
-    setSalCamion(''); setSalCant('')
+    setSalCamion(''); setSalCant(''); setSalVacio(false)
     salFotos.forEach(f => URL.revokeObjectURL(f.preview))
     setSalFotos([])
     setIngCamion(''); setIngTipo('directo'); setIngDeposito('')
@@ -183,20 +189,40 @@ export default function GuardiaPage() {
     showToast(`${data.length} registros exportados`)
   }
 
+  const cargarMatriz = async (fecha: string) => {
+    setMatrizLoading(true)
+    const { data } = await supabase
+      .from('guardia_eventos')
+      .select('id, camion_codigo, tipo, created_at, cant_pedidos, tipo_ingreso, cant_posiciones, paquetes_hierro')
+      .eq('fecha', fecha)
+      .order('created_at', { ascending: true })
+    setMatrizData(data ?? [])
+    setMatrizLoading(false)
+  }
+
+  useEffect(() => {
+    if (accion === 'home') cargarMatriz(matrizFecha)
+  }, [accion, matrizFecha])
+
   const registrarSalida = async () => {
-    if (!salCamion || !salCant) { showToast('Completá todos los campos', 'err'); return }
-    if (salFotos.length === 0) { showToast('Agregá al menos 1 foto', 'err'); return }
+    if (!salCamion) { showToast('Seleccioná el camión', 'err'); return }
+    if (!salVacio && !salCant) { showToast('Ingresá la cantidad de pedidos', 'err'); return }
+    if (!salVacio && salFotos.length === 0) { showToast('Agregá al menos 1 foto', 'err'); return }
     setGuardando(true)
     try {
       const eventoId = crypto.randomUUID()
-      const fotosUrls = await subirFotos(salFotos, eventoId)
+      const fotosUrls = salFotos.length > 0 ? await subirFotos(salFotos, eventoId) : []
       const { error } = await supabase.from('guardia_eventos').insert({
         id: eventoId, fecha: hoy(), tipo: 'salida',
-        camion_codigo: salCamion, cant_pedidos: Number(salCant),
+        camion_codigo: salCamion, cant_pedidos: salVacio ? 0 : Number(salCant),
         fotos_urls: fotosUrls, registrado_por: userId,
       })
       if (error) throw error
-      setUltimoEvento(`✅ ${salCamion} salió con ${salCant} pedido${Number(salCant) !== 1 ? 's' : ''} — ${horaLocal()}`)
+      setUltimoEvento(
+        salVacio
+          ? `✅ ${salCamion} salió vacío — ${horaLocal()}`
+          : `✅ ${salCamion} salió con ${salCant} pedido${Number(salCant) !== 1 ? 's' : ''} — ${horaLocal()}`
+      )
       resetForms(); setAccion('home')
       showToast(`Salida registrada — ${salCamion}`)
     } catch { showToast('Error al guardar', 'err') }
@@ -407,7 +433,7 @@ export default function GuardiaPage() {
         </div>
       </div>
 
-      <div style={{ padding: '20px 16px', maxWidth: 480, margin: '0 auto' }}>
+      <div style={{ padding: '20px 16px', maxWidth: accion === 'home' ? 1100 : 480, margin: '0 auto' }}>
         {/* Toast */}
         {toast && (
           <div style={{
@@ -446,7 +472,7 @@ export default function GuardiaPage() {
               </div>
             )}
 
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 14 }}>
               {/* Tab Guardia */}
               {(tab === 'guardia' || !verTabs) && !esDeposito && (
                 <>
@@ -502,6 +528,107 @@ export default function GuardiaPage() {
                 </>
               )}
             </div>
+
+            {/* ── MATRIZ DE ACTIVIDAD ── */}
+            {(() => {
+              const TIPOS = [
+                { key: 'inicio_carga', label: 'Inicio carga', emoji: '📦', color: '#0891b2' },
+                { key: 'fin_carga',    label: 'Fin carga',    emoji: '✅', color: '#059669' },
+                { key: 'salida',       label: 'Salida',       emoji: '🚛', color: '#254A96' },
+                { key: 'ingreso',      label: 'Ingreso',      emoji: '🏠', color: '#059669' },
+                { key: 'devolucion',   label: 'Devolución',   emoji: '📋', color: '#b45309' },
+              ]
+              const fmt = (iso: string) =>
+                new Date(iso).toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' })
+
+              // Agrupar eventos por camion → tipo
+              const byKey: Record<string, Record<string, any[]>> = {}
+              for (const ev of matrizData) {
+                if (!ev.camion_codigo) continue
+                if (!byKey[ev.camion_codigo]) byKey[ev.camion_codigo] = {}
+                if (!byKey[ev.camion_codigo][ev.tipo]) byKey[ev.camion_codigo][ev.tipo] = []
+                byKey[ev.camion_codigo][ev.tipo].push(ev)
+              }
+              const camionesConActividad = Object.keys(byKey).sort()
+
+              return (
+                <div style={{ marginTop: 24, background: '#fff', borderRadius: 16, border: '1px solid #e8edf8', overflow: 'hidden' }}>
+                  {/* Header con fecha */}
+                  <div style={{ padding: '12px 16px', borderBottom: '1px solid #f0f0f0', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+                    <span style={{ fontWeight: 700, fontSize: 14, color: '#254A96' }}>📊 Actividad del día</span>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      {matrizLoading && (
+                        <div className="animate-spin" style={{ width: 16, height: 16, border: '2px solid #254A96', borderTopColor: 'transparent', borderRadius: '50%' }} />
+                      )}
+                      <input
+                        type="date" value={matrizFecha}
+                        onChange={e => setMatrizFecha(e.target.value)}
+                        style={{ border: '1px solid #e8edf8', borderRadius: 8, padding: '5px 8px', fontSize: 13, color: '#254A96', fontWeight: 600 }}
+                      />
+                    </div>
+                  </div>
+
+                  {camionesConActividad.length === 0 ? (
+                    <p style={{ textAlign: 'center', padding: '28px 16px', fontSize: 13, color: '#B9BBB7' }}>
+                      {matrizLoading ? 'Cargando…' : 'Sin registros para esta fecha'}
+                    </p>
+                  ) : (
+                    <div style={{ overflowX: 'auto' }}>
+                      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                        <thead>
+                          <tr style={{ background: '#f9f9f9' }}>
+                            <th style={{ padding: '10px 14px', textAlign: 'left', fontWeight: 700, color: '#254A96', whiteSpace: 'nowrap', position: 'sticky', left: 0, background: '#f9f9f9', zIndex: 1, borderRight: '1px solid #e8edf8' }}>
+                              Camión
+                            </th>
+                            {TIPOS.map(t => (
+                              <th key={t.key} style={{ padding: '10px 12px', textAlign: 'center', fontWeight: 600, color: t.color, whiteSpace: 'nowrap', minWidth: 100 }}>
+                                {t.emoji} {t.label}
+                              </th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {camionesConActividad.map((camion, idx) => (
+                            <tr key={camion} style={{ borderTop: '1px solid #f5f5f5', background: idx % 2 === 0 ? '#fff' : '#fafafa' }}>
+                              <td style={{ padding: '10px 14px', fontWeight: 700, color: '#1a1a1a', whiteSpace: 'nowrap', position: 'sticky', left: 0, background: idx % 2 === 0 ? '#fff' : '#fafafa', borderRight: '1px solid #e8edf8', zIndex: 1 }}>
+                                {camion}
+                              </td>
+                              {TIPOS.map(t => {
+                                const evs = byKey[camion]?.[t.key] ?? []
+                                if (evs.length === 0) {
+                                  return (
+                                    <td key={t.key} style={{ padding: '10px 12px', textAlign: 'center', color: '#d0d0d0', fontSize: 16 }}>—</td>
+                                  )
+                                }
+                                return (
+                                  <td key={t.key} style={{ padding: '8px 12px', textAlign: 'center' }}>
+                                    {evs.map((ev: any, i: number) => {
+                                      let detalle = ''
+                                      if (ev.tipo === 'salida') detalle = ev.cant_pedidos > 0 ? `${ev.cant_pedidos} ped.` : 'vacío'
+                                      if (ev.tipo === 'inicio_carga') {
+                                        const parts = [ev.cant_posiciones && `${ev.cant_posiciones} pos`, ev.paquetes_hierro && `${ev.paquetes_hierro} H`].filter(Boolean)
+                                        detalle = parts.join(' · ')
+                                      }
+                                      return (
+                                        <div key={i} style={{ marginBottom: i < evs.length - 1 ? 4 : 0 }}>
+                                          <span style={{ display: 'inline-block', background: t.color + '18', color: t.color, borderRadius: 6, padding: '3px 8px', fontWeight: 600, fontSize: 12, whiteSpace: 'nowrap' }}>
+                                            {fmt(ev.created_at)}{detalle ? ` · ${detalle}` : ''}
+                                          </span>
+                                        </div>
+                                      )
+                                    })}
+                                  </td>
+                                )
+                              })}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              )
+            })()}
           </>
         )}
 
@@ -515,15 +642,36 @@ export default function GuardiaPage() {
                 {camiones.map(c => <option key={c} value={c}>{c}</option>)}
               </select>
             </div>
-            <div style={fieldStyle}>
-              <label style={labelStyle}>Cantidad de pedidos</label>
-              <input type="number" inputMode="numeric" min={0}
-                value={salCant} onChange={e => setSalCant(e.target.value)}
-                placeholder="ej: 5" style={inputStyle} />
-            </div>
-            <FotoSection fotos={salFotos} setter={setSalFotos} fileRef={salFileRef} color="#254A96" />
+
+            {/* Toggle salida vacío */}
+            <button
+              onClick={() => { setSalVacio(v => !v); setSalCant('') }}
+              style={{
+                width: '100%', padding: '14px 16px', borderRadius: 12, marginBottom: 16,
+                border: salVacio ? '2px solid #059669' : '2px solid #e0e0e0',
+                background: salVacio ? '#f0fdf4' : '#fafafa',
+                color: salVacio ? '#059669' : '#888',
+                fontWeight: 700, fontSize: 15, textAlign: 'left', cursor: 'pointer',
+                display: 'flex', alignItems: 'center', gap: 10,
+              }}>
+              <span style={{ fontSize: 20 }}>{salVacio ? '☑️' : '☐'}</span>
+              Salida vacío <span style={{ fontWeight: 400, fontSize: 13 }}>(sin pedidos)</span>
+            </button>
+
+            {!salVacio && (
+              <>
+                <div style={fieldStyle}>
+                  <label style={labelStyle}>Cantidad de pedidos</label>
+                  <input type="number" inputMode="numeric" min={0}
+                    value={salCant} onChange={e => setSalCant(e.target.value)}
+                    placeholder="ej: 5" style={inputStyle} />
+                </div>
+                <FotoSection fotos={salFotos} setter={setSalFotos} fileRef={salFileRef} color="#254A96" />
+              </>
+            )}
+
             <button onClick={registrarSalida} disabled={guardando} style={btnPrimary}>
-              {guardando ? 'Guardando…' : 'Registrar salida'}
+              {guardando ? 'Guardando…' : salVacio ? 'Registrar salida vacío' : 'Registrar salida'}
             </button>
             <button onClick={() => { setAccion('home'); resetForms() }} style={btnSecondary}>Cancelar</button>
           </div>

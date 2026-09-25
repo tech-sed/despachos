@@ -165,7 +165,6 @@ async function sugerirConRouteOptimization(
 
   // Fecha de hoy para ventanas horarias
   const dateStr = new Date().toISOString().split('T')[0]
-  const vuelta = conCoords[0]?.vuelta ?? 1
 
   // ── Detectar grupos de mismo cliente (fuzzy) dentro de 2km ───────────────
   const normCliente = (s: string) => s.toLowerCase()
@@ -173,70 +172,13 @@ async function sugerirConRouteOptimization(
     .replace(/\b(s\.?a\.?|s\.?r\.?l\.?|sas|sa|srl)\b/g, '')
     .replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim()
 
-  const parentG: Record<string, string> = {}
-  conCoords.forEach(p => { parentG[p.id] = p.id })
-  const findG = (id: string): string => parentG[id] === id ? id : (parentG[id] = findG(parentG[id]))
-  const unionG = (a: string, b: string) => { parentG[findG(a)] = findG(b) }
-
-  for (let i = 0; i < conCoords.length; i++) {
-    for (let j = i + 1; j < conCoords.length; j++) {
-      const a = conCoords[i], b = conCoords[j]
-      const mismoCli = normCliente(a.cliente) === normCliente(b.cliente)
-      const dist = distKm(a.latitud!, a.longitud!, b.latitud!, b.longitud!)
-      // Mismo cliente a menos de 2km → mismo camión (hard)
-      if (mismoCli && dist <= 2) unionG(a.id, b.id)
-      // Distinto cliente pero a menos de 1km → mismo camión (soft: solo si mismo tipo de carga)
-      else if (!mismoCli && dist <= 1) {
-        const tipoA = getShipmentType(a), tipoB = getShipmentType(b)
-        if (tipoA === tipoB && tipoA !== 'granel') unionG(a.id, b.id)
-      }
-    }
-  }
-  // Grupos con >1 pedido
-  const gruposCliente = new Map<string, PedidoInput[]>()
-  conCoords.forEach(p => {
-    const root = findG(p.id)
-    if (!gruposCliente.has(root)) gruposCliente.set(root, [])
-    gruposCliente.get(root)!.push(p)
-  })
-  // Para cada grupo, calcular qué camiones tienen capacidad combinada suficiente
-  const allowedByPedido: Record<string, number[]> = {}
-  for (const [, grupoPedidos] of gruposCliente) {
-    if (grupoPedidos.length <= 1) continue
-    const totalKg = grupoPedidos.reduce((s, p) => s + (p.peso_total_kg ?? 0), 0)
-    const totalPos = grupoPedidos.reduce((s, p) => s + (p.volumen_total_m3 ?? 0), 0)
-    const eligibles = camiones
-      .map((c, i) => ({ c, i }))
-      .filter(({ c }) => {
-        const libreKg = c.tonelaje_max_kg - (cargaActual[c.codigo]?.kg ?? 0)
-        const librePos = c.posiciones_total - (cargaActual[c.codigo]?.pos ?? 0)
-        return libreKg >= totalKg && (c.posiciones_total === 0 || librePos >= totalPos)
-      })
-      .map(({ i }) => i)
-    // Si hay camiones que aguantan el grupo completo → forzar (restricción dura)
-    // Si ningún camión aguanta el grupo → al menos forzar que cada pedido vaya
-    // a alguno de los camiones con más capacidad libre (soft: top 3 por capacidad)
-    if (eligibles.length > 0) {
-      grupoPedidos.forEach(p => { allowedByPedido[p.id] = eligibles })
-    } else {
-      const top3 = camiones
-        .map((c, i) => ({ c, i, libre: c.tonelaje_max_kg - (cargaActual[c.codigo]?.kg ?? 0) }))
-        .sort((a, b) => b.libre - a.libre)
-        .slice(0, 3)
-        .map(({ i }) => i)
-      if (top3.length > 0) grupoPedidos.forEach(p => { allowedByPedido[p.id] = top3 })
-    }
-  }
-
   // ── Construir shipments ordenados: grandes primero (FFD) ────────────────────
   // Pedidos que caben sólo en UN camión (por capacidad de posiciones) → forzar ese camión
   const buildShipment = (p: PedidoInput) => {
-    const tw = getTimeWindow(vuelta, dateStr)
     const delivery: any = {
       arrivalLocation: { latitude: p.latitud!, longitude: p.longitud! },
       duration: '600s',
     }
-    if (tw) delivery.timeWindows = [tw]
 
     // Camiones elegibles por capacidad individual
     const elegiblesPorCapacidad = camiones
@@ -279,23 +221,7 @@ async function sugerirConRouteOptimization(
         }
       }
     }
-    // 2. Mismo cliente
-    // Si ya hay una restricción dura (ej: volcador), la intersección puede quedar vacía porque
-    // el grupo combinado no cabe en el camión requerido → en ese caso NO borrar la restricción dura,
-    // simplemente ignorar el agrupamiento para este pedido (Google puede separar el grupo con penalty).
-    if (allowedByPedido[p.id]) {
-      if (finalAllowed !== null) {
-        // Hay restricción dura previa (volcador) → intersectar solo si el resultado no queda vacío
-        const inter = finalAllowed.filter(i => allowedByPedido[p.id].includes(i))
-        if (inter.length > 0) finalAllowed = inter
-        // Si inter es vacío: el grupo mismo-cliente no puede ir junto (volcador no tiene tonelaje)
-        // → mantener la restricción volcador y dejar que Google decida con penalty
-      } else {
-        finalAllowed = allowedByPedido[p.id]
-        if (finalAllowed.length === 0) finalAllowed = null
-      }
-    }
-    // 3. Único camión elegible por capacidad → forzarlo (pedido grande que sólo cabe en uno)
+    // 2. Único camión elegible por capacidad → forzarlo (pedido grande que sólo cabe en uno)
     if (!finalAllowed && elegiblesPorCapacidad.length === 1) {
       finalAllowed = elegiblesPorCapacidad
     }
@@ -429,6 +355,78 @@ async function sugerirConRouteOptimization(
         const p = conCoords.find(x => x.id === pedidoId)
         pedidosSinAsignar[pedidoId] = traducirMotivo(reason, p)
       }
+    }
+  }
+
+  // ── Post-proceso: consolidar pedidos mismo destino / mismo cliente ────────
+  // Google puede distribuir pedidos co-localizados en camiones distintos.
+  // Múltiples pasadas bidireccionales garantizan la máxima consolidación posible.
+  {
+    const cargaFinal: Record<string, { kg: number; pos: number }> = {}
+    camiones.forEach(c => {
+      cargaFinal[c.codigo] = {
+        kg: ya_asignados.filter(p => p.camion_id === c.codigo).reduce((s, p) => s + (p.peso_total_kg ?? 0), 0),
+        pos: ya_asignados.filter(p => p.camion_id === c.codigo).reduce((s, p) => s + (p.volumen_total_m3 ?? 0), 0),
+      }
+    })
+    conCoords.forEach(p => {
+      const cam = asignacion[p.id]
+      if (cam && cargaFinal[cam]) {
+        cargaFinal[cam].kg += p.peso_total_kg ?? 0
+        cargaFinal[cam].pos += p.volumen_total_m3 ?? 0
+      }
+    })
+
+    const cabePedido = (p: PedidoInput, camCod: string): boolean => {
+      const truck = camiones.find(c => c.codigo === camCod)
+      if (!truck) return false
+      const libreKg = truck.tonelaje_max_kg - cargaFinal[camCod].kg
+      const librePos = truck.posiciones_total - cargaFinal[camCod].pos
+      return libreKg >= (p.peso_total_kg ?? 0) &&
+        (truck.posiciones_total === 0 || librePos >= (p.volumen_total_m3 ?? 0))
+    }
+
+    const moverPedido = (p: PedidoInput, desde: string, hasta: string) => {
+      cargaFinal[desde].kg -= p.peso_total_kg ?? 0
+      cargaFinal[desde].pos -= p.volumen_total_m3 ?? 0
+      cargaFinal[hasta].kg += p.peso_total_kg ?? 0
+      cargaFinal[hasta].pos += p.volumen_total_m3 ?? 0
+      asignacion[p.id] = hasta
+    }
+
+    // Hasta 4 pasadas para convergencia (cubre grupos de 3+ camiones)
+    for (let pass = 0; pass < 4; pass++) {
+      let changed = false
+      for (let i = 0; i < conCoords.length; i++) {
+        for (let j = i + 1; j < conCoords.length; j++) {
+          const a = conCoords[i], b = conCoords[j]
+          const camA = asignacion[a.id], camB = asignacion[b.id]
+          if (!camA || !camB || camA === camB) continue
+
+          const tipoA = getShipmentType(a), tipoB = getShipmentType(b)
+          if ((tipoA === 'hierro_largo') !== (tipoB === 'hierro_largo')) continue
+
+          const dist = distKm(a.latitud!, a.longitud!, b.latitud!, b.longitud!)
+          const mismoCli = normCliente(a.cliente) === normCliente(b.cliente)
+          // Mismo destino (< 300m) o mismo cliente (< 2km) → deben ir juntos si entra
+          if (dist > 0.3 && !(mismoCli && dist <= 2)) continue
+
+          // Preferir consolidar en el camión con más capacidad libre
+          const libreA = camiones.find(c => c.codigo === camA)!.tonelaje_max_kg - cargaFinal[camA].kg
+          const libreB = camiones.find(c => c.codigo === camB)!.tonelaje_max_kg - cargaFinal[camB].kg
+
+          if (libreA >= libreB) {
+            // Mover b → camA
+            if (cabePedido(b, camA)) { moverPedido(b, camB, camA); changed = true }
+            else if (cabePedido(a, camB)) { moverPedido(a, camA, camB); changed = true }
+          } else {
+            // Mover a → camB (camB tiene más espacio)
+            if (cabePedido(a, camB)) { moverPedido(a, camA, camB); changed = true }
+            else if (cabePedido(b, camA)) { moverPedido(b, camB, camA); changed = true }
+          }
+        }
+      }
+      if (!changed) break
     }
   }
 

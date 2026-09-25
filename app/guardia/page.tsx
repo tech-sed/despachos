@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 import { supabase } from '../supabase'
 import { useRouter } from 'next/navigation'
 
@@ -77,8 +77,14 @@ export default function GuardiaPage() {
   const [matrizData, setMatrizData] = useState<any[]>([])
   const [matrizLoading, setMatrizLoading] = useState(false)
   const [usuariosMap, setUsuariosMap] = useState<Record<string, string>>({})
+  const [confirmDelete, setConfirmDelete] = useState<{ id: string; label: string; fotosUrls?: string[] } | null>(null)
+  const [eliminando, setEliminando] = useState(false)
+
+  // Choferes
+  const [choferes, setChoferes] = useState<{id: string, nombre: string, camion_codigo: string | null}[]>([])
 
   // Salida
+  const [salChofer, setSalChofer] = useState('')
   const [salCamion, setSalCamion] = useState('')
   const [salCant, setSalCant] = useState('')
   const [salVacio, setSalVacio] = useState(false)
@@ -88,6 +94,7 @@ export default function GuardiaPage() {
   const salFileRef = useRef<HTMLInputElement>(null)
 
   // Ingreso
+  const [ingChofer, setIngChofer] = useState('')
   const [ingCamion, setIngCamion] = useState('')
   const [ingTipo, setIngTipo] = useState<'directo' | 'con_transferencia'>('directo')
   const [ingDeposito, setIngDeposito] = useState('')
@@ -104,11 +111,13 @@ export default function GuardiaPage() {
   const devFileRef = useRef<HTMLInputElement>(null)
 
   // Inicio de carga
+  const [icChofer, setIcChofer] = useState('')
   const [icCamion, setIcCamion] = useState('')
   const [icPosiciones, setIcPosiciones] = useState('')
   const [icHierro, setIcHierro] = useState('')
 
   // Fin de carga
+  const [fcChofer, setFcChofer] = useState('')
   const [fcCamion, setFcCamion] = useState('')
 
   const showToast = (msg: string, tipo: 'ok' | 'err' = 'ok') => {
@@ -127,11 +136,12 @@ export default function GuardiaPage() {
       setRol(r)
       if (r === 'deposito') setTab('deposito')
 
-      const { data: flota } = await supabase
-        .from('camiones_flota')
-        .select('codigo')
-        .order('codigo')
+      const [{ data: flota }, { data: choferesData }] = await Promise.all([
+        supabase.from('camiones_flota').select('codigo').order('codigo'),
+        supabase.from('usuarios').select('id, nombre, camion_codigo').eq('rol', 'chofer').eq('activo', true).order('nombre'),
+      ])
       setCamiones((flota ?? []).map((c: any) => c.codigo))
+      setChoferes(choferesData ?? [])
       setCargando(false)
     })
   }, [])
@@ -168,17 +178,37 @@ export default function GuardiaPage() {
   }
 
   const resetForms = () => {
-    setSalCamion(''); setSalCant(''); setSalVacio(false)
+    setSalChofer(''); setSalCamion(''); setSalCant(''); setSalVacio(false)
     setSalConTransferencia(false); setSalDepositoDestino('')
     salFotos.forEach(f => URL.revokeObjectURL(f.preview))
     setSalFotos([])
-    setIngCamion(''); setIngTipo('directo'); setIngDeposito('')
+    setIngChofer(''); setIngCamion(''); setIngTipo('directo'); setIngDeposito('')
     setDevCamion(''); setDevChofer(''); setDevCategoria(''); setDevMotivo('')
     setDevRemito(''); setDevNV(''); setDevObs('')
     devFotos.forEach(f => URL.revokeObjectURL(f.preview))
     setDevFotos([])
-    setIcCamion(''); setIcPosiciones(''); setIcHierro('')
-    setFcCamion('')
+    setIcChofer(''); setIcCamion(''); setIcPosiciones(''); setIcHierro('')
+    setFcChofer(''); setFcCamion('')
+  }
+
+  const eliminarEvento = async () => {
+    if (!confirmDelete) return
+    setEliminando(true)
+    try {
+      if (confirmDelete.fotosUrls?.length) {
+        const paths = confirmDelete.fotosUrls.map(url => {
+          const parts = url.split('/guardia-fotos/')
+          return parts[1] ?? ''
+        }).filter(Boolean)
+        if (paths.length) await supabase.storage.from('guardia-fotos').remove(paths)
+      }
+      const { error } = await supabase.from('guardia_eventos').delete().eq('id', confirmDelete.id)
+      if (error) throw error
+      setMatrizData(prev => prev.filter(e => e.id !== confirmDelete.id))
+      setConfirmDelete(null)
+      showToast('Registro eliminado')
+    } catch { showToast('Error al eliminar', 'err') }
+    finally { setEliminando(false) }
   }
 
   const exportarRegistros = async () => {
@@ -198,7 +228,7 @@ export default function GuardiaPage() {
     setMatrizLoading(true)
     const { data } = await supabase
       .from('guardia_eventos')
-      .select('id, camion_codigo, tipo, created_at, cant_pedidos, tipo_ingreso, cant_posiciones, paquetes_hierro, lleva_transferencia, deposito_destino, registrado_por')
+      .select('id, camion_codigo, tipo, created_at, cant_pedidos, tipo_ingreso, cant_posiciones, paquetes_hierro, lleva_transferencia, deposito_destino, registrado_por, chofer_apellido, fotos_urls')
       .eq('fecha', fecha)
       .order('created_at', { ascending: true })
     setMatrizData(data ?? [])
@@ -229,7 +259,8 @@ export default function GuardiaPage() {
       const fotosUrls = salFotos.length > 0 ? await subirFotos(salFotos, eventoId) : []
       const { error } = await supabase.from('guardia_eventos').insert({
         id: eventoId, fecha: hoy(), tipo: 'salida',
-        camion_codigo: salCamion, cant_pedidos: salVacio ? 0 : Number(salCant),
+        camion_codigo: salCamion, chofer_apellido: salChofer || null,
+        cant_pedidos: salVacio ? 0 : Number(salCant),
         lleva_transferencia: salConTransferencia,
         deposito_destino: salConTransferencia ? salDepositoDestino : null,
         fotos_urls: fotosUrls, registrado_por: userId,
@@ -253,6 +284,7 @@ export default function GuardiaPage() {
     setGuardando(true)
     const { error } = await supabase.from('guardia_eventos').insert({
       fecha: hoy(), tipo: 'ingreso', camion_codigo: ingCamion,
+      chofer_apellido: ingChofer || null,
       tipo_ingreso: ingTipo, deposito_desde: ingTipo === 'con_transferencia' ? ingDeposito : null,
       registrado_por: userId,
     })
@@ -294,6 +326,7 @@ export default function GuardiaPage() {
     setGuardando(true)
     const { error } = await supabase.from('guardia_eventos').insert({
       fecha: hoy(), tipo: 'inicio_carga', camion_codigo: icCamion,
+      chofer_apellido: icChofer || null,
       cant_posiciones: icPosiciones ? Number(icPosiciones) : null,
       paquetes_hierro: icHierro ? Number(icHierro) : null,
       registrado_por: userId,
@@ -311,6 +344,7 @@ export default function GuardiaPage() {
     setGuardando(true)
     const { error } = await supabase.from('guardia_eventos').insert({
       fecha: hoy(), tipo: 'fin_carga', camion_codigo: fcCamion,
+      chofer_apellido: fcChofer || null,
       registrado_por: userId,
     })
     setGuardando(false)
@@ -358,6 +392,63 @@ export default function GuardiaPage() {
     devolucion: '📋 Devolución',
     inicio_carga: '📦 Inicio de carga',
     fin_carga: '✅ Fin de carga',
+  }
+
+  const SearchSelect = ({
+    value, onChange, options, placeholder,
+  }: {
+    value: string
+    onChange: (v: string) => void
+    options: string[]
+    placeholder: string
+  }) => {
+    const [query, setQuery] = useState(value)
+    const [open, setOpen] = useState(false)
+    const ref = useRef<HTMLDivElement>(null)
+    const filtered = options.filter(o => o.toLowerCase().includes(query.toLowerCase()))
+
+    useEffect(() => { setQuery(value) }, [value])
+
+    useEffect(() => {
+      const handler = (e: MouseEvent) => {
+        if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false)
+      }
+      document.addEventListener('mousedown', handler)
+      return () => document.removeEventListener('mousedown', handler)
+    }, [])
+
+    return (
+      <div ref={ref} style={{ position: 'relative' }}>
+        <input
+          value={query}
+          onChange={e => { setQuery(e.target.value); setOpen(true); if (!e.target.value) onChange('') }}
+          onFocus={() => setOpen(true)}
+          placeholder={placeholder}
+          style={{ ...inputStyle, paddingRight: 36 }}
+          autoComplete="off"
+        />
+        <span style={{ position: 'absolute', right: 12, top: '50%', transform: 'translateY(-50%)', fontSize: 16, pointerEvents: 'none', color: '#aaa' }}>▼</span>
+        {open && filtered.length > 0 && (
+          <div style={{
+            position: 'absolute', top: '100%', left: 0, right: 0, zIndex: 100,
+            background: '#fff', border: '1.5px solid #e0e0e0', borderRadius: 10,
+            boxShadow: '0 4px 16px rgba(0,0,0,0.10)', maxHeight: 220, overflowY: 'auto', marginTop: 2,
+          }}>
+            {filtered.map(o => (
+              <div key={o}
+                onMouseDown={() => { onChange(o); setQuery(o); setOpen(false) }}
+                style={{
+                  padding: '12px 14px', fontSize: 15, cursor: 'pointer',
+                  borderBottom: '1px solid #f5f5f5', color: '#1a1a1a',
+                  background: o === value ? '#eef2fb' : '#fff',
+                }}>
+                {o}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    )
   }
 
   const FotoSection = ({
@@ -631,13 +722,30 @@ export default function GuardiaPage() {
                                         const parts = [ev.cant_posiciones && `${ev.cant_posiciones} pos`, ev.paquetes_hierro && `${ev.paquetes_hierro} H`].filter(Boolean)
                                         detalle = parts.join(' · ')
                                       }
+                                      const label = `${camion} · ${t.label} · ${fmt(ev.created_at)}`
                                       return (
                                         <div key={i} style={{ marginBottom: i < evs.length - 1 ? 4 : 0 }}>
-                                          <span style={{ display: 'inline-block', background: t.color + '18', color: t.color, borderRadius: 6, padding: '3px 8px', fontWeight: 600, fontSize: 12, whiteSpace: 'nowrap' }}>
-                                            {fmt(ev.created_at)}{detalle ? ` · ${detalle}` : ''}
-                                          </span>
+                                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4 }}>
+                                            <span style={{ display: 'inline-block', background: t.color + '18', color: t.color, borderRadius: 6, padding: '3px 8px', fontWeight: 600, fontSize: 12, whiteSpace: 'nowrap' }}>
+                                              {fmt(ev.created_at)}{detalle ? ` · ${detalle}` : ''}
+                                            </span>
+                                            {rol === 'gerencia' && (
+                                              <button
+                                                onClick={() => setConfirmDelete({ id: ev.id, label, fotosUrls: ev.fotos_urls })}
+                                                title="Eliminar registro"
+                                                style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#ccc', fontSize: 14, padding: '2px 4px', lineHeight: 1, borderRadius: 4, flexShrink: 0 }}
+                                                onMouseEnter={e => (e.currentTarget.style.color = '#ef4444')}
+                                                onMouseLeave={e => (e.currentTarget.style.color = '#ccc')}
+                                              >×</button>
+                                            )}
+                                          </div>
+                                          {ev.chofer_apellido && (
+                                            <div style={{ fontSize: 10, color: '#254A96', marginTop: 2, fontWeight: 600 }}>
+                                              🚛 {ev.chofer_apellido}
+                                            </div>
+                                          )}
                                           {ev.registrado_por && usuariosMap[ev.registrado_por] && (
-                                            <div style={{ fontSize: 10, color: '#888', marginTop: 2 }}>
+                                            <div style={{ fontSize: 10, color: '#888', marginTop: 1 }}>
                                               👤 {usuariosMap[ev.registrado_por]}
                                             </div>
                                           )}
@@ -663,11 +771,17 @@ export default function GuardiaPage() {
         {accion === 'salida' && (
           <div style={{ background: '#fff', borderRadius: 16, padding: '20px 16px', border: '1px solid #e0e0e0' }}>
             <div style={fieldStyle}>
-              <label style={labelStyle}>Camión</label>
-              <select value={salCamion} onChange={e => setSalCamion(e.target.value)} style={inputStyle}>
-                <option value="">Seleccioná el camión</option>
-                {camiones.map(c => <option key={c} value={c}>{c}</option>)}
-              </select>
+              <label style={labelStyle}>Chofer</label>
+              <SearchSelect
+                value={salChofer}
+                onChange={v => { setSalChofer(v); const c = choferes.find(ch => ch.nombre === v); if (c?.camion_codigo) setSalCamion(c.camion_codigo) }}
+                options={choferes.map(c => c.nombre)}
+                placeholder="Buscar chofer…"
+              />
+            </div>
+            <div style={fieldStyle}>
+              <label style={labelStyle}>Camión {salChofer && <span style={{ color: '#888', fontWeight: 400 }}>(auto-completado, podés cambiarlo)</span>}</label>
+              <SearchSelect value={salCamion} onChange={setSalCamion} options={camiones} placeholder="Buscar camión…" />
             </div>
 
             {/* Toggle salida vacío */}
@@ -733,11 +847,17 @@ export default function GuardiaPage() {
         {accion === 'ingreso' && (
           <div style={{ background: '#fff', borderRadius: 16, padding: '20px 16px', border: '1px solid #e0e0e0' }}>
             <div style={fieldStyle}>
-              <label style={labelStyle}>Camión</label>
-              <select value={ingCamion} onChange={e => setIngCamion(e.target.value)} style={inputStyle}>
-                <option value="">Seleccioná el camión</option>
-                {camiones.map(c => <option key={c} value={c}>{c}</option>)}
-              </select>
+              <label style={labelStyle}>Chofer</label>
+              <SearchSelect
+                value={ingChofer}
+                onChange={v => { setIngChofer(v); const c = choferes.find(ch => ch.nombre === v); if (c?.camion_codigo) setIngCamion(c.camion_codigo) }}
+                options={choferes.map(c => c.nombre)}
+                placeholder="Buscar chofer…"
+              />
+            </div>
+            <div style={fieldStyle}>
+              <label style={labelStyle}>Camión {ingChofer && <span style={{ color: '#888', fontWeight: 400 }}>(auto-completado, podés cambiarlo)</span>}</label>
+              <SearchSelect value={ingCamion} onChange={setIngCamion} options={camiones} placeholder="Buscar camión…" />
             </div>
             <div style={fieldStyle}>
               <label style={labelStyle}>Tipo de ingreso</label>
@@ -776,10 +896,7 @@ export default function GuardiaPage() {
           <div style={{ background: '#fff', borderRadius: 16, padding: '20px 16px', border: '1px solid #e0e0e0' }}>
             <div style={fieldStyle}>
               <label style={labelStyle}>Camión</label>
-              <select value={devCamion} onChange={e => setDevCamion(e.target.value)} style={inputStyle}>
-                <option value="">Seleccioná el camión</option>
-                {camiones.map(c => <option key={c} value={c}>{c}</option>)}
-              </select>
+              <SearchSelect value={devCamion} onChange={setDevCamion} options={camiones} placeholder="Buscar camión…" />
             </div>
             <div style={fieldStyle}>
               <label style={labelStyle}>Apellido del chofer</label>
@@ -830,11 +947,17 @@ export default function GuardiaPage() {
         {accion === 'inicio_carga' && (
           <div style={{ background: '#fff', borderRadius: 16, padding: '20px 16px', border: '1px solid #e0e0e0' }}>
             <div style={fieldStyle}>
-              <label style={labelStyle}>Camión</label>
-              <select value={icCamion} onChange={e => setIcCamion(e.target.value)} style={inputStyle}>
-                <option value="">Seleccioná el camión</option>
-                {camiones.map(c => <option key={c} value={c}>{c}</option>)}
-              </select>
+              <label style={labelStyle}>Chofer</label>
+              <SearchSelect
+                value={icChofer}
+                onChange={v => { setIcChofer(v); const c = choferes.find(ch => ch.nombre === v); if (c?.camion_codigo) setIcCamion(c.camion_codigo) }}
+                options={choferes.map(c => c.nombre)}
+                placeholder="Buscar chofer…"
+              />
+            </div>
+            <div style={fieldStyle}>
+              <label style={labelStyle}>Camión {icChofer && <span style={{ color: '#888', fontWeight: 400 }}>(auto-completado, podés cambiarlo)</span>}</label>
+              <SearchSelect value={icCamion} onChange={setIcCamion} options={camiones} placeholder="Buscar camión…" />
             </div>
             <div style={fieldStyle}>
               <label style={labelStyle}>Cantidad de posiciones <span style={{ color: '#999' }}>(opcional si hay hierro)</span></label>
@@ -859,11 +982,17 @@ export default function GuardiaPage() {
         {accion === 'fin_carga' && (
           <div style={{ background: '#fff', borderRadius: 16, padding: '20px 16px', border: '1px solid #e0e0e0' }}>
             <div style={fieldStyle}>
-              <label style={labelStyle}>Camión</label>
-              <select value={fcCamion} onChange={e => setFcCamion(e.target.value)} style={inputStyle}>
-                <option value="">Seleccioná el camión</option>
-                {camiones.map(c => <option key={c} value={c}>{c}</option>)}
-              </select>
+              <label style={labelStyle}>Chofer</label>
+              <SearchSelect
+                value={fcChofer}
+                onChange={v => { setFcChofer(v); const c = choferes.find(ch => ch.nombre === v); if (c?.camion_codigo) setFcCamion(c.camion_codigo) }}
+                options={choferes.map(c => c.nombre)}
+                placeholder="Buscar chofer…"
+              />
+            </div>
+            <div style={fieldStyle}>
+              <label style={labelStyle}>Camión {fcChofer && <span style={{ color: '#888', fontWeight: 400 }}>(auto-completado, podés cambiarlo)</span>}</label>
+              <SearchSelect value={fcCamion} onChange={setFcCamion} options={camiones} placeholder="Buscar camión…" />
             </div>
             <button onClick={registrarFinCarga} disabled={guardando} style={{ ...btnPrimary, background: '#059669' }}>
               {guardando ? 'Guardando…' : 'Registrar fin de carga'}
@@ -872,6 +1001,34 @@ export default function GuardiaPage() {
           </div>
         )}
       </div>
+
+      {/* Modal eliminar — solo gerencia */}
+      {confirmDelete && (
+        <div style={{
+          position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 200, padding: 20,
+        }}>
+          <div style={{ background: '#fff', borderRadius: 16, padding: '24px 20px', maxWidth: 360, width: '100%', boxShadow: '0 8px 32px rgba(0,0,0,0.2)' }}>
+            <p style={{ fontWeight: 700, fontSize: 16, color: '#1a1a1a', marginBottom: 8 }}>¿Eliminar este registro?</p>
+            <p style={{ fontSize: 13, color: '#666', marginBottom: 20 }}>{confirmDelete.label}</p>
+            <p style={{ fontSize: 12, color: '#999', marginBottom: 20 }}>Esta acción no se puede deshacer.</p>
+            <div style={{ display: 'flex', gap: 10 }}>
+              <button
+                onClick={() => setConfirmDelete(null)}
+                disabled={eliminando}
+                style={{ flex: 1, padding: '12px', borderRadius: 12, border: '1.5px solid #e0e0e0', background: '#fff', color: '#444', fontWeight: 600, fontSize: 15, cursor: 'pointer' }}>
+                Cancelar
+              </button>
+              <button
+                onClick={eliminarEvento}
+                disabled={eliminando}
+                style={{ flex: 1, padding: '12px', borderRadius: 12, border: 'none', background: '#ef4444', color: '#fff', fontWeight: 700, fontSize: 15, cursor: 'pointer', opacity: eliminando ? 0.7 : 1 }}>
+                {eliminando ? 'Eliminando…' : 'Eliminar'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

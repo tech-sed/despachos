@@ -60,6 +60,8 @@ function buildCiclos(eventos: any[]) {
       .sort((a, b) => a._ti.minutes - b._ti.minutes)
 
     const usados = new Set<number>()
+    const ARRANQUE_MIN = 7 * 60 // 07:00 — hora teórica de llegada de choferes
+    let arranqueUsado = false
 
     for (const sal of salidas) {
       const salMin = sal._ti.minutes
@@ -68,11 +70,29 @@ function buildCiclos(eventos: any[]) {
         .filter(({ idx }) => !usados.has(idx))
         .filter(({ ing }) => ing._ti.minutes < salMin)
 
-      if (!candidatos.length) continue
-      const { ing, idx } = candidatos[candidatos.length - 1]
-      usados.add(idx)
+      let ingresoDisplay: string
+      let ingresoMin: number
+      let ingresoEsTransferencia = false
+      let depositoDesde: string | null = null
 
-      const duracion = salMin - ing._ti.minutes
+      if (!candidatos.length) {
+        // Sin ingreso previo real: arranque sintético a las 7:00, solo para la primera salida del día
+        if (arranqueUsado) continue // ingreso no registrado, ciclo no medible
+        arranqueUsado = true
+        ingresoMin = ARRANQUE_MIN
+        ingresoDisplay = '07:00 ★'
+      } else {
+        const { ing, idx } = candidatos[candidatos.length - 1]
+        usados.add(idx)
+        ingresoMin = ing._ti.minutes
+        ingresoDisplay = ing._ti.display
+        if (ing.deposito_desde) {
+          ingresoEsTransferencia = true
+          depositoDesde = ing.deposito_desde
+        }
+      }
+
+      const duracion = salMin - ingresoMin
 
       let excluido = false
       let motivo_exclusion: string | null = null
@@ -80,9 +100,9 @@ function buildCiclos(eventos: any[]) {
       if (sal.deposito_destino) {
         excluido = true
         motivo_exclusion = `Transferencia saliente a ${sal.deposito_destino}`
-      } else if (ing.deposito_desde) {
+      } else if (ingresoEsTransferencia) {
         excluido = true
-        motivo_exclusion = `Transferencia entrante de ${ing.deposito_desde}`
+        motivo_exclusion = `Transferencia entrante de ${depositoDesde}`
       } else if (duracion > 120) {
         excluido = true
         motivo_exclusion = `Ciclo atípico (${duracion} min)`
@@ -91,7 +111,7 @@ function buildCiclos(eventos: any[]) {
       ciclos.push({
         fecha,
         camion,
-        ingreso: ing._ti.display,
+        ingreso: ingresoDisplay,
         salida: sal._ti.display,
         duracion_min: duracion,
         excluido,

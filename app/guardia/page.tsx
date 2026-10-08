@@ -84,7 +84,13 @@ export default function GuardiaPage() {
   const [matrizFecha, setMatrizFecha] = useState(hoy())
   const [matrizData, setMatrizData] = useState<any[]>([])
   const [matrizLoading, setMatrizLoading] = useState(false)
+  const [matrizVista, setMatrizVista] = useState<'tabla' | 'fotos'>('tabla')
   const [usuariosMap, setUsuariosMap] = useState<Record<string, string>>({})
+  const fmtHora = (ev: any) => ev.hora_evento
+    ? ev.hora_evento.slice(0, 5)
+    : ev.created_at
+      ? new Date(ev.created_at).toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' })
+      : ''
   const [confirmDelete, setConfirmDelete] = useState<{ id: string; label: string; fotosUrls?: string[] } | null>(null)
   const [eliminando, setEliminando] = useState(false)
   const [editEvento, setEditEvento] = useState<{ id: string; label: string; tipo: string } | null>(null)
@@ -111,6 +117,8 @@ export default function GuardiaPage() {
   const [ingTipo, setIngTipo] = useState<'directo' | 'con_transferencia' | 'con_proveedor'>('directo')
   const [ingDeposito, setIngDeposito] = useState('')
   const [ingProveedor, setIngProveedor] = useState('')
+  const [ingFotos, setIngFotos] = useState<FotoItem[]>([])
+  const ingFileRef = useRef<HTMLInputElement>(null)
 
   // Devolución
   const [devCamion, setDevCamion] = useState('')
@@ -226,6 +234,8 @@ export default function GuardiaPage() {
     salFotos.forEach(f => URL.revokeObjectURL(f.preview))
     setSalFotos([])
     setIngChofer(''); setIngCamion(''); setIngTipo('directo'); setIngDeposito(''); setIngProveedor('')
+    ingFotos.forEach(f => URL.revokeObjectURL(f.preview))
+    setIngFotos([])
     setDevCamion(''); setDevChofer(''); setDevCategoria(''); setDevMotivo('')
     setDevRemito(''); setDevNV(''); setDevObs('')
     devFotos.forEach(f => URL.revokeObjectURL(f.preview))
@@ -265,6 +275,8 @@ export default function GuardiaPage() {
       paquetes_hierro: ev.paquetes_hierro ?? '',
       observacion: ev.observacion ?? '',
       motivo: ev.motivo ?? '',
+      tipo_ingreso: ev.tipo_ingreso ?? 'directo',
+      deposito_desde: ev.deposito_desde ?? '',
     })
   }
 
@@ -281,6 +293,12 @@ export default function GuardiaPage() {
     if (v.paquetes_hierro !== '') updates.paquetes_hierro = Number(v.paquetes_hierro)
     updates.observacion = v.observacion
     updates.motivo = v.motivo
+    if (editEvento.tipo === 'ingreso') {
+      updates.tipo_ingreso = v.tipo_ingreso || 'directo'
+      updates.deposito_desde = (v.tipo_ingreso === 'con_transferencia' || v.tipo_ingreso === 'con_proveedor')
+        ? (v.deposito_desde?.trim() || null)
+        : null
+    }
     const { error } = await supabase.from('guardia_eventos').update(updates).eq('id', editEvento.id)
     if (error) { showToast('Error al guardar', 'err') }
     else {
@@ -308,8 +326,57 @@ export default function GuardiaPage() {
     }
     const rows = data.map((e: any) => ({ ...e, registrado_por_nombre: nombresMap[e.registrado_por] ?? '' }))
 
+    // Inyectar arranques sintéticos a las 7:00 para la primera salida sin ingreso previo
+    const getMin = (e: any): number | null => {
+      if (e.hora_evento) {
+        const [h, m] = e.hora_evento.split(':').map(Number)
+        return h * 60 + m
+      }
+      if (e.created_at) {
+        const d = new Date(e.created_at)
+        return ((d.getUTCHours() - 3 + 24) % 24) * 60 + d.getUTCMinutes()
+      }
+      return null
+    }
+    const byFechaCamion: Record<string, any[]> = {}
+    for (const e of rows) {
+      if (!e.camion_codigo) continue
+      const key = `${e.fecha}__${e.camion_codigo}`
+      if (!byFechaCamion[key]) byFechaCamion[key] = []
+      byFechaCamion[key].push(e)
+    }
+    const sinteticos: any[] = []
+    for (const [key, evs] of Object.entries(byFechaCamion)) {
+      const [fechaEv, camion] = key.split('__')
+      const salidas = evs.filter((e: any) => e.tipo === 'salida').sort((a: any, b: any) => (getMin(a) ?? 0) - (getMin(b) ?? 0))
+      const ingresos = evs.filter((e: any) => e.tipo === 'ingreso').sort((a: any, b: any) => (getMin(a) ?? 0) - (getMin(b) ?? 0))
+      const usados = new Set<number>()
+      let arranqueUsado = false
+      for (const sal of salidas) {
+        const salMin = getMin(sal)
+        if (salMin === null) continue
+        const candidatoIdx = ingresos.reduce((found: number, ing: any, idx: number) => {
+          if (usados.has(idx)) return found
+          if ((getMin(ing) ?? Infinity) >= salMin) return found
+          return idx // último ingreso previo no usado
+        }, -1)
+        if (candidatoIdx === -1) {
+          if (!arranqueUsado) {
+            arranqueUsado = true
+            sinteticos.push({ fecha: fechaEv, camion_codigo: camion, tipo: 'ingreso', hora_evento: '07:00:00', observacion: 'Arranque sintético (teórico 07:00)', registrado_por_nombre: '' })
+          }
+          // salidas posteriores sin ingreso: ciclo no medible, no inyectar
+        } else {
+          usados.add(candidatoIdx)
+        }
+      }
+    }
+    const allRows = [...rows, ...sinteticos].sort((a: any, b: any) =>
+      a.fecha.localeCompare(b.fecha) || (a.hora_evento ?? '').localeCompare(b.hora_evento ?? '')
+    )
+
     setExportando(false)
-    const csv = toCSV(rows)
+    const csv = toCSV(allRows)
     descargarCSV(csv, `guardia_${hoy()}.csv`)
     showToast(`${data.length} registros exportados`)
   }
@@ -377,20 +444,29 @@ export default function GuardiaPage() {
     if (!ingCamion) { showToast('Seleccioná el camión', 'err'); return }
     if (ingTipo === 'con_transferencia' && !ingDeposito) { showToast('Indicá el depósito de origen', 'err'); return }
     if (ingTipo === 'con_proveedor' && !ingProveedor.trim()) { showToast('Ingresá el nombre del proveedor', 'err'); return }
+    if ((ingTipo === 'con_transferencia' || ingTipo === 'con_proveedor') && ingFotos.length === 0) {
+      showToast('Agregá al menos 1 foto', 'err'); return
+    }
     setGuardando(true)
-    const { error } = await supabase.from('guardia_eventos').insert({
-      fecha: hoy(), tipo: 'ingreso', camion_codigo: ingCamion,
-      chofer_apellido: ingChofer || null,
-      tipo_ingreso: ingTipo,
-      deposito_desde: ingTipo === 'con_transferencia' ? ingDeposito : ingTipo === 'con_proveedor' ? ingProveedor.trim() : null,
-      registrado_por: userId,
-    })
-    setGuardando(false)
-    if (error) { showToast('Error al guardar', 'err'); return }
-    const label = ingTipo === 'con_transferencia' ? `con transferencia desde ${ingDeposito}` : ingTipo === 'con_proveedor' ? `con proveedor ${ingProveedor.trim()}` : 'directo'
-    setUltimoEvento(`✅ ${ingCamion} ingresó ${label} — ${horaLocal()}`)
-    resetForms(); setAccion('home')
-    showToast(`Ingreso registrado — ${ingCamion}`)
+    try {
+      const eventoId = crypto.randomUUID()
+      const fotosUrls = ingFotos.length > 0 ? await subirFotos(ingFotos, eventoId) : []
+      const { error } = await supabase.from('guardia_eventos').insert({
+        id: eventoId, fecha: hoy(), tipo: 'ingreso', camion_codigo: ingCamion,
+        chofer_apellido: ingChofer || null,
+        tipo_ingreso: ingTipo,
+        deposito_desde: ingTipo === 'con_transferencia' ? ingDeposito : ingTipo === 'con_proveedor' ? ingProveedor.trim() : null,
+        fotos_urls: fotosUrls,
+        registrado_por: userId,
+      })
+      if (error) throw error
+      const label = ingTipo === 'con_transferencia' ? `con transferencia desde ${ingDeposito}` : ingTipo === 'con_proveedor' ? `con proveedor ${ingProveedor.trim()}` : 'directo'
+      setUltimoEvento(`✅ ${ingCamion} ingresó ${label} — ${horaLocal()}`)
+      resetForms(); setAccion('home')
+      showToast(`Ingreso registrado — ${ingCamion}`)
+    } catch (err: any) {
+      showToast(err?.message || 'Error al guardar', 'err')
+    } finally { setGuardando(false) }
   }
 
   const registrarDevolucion = async () => {
@@ -650,7 +726,7 @@ export default function GuardiaPage() {
           {/* Botones de acción — solo en home y para roles con acceso completo */}
           {accion === 'home' && tieneDashboard && (
             <div style={{ display: 'flex', gap: 8 }}>
-              {rol === 'gerencia' && (
+              {(['gerencia', 'admin_flota', 'ruteador'] as string[]).includes(rol) && (
                 <button onClick={() => setInformeModal(true)}
                   style={{
                     background: 'rgba(255,255,255,0.15)', border: '1px solid rgba(255,255,255,0.3)',
@@ -797,7 +873,16 @@ export default function GuardiaPage() {
                 <div style={{ marginTop: 24, background: '#fff', borderRadius: 16, border: '1px solid #e8edf8', overflow: 'hidden' }}>
                   {/* Header con fecha */}
                   <div style={{ padding: '12px 16px', borderBottom: '1px solid #f0f0f0', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
-                    <span style={{ fontWeight: 700, fontSize: 14, color: '#254A96' }}>📊 Actividad del día</span>
+                    <div style={{ display: 'flex', gap: 6 }}>
+                      {(['tabla', 'fotos'] as const).map(v => (
+                        <button key={v} onClick={() => setMatrizVista(v)}
+                          style={{ padding: '5px 14px', borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: 'pointer', border: 'none',
+                            background: matrizVista === v ? '#254A96' : '#f0f4ff',
+                            color: matrizVista === v ? '#fff' : '#254A96' }}>
+                          {v === 'tabla' ? '📊 Actividad' : '📷 Fotos'}
+                        </button>
+                      ))}
+                    </div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                       {matrizLoading && (
                         <div className="animate-spin" style={{ width: 16, height: 16, border: '2px solid #254A96', borderTopColor: 'transparent', borderRadius: '50%' }} />
@@ -810,11 +895,55 @@ export default function GuardiaPage() {
                     </div>
                   </div>
 
-                  {camionesConActividad.length === 0 ? (
+                  {/* Vista fotos cronológica */}
+                  {matrizVista === 'fotos' && (() => {
+                    const TIPO_LABEL: Record<string, string> = { salida: '🚛 Salida', ingreso: '🏠 Ingreso', devolucion: '📋 Devolución', inicio_carga: '📦 Inicio carga', fin_carga: '✅ Fin carga' }
+                    const TIPO_COLOR: Record<string, string> = { salida: '#254A96', ingreso: '#059669', devolucion: '#b45309', inicio_carga: '#0891b2', fin_carga: '#059669' }
+                    const conFotos = [...matrizData]
+                      .filter(ev => Array.isArray(ev.fotos_urls) && ev.fotos_urls.length > 0)
+                      .sort((a, b) => (a.hora_evento ?? a.created_at ?? '').localeCompare(b.hora_evento ?? b.created_at ?? ''))
+                    if (conFotos.length === 0) return (
+                      <p style={{ textAlign: 'center', padding: '28px 16px', fontSize: 13, color: '#B9BBB7' }}>
+                        {matrizLoading ? 'Cargando…' : 'Sin fotos para esta fecha'}
+                      </p>
+                    )
+                    return (
+                      <div style={{ padding: '16px', display: 'flex', flexDirection: 'column', gap: 20 }}>
+                        {conFotos.map((ev, ei) => {
+                          const color = TIPO_COLOR[ev.tipo] ?? '#666'
+                          const titulo = `${ev.camion_codigo} · ${TIPO_LABEL[ev.tipo] ?? ev.tipo} · ${fmtHora(ev)}`
+                          return (
+                            <div key={ei} style={{ borderLeft: `3px solid ${color}`, paddingLeft: 14 }}>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10, flexWrap: 'wrap' }}>
+                                <span style={{ fontWeight: 700, fontSize: 13, color }}>{TIPO_LABEL[ev.tipo] ?? ev.tipo}</span>
+                                <span style={{ fontWeight: 700, fontSize: 13, color: '#1a1a1a' }}>{ev.camion_codigo}</span>
+                                <span style={{ fontSize: 12, color: '#888' }}>{fmtHora(ev)}</span>
+                                {ev.chofer_apellido && <span style={{ fontSize: 12, color: '#555' }}>🧑 {ev.chofer_apellido}</span>}
+                                {ev.registrado_por && usuariosMap[ev.registrado_por] && (
+                                  <span style={{ fontSize: 11, color: '#aaa' }}>👤 {usuariosMap[ev.registrado_por]}</span>
+                                )}
+                              </div>
+                              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                                {ev.fotos_urls.map((url: string, fi: number) => (
+                                  <img key={fi} src={url} alt=""
+                                    onClick={() => setVisorFotos({ urls: ev.fotos_urls, titulo, ev })}
+                                    style={{ width: 90, height: 90, objectFit: 'cover', borderRadius: 8, cursor: 'zoom-in', border: '1px solid #e0e0e0' }}
+                                  />
+                                ))}
+                              </div>
+                              {ev.observacion && <p style={{ margin: '8px 0 0', fontSize: 12, color: '#666' }}>{ev.observacion}</p>}
+                            </div>
+                          )
+                        })}
+                      </div>
+                    )
+                  })()}
+
+                  {matrizVista === 'tabla' && camionesConActividad.length === 0 ? (
                     <p style={{ textAlign: 'center', padding: '28px 16px', fontSize: 13, color: '#B9BBB7' }}>
                       {matrizLoading ? 'Cargando…' : 'Sin registros para esta fecha'}
                     </p>
-                  ) : (
+                  ) : matrizVista === 'tabla' ? (
                     <div style={{ overflowX: 'auto' }}>
                       <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
                         <thead>
@@ -909,7 +1038,7 @@ export default function GuardiaPage() {
                         </tbody>
                       </table>
                     </div>
-                  )}
+                  ) : null}
                 </div>
               )
             })()}
@@ -1043,6 +1172,9 @@ export default function GuardiaPage() {
                 <input type="text" value={ingProveedor} onChange={e => setIngProveedor(e.target.value)}
                   placeholder="ej: Acería Argentina" style={inputStyle} autoCapitalize="words" />
               </div>
+            )}
+            {(ingTipo === 'con_transferencia' || ingTipo === 'con_proveedor') && (
+              <FotoSection fotos={ingFotos} setter={setIngFotos} fileRef={ingFileRef} color="#059669" />
             )}
             <button onClick={registrarIngreso} disabled={guardando} style={{ ...btnPrimary, background: '#059669' }}>
               {guardando ? 'Guardando…' : 'Registrar ingreso'}
@@ -1253,6 +1385,53 @@ export default function GuardiaPage() {
                 />
               </div>
             ))}
+
+            {/* Tipo de ingreso — solo para eventos de ingreso */}
+            {editEvento.tipo === 'ingreso' && (
+              <div style={{ marginBottom: 12 }}>
+                <label style={{ fontSize: 12, fontWeight: 600, color: '#555', display: 'block', marginBottom: 6 }}>Tipo de ingreso</label>
+                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                  {([
+                    { key: 'directo', label: 'Vacío / directo' },
+                    { key: 'con_transferencia', label: 'Con transferencia' },
+                    { key: 'con_proveedor', label: 'Con proveedor' },
+                  ] as const).map(({ key, label }) => (
+                    <button key={key}
+                      onClick={() => setEditEventoVals(prev => ({ ...prev, tipo_ingreso: key, deposito_desde: '' }))}
+                      style={{
+                        flex: 1, minWidth: 80, padding: '9px 6px', borderRadius: 10, fontSize: 12, fontWeight: 600,
+                        border: editEventoVals.tipo_ingreso === key ? '2px solid #254A96' : '1.5px solid #e0e0e0',
+                        background: editEventoVals.tipo_ingreso === key ? '#eef2fb' : '#fff',
+                        color: editEventoVals.tipo_ingreso === key ? '#254A96' : '#555',
+                        cursor: 'pointer',
+                      }}>
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                {editEventoVals.tipo_ingreso === 'con_transferencia' && (
+                  <div style={{ marginTop: 8 }}>
+                    <label style={{ fontSize: 12, fontWeight: 600, color: '#555', display: 'block', marginBottom: 4 }}>Depósito origen</label>
+                    <select value={editEventoVals.deposito_desde ?? ''}
+                      onChange={e => setEditEventoVals(prev => ({ ...prev, deposito_desde: e.target.value }))}
+                      style={{ width: '100%', padding: '10px 12px', fontSize: 15, borderRadius: 10, border: '1.5px solid #e0e0e0' }}>
+                      <option value="">Seleccioná…</option>
+                      {SUCURSALES.map(s => <option key={s} value={s}>{s}</option>)}
+                    </select>
+                  </div>
+                )}
+                {editEventoVals.tipo_ingreso === 'con_proveedor' && (
+                  <div style={{ marginTop: 8 }}>
+                    <label style={{ fontSize: 12, fontWeight: 600, color: '#555', display: 'block', marginBottom: 4 }}>Nombre del proveedor</label>
+                    <input type="text" value={editEventoVals.deposito_desde ?? ''}
+                      onChange={e => setEditEventoVals(prev => ({ ...prev, deposito_desde: e.target.value }))}
+                      placeholder="ej: Acería Argentina"
+                      style={{ width: '100%', padding: '10px 12px', fontSize: 15, borderRadius: 10, border: '1.5px solid #e0e0e0', boxSizing: 'border-box' }} />
+                  </div>
+                )}
+              </div>
+            )}
+
             <div style={{ display: 'flex', gap: 10, marginTop: 8 }}>
               <button onClick={() => setEditEvento(null)} disabled={guardandoEvento}
                 style={{ flex: 1, padding: '12px', borderRadius: 12, border: '1.5px solid #e0e0e0', background: '#fff', color: '#444', fontWeight: 600, fontSize: 15, cursor: 'pointer' }}>

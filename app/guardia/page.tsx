@@ -3,6 +3,8 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { supabase } from '../supabase'
 import { useRouter } from 'next/navigation'
+import { IngresoProveedorForm, IngresosProveedorLista } from './ProveedoresTab'
+import VisorFotoGrande from '../components/VisorFotoGrande'
 
 const SUCURSALES = ['LP520', 'LP139', 'Guernica', 'Cañuelas', 'Pinamar']
 
@@ -16,7 +18,7 @@ const CATEGORIAS: Record<string, string[]> = {
 
 const MAX_FOTOS = 5
 
-type Accion = 'home' | 'salida' | 'ingreso' | 'devolucion' | 'inicio_carga' | 'fin_carga'
+type Accion = 'home' | 'salida' | 'ingreso' | 'devolucion' | 'inicio_carga' | 'fin_carga' | 'prov_ingreso'
 
 interface FotoItem {
   file: File
@@ -67,7 +69,7 @@ export default function GuardiaPage() {
   const [rol, setRol] = useState<string>('')
   const [cargando, setCargando] = useState(true)
   const [camiones, setCamiones] = useState<string[]>([])
-  const [tab, setTab] = useState<'guardia' | 'deposito'>('guardia')
+  const [tab, setTab] = useState<'guardia' | 'deposito' | 'proveedores'>('guardia')
   const [accion, setAccion] = useState<Accion>('home')
   const [guardando, setGuardando] = useState(false)
   const [exportando, setExportando] = useState(false)
@@ -97,6 +99,7 @@ export default function GuardiaPage() {
   const [editEventoVals, setEditEventoVals] = useState<Record<string, any>>({})
   const [guardandoEvento, setGuardandoEvento] = useState(false)
   const [visorFotos, setVisorFotos] = useState<{ urls: string[]; titulo: string; ev: any } | null>(null)
+  const [fotoGrande, setFotoGrande] = useState<{ urls: string[]; i: number } | null>(null)
 
   // Choferes
   const [choferes, setChoferes] = useState<{id: string, nombre: string, camion_codigo: string | null}[]>([])
@@ -114,9 +117,10 @@ export default function GuardiaPage() {
   // Ingreso
   const [ingChofer, setIngChofer] = useState('')
   const [ingCamion, setIngCamion] = useState('')
-  const [ingTipo, setIngTipo] = useState<'directo' | 'con_transferencia' | 'con_proveedor'>('directo')
+  const [ingTipo, setIngTipo] = useState<'directo' | 'con_transferencia'>('directo')
   const [ingDeposito, setIngDeposito] = useState('')
-  const [ingProveedor, setIngProveedor] = useState('')
+  const [provRefresh, setProvRefresh] = useState(0)
+  const [provInicial, setProvInicial] = useState<{ origen: 'externo' | 'propio'; chofer?: string; camion?: string } | null>(null)
   const [ingFotos, setIngFotos] = useState<FotoItem[]>([])
   const ingFileRef = useRef<HTMLInputElement>(null)
 
@@ -233,7 +237,7 @@ export default function GuardiaPage() {
     setSalConTransferencia(false); setSalDepositoDestino('')
     salFotos.forEach(f => URL.revokeObjectURL(f.preview))
     setSalFotos([])
-    setIngChofer(''); setIngCamion(''); setIngTipo('directo'); setIngDeposito(''); setIngProveedor('')
+    setIngChofer(''); setIngCamion(''); setIngTipo('directo'); setIngDeposito('')
     ingFotos.forEach(f => URL.revokeObjectURL(f.preview))
     setIngFotos([])
     setDevCamion(''); setDevChofer(''); setDevCategoria(''); setDevMotivo('')
@@ -443,10 +447,7 @@ export default function GuardiaPage() {
   const registrarIngreso = async () => {
     if (!ingCamion) { showToast('Seleccioná el camión', 'err'); return }
     if (ingTipo === 'con_transferencia' && !ingDeposito) { showToast('Indicá el depósito de origen', 'err'); return }
-    if (ingTipo === 'con_proveedor' && !ingProveedor.trim()) { showToast('Ingresá el nombre del proveedor', 'err'); return }
-    if ((ingTipo === 'con_transferencia' || ingTipo === 'con_proveedor') && ingFotos.length === 0) {
-      showToast('Agregá al menos 1 foto', 'err'); return
-    }
+    if (ingTipo === 'con_transferencia' && ingFotos.length === 0) { showToast('Agregá al menos 1 foto', 'err'); return }
     setGuardando(true)
     try {
       const eventoId = crypto.randomUUID()
@@ -455,12 +456,12 @@ export default function GuardiaPage() {
         id: eventoId, fecha: hoy(), tipo: 'ingreso', camion_codigo: ingCamion,
         chofer_apellido: ingChofer || null,
         tipo_ingreso: ingTipo,
-        deposito_desde: ingTipo === 'con_transferencia' ? ingDeposito : ingTipo === 'con_proveedor' ? ingProveedor.trim() : null,
+        deposito_desde: ingTipo === 'con_transferencia' ? ingDeposito : null,
         fotos_urls: fotosUrls,
         registrado_por: userId,
       })
       if (error) throw error
-      const label = ingTipo === 'con_transferencia' ? `con transferencia desde ${ingDeposito}` : ingTipo === 'con_proveedor' ? `con proveedor ${ingProveedor.trim()}` : 'directo'
+      const label = ingTipo === 'con_transferencia' ? `con transferencia desde ${ingDeposito}` : 'directo'
       setUltimoEvento(`✅ ${ingCamion} ingresó ${label} — ${horaLocal()}`)
       resetForms(); setAccion('home')
       showToast(`Ingreso registrado — ${ingCamion}`)
@@ -587,6 +588,7 @@ export default function GuardiaPage() {
     devolucion: '📋 Devolución',
     inicio_carga: '📦 Inicio de carga',
     fin_carga: '✅ Fin de carga',
+    prov_ingreso: '🧾 Ingreso de proveedor',
   }
 
   const SearchSelect = ({
@@ -772,9 +774,9 @@ export default function GuardiaPage() {
             )}
 
             {/* Tabs (solo para roles que ven ambos sectores) */}
-            {verTabs && (
+            {!esDeposito && (
               <div style={{ display: 'flex', gap: 8, marginBottom: 18 }}>
-                {(['guardia', 'deposito'] as const).map(t => (
+                {((verTabs ? ['guardia', 'deposito', 'proveedores'] : ['guardia', 'proveedores']) as ('guardia' | 'deposito' | 'proveedores')[]).map(t => (
                   <button key={t} onClick={() => { setTab(t) }}
                     style={{
                       flex: 1, padding: '12px 8px', borderRadius: 12, fontSize: 15, fontWeight: 700,
@@ -782,7 +784,7 @@ export default function GuardiaPage() {
                       background: tab === t ? '#254A96' : '#fff',
                       color: tab === t ? '#fff' : '#666', cursor: 'pointer',
                     }}>
-                    {t === 'guardia' ? '🔒 Guardia' : '🏭 Depósito'}
+                    {t === 'guardia' ? '🔒 Guardia' : t === 'deposito' ? '🏭 Depósito' : '🧾 Proveedores'}
                   </button>
                 ))}
               </div>
@@ -790,7 +792,7 @@ export default function GuardiaPage() {
 
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 14 }}>
               {/* Tab Guardia */}
-              {(tab === 'guardia' || !verTabs) && !esDeposito && (
+              {tab === 'guardia' && !esDeposito && (
                 <>
                   <button onClick={() => setAccion('salida')} style={{
                     background: '#fff', border: '2px solid #254A96', borderRadius: 16, padding: '22px 20px',
@@ -821,6 +823,18 @@ export default function GuardiaPage() {
                 </>
               )}
 
+              {/* Tab Proveedores */}
+              {tab === 'proveedores' && !esDeposito && (
+                <button onClick={() => { setProvInicial(null); setAccion('prov_ingreso') }} style={{
+                  background: '#fff', border: '2px solid #254A96', borderRadius: 16, padding: '22px 20px',
+                  textAlign: 'left', cursor: 'pointer',
+                }}>
+                  <div style={{ fontSize: 32, marginBottom: 6 }}>🧾</div>
+                  <div style={{ fontSize: 18, fontWeight: 700, color: '#254A96' }}>Ingreso de proveedor</div>
+                  <div style={{ fontSize: 13, color: '#666', marginTop: 4 }}>Camión externo con remito</div>
+                </button>
+              )}
+
               {/* Tab Depósito */}
               {(tab === 'deposito' || esDeposito) && (
                 <>
@@ -845,8 +859,12 @@ export default function GuardiaPage() {
               )}
             </div>
 
+            {tab === 'proveedores' && !esDeposito && (
+              <IngresosProveedorLista userId={userId} rol={rol} sucursalUsuario={sucursalUsuario} refreshKey={provRefresh} showToast={showToast} />
+            )}
+
             {/* ── MATRIZ DE ACTIVIDAD ── */}
-            {(() => {
+            {tab !== 'proveedores' && (() => {
               const TIPOS = [
                 { key: 'inicio_carga', label: 'Inicio carga', emoji: '📦', color: '#0891b2' },
                 { key: 'fin_carga',    label: 'Fin carga',    emoji: '✅', color: '#059669' },
@@ -1045,6 +1063,16 @@ export default function GuardiaPage() {
           </>
         )}
 
+        {/* INGRESO DE PROVEEDOR (camión externo) */}
+        {accion === 'prov_ingreso' && (
+          <IngresoProveedorForm
+            key={provInicial ? 'propio' : 'externo'} camiones={camiones} choferes={choferes} inicial={provInicial ?? undefined}
+            userId={userId} rol={rol} sucursalUsuario={sucursalUsuario} showToast={showToast}
+            onCancel={() => setAccion('home')}
+            onDone={msg => { setUltimoEvento(msg); setProvRefresh(k => k + 1); setTab('proveedores'); setAccion('home'); showToast('Ingreso de proveedor registrado') }}
+          />
+        )}
+
         {/* SALIDA */}
         {accion === 'salida' && (
           <div style={{ background: '#fff', borderRadius: 16, padding: '20px 16px', border: '1px solid #e0e0e0' }}>
@@ -1145,7 +1173,11 @@ export default function GuardiaPage() {
                   { key: 'con_transferencia', label: 'Con transferencia' },
                   { key: 'con_proveedor', label: 'Con proveedor' },
                 ] as const).map(({ key, label }) => (
-                  <button key={key} onClick={() => { setIngTipo(key); if (key !== 'con_transferencia') setIngDeposito(''); if (key !== 'con_proveedor') setIngProveedor('') }}
+                  <button key={key} onClick={() => {
+                    // «Con proveedor» se carga en el mismo formulario que el ingreso de proveedores (proveedor, remito, fotos)
+                    if (key === 'con_proveedor') { setProvInicial({ origen: 'propio', chofer: ingChofer, camion: ingCamion }); setAccion('prov_ingreso'); return }
+                    setIngTipo(key); setIngDeposito('')
+                  }}
                     style={{
                       flex: 1, minWidth: 90, padding: '12px 6px', borderRadius: 12, fontSize: 13, fontWeight: 600,
                       border: ingTipo === key ? '2px solid #254A96' : '1.5px solid #e0e0e0',
@@ -1166,14 +1198,7 @@ export default function GuardiaPage() {
                 </select>
               </div>
             )}
-            {ingTipo === 'con_proveedor' && (
-              <div style={fieldStyle}>
-                <label style={labelStyle}>Nombre del proveedor</label>
-                <input type="text" value={ingProveedor} onChange={e => setIngProveedor(e.target.value)}
-                  placeholder="ej: Acería Argentina" style={inputStyle} autoCapitalize="words" />
-              </div>
-            )}
-            {(ingTipo === 'con_transferencia' || ingTipo === 'con_proveedor') && (
+            {ingTipo === 'con_transferencia' && (
               <FotoSection fotos={ingFotos} setter={setIngFotos} fileRef={ingFileRef} color="#059669" />
             )}
             <button onClick={registrarIngreso} disabled={guardando} style={{ ...btnPrimary, background: '#059669' }}>
@@ -1341,11 +1366,12 @@ export default function GuardiaPage() {
             })()}
 
             {/* Fotos */}
+            <p style={{ color: 'rgba(255,255,255,0.55)', fontSize: 12, textAlign: 'center', marginBottom: 10 }}>Tocá una foto para ampliarla</p>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, justifyContent: 'center' }}>
               {visorFotos.urls.map((url, i) => (
                 // eslint-disable-next-line @next/next/no-img-element
-                <img key={i} src={url} alt={`foto ${i + 1}`}
-                  style={{ maxWidth: 260, maxHeight: 360, objectFit: 'contain', borderRadius: 12, border: '2px solid rgba(255,255,255,0.2)' }} />
+                <img key={i} src={url} alt={`foto ${i + 1}`} title="Tocá para ampliar" onClick={() => setFotoGrande({ urls: visorFotos.urls, i })}
+                  style={{ maxWidth: 260, maxHeight: 360, objectFit: 'contain', borderRadius: 12, border: '2px solid rgba(255,255,255,0.2)', cursor: 'zoom-in' }} />
               ))}
             </div>
 
@@ -1358,6 +1384,8 @@ export default function GuardiaPage() {
           </div>
         </div>
       )}
+
+      {fotoGrande && <VisorFotoGrande urls={fotoGrande.urls} inicio={fotoGrande.i} onCerrar={() => setFotoGrande(null)} />}
 
       {/* Modal editar evento — solo gerencia */}
       {editEvento && (

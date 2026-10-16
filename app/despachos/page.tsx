@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { supabase } from '../supabase'
+import { rolesDe } from '../lib/roles'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { puedeEditar } from '../lib/permisos'
@@ -146,9 +147,9 @@ export default function NuevoDespacho() {
     supabase.auth.getUser().then(({ data: { user } }) => {
       if (!user) { router.push('/'); return }
       setUserId(user.id)
-      supabase.from('usuarios').select('rol, permisos, nombre').eq('id', user.id).single().then(({ data }) => {
+      supabase.from('usuarios').select('rol, roles_extra, permisos, nombre').eq('id', user.id).single().then(({ data }) => {
         if (data) {
-          setPuedeEditarDespachos(puedeEditar(data.permisos, data.rol, 'despachos'))
+          setPuedeEditarDespachos(puedeEditar(data.permisos, rolesDe(data.rol, data.roles_extra), 'despachos'))
           setUserNombre(data.nombre ?? '')
           setUserRol(data.rol ?? null)
         }
@@ -1123,7 +1124,7 @@ export default function NuevoDespacho() {
                       <button type="button" onClick={() => setHierroModal(true)}
                         className="ml-2 text-xs font-bold rounded-full px-2 py-0.5"
                         style={{ background: p.forma_hierro ? '#e8edf8' : '#fee2e2', color: p.forma_hierro ? '#254A96' : '#b91c1c', border: 'none', cursor: 'pointer' }}>
-                        {p.forma_hierro ? (p.forma_hierro === 'doblado' ? 'DOBLADO' : 'DERECHO') + ' · cambiar' : '⚠ elegir derecho/doblado'}
+                        {p.forma_hierro ? (p.forma_hierro === 'doblado' ? 'DOBLADO' : p.forma_hierro === 'indistinto' ? 'INDISTINTO' : 'DERECHO') + ' · cambiar' : '⚠ elegir derecho/doblado/indistinto'}
                       </button>
                     )}
                   </div>

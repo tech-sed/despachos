@@ -3,9 +3,12 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { supabase } from '../supabase'
+import { rolesDe } from '../lib/roles'
 import { puedeEditar } from '../lib/permisos'
 import ProveedorPicker from '../components/ProveedorPicker'
 import OrdenesCompra from './OrdenesCompra'
+import { BadgeHuemul, CheckHuemul, ESTADO_HUEMUL, estadoHuemulFinal, ImportadorHuemul, ListaIngresosHuemul, useCruceHuemul } from './IngresosHuemul'
+import type { RemitoGuardia } from '../lib/huemul-utils'
 import ProductosRemito, { type ItemRemito } from './ProductosRemito'
 import AsociarOC from './AsociarOC'
 import VisorFotoGrande from '../components/VisorFotoGrande'
@@ -13,7 +16,8 @@ import {
   coincideTexto, cuitValido, formatCuit, normalizarCuit, normalizarRemito, remitoIgual, soloDigitos,
 } from '../lib/compras-utils'
 import {
-  crearProveedor, eliminarIngreso, fechaLocal, firmarFotos, useProveedores, type ProveedorLite,
+  crearProveedor, eliminarIngreso, ETIQUETA_VALIDACION, fechaLocal, firmarFotos, marcarRemitoHuemul, nombresUsuarios, useProveedores,
+  type EstadoValidacion, type ProveedorLite,
 } from '../lib/compras'
 
 const SUCURSALES = ['LP520', 'LP139', 'Guernica', 'Cañuelas', 'Pinamar']
@@ -75,6 +79,8 @@ export default function ComprasPage() {
   const [userId, setUserId] = useState<string | null>(null)
   const [rol, setRol] = useState('')
   const [puedeEd, setPuedeEd] = useState(false)
+  const [puedeMarcar, setPuedeMarcar] = useState(false)   // check «Lo cargué en Huemul»
+  const [marcando, setMarcando] = useState<string | null>(null)
   const [tab, setTab] = useState<Tab>('ingresos')
   const [toast, setToast] = useState<{ msg: string; tipo: 'ok' | 'err' } | null>(null)
   const { lista: proveedoresLista, recargar: recargarProveedores } = useProveedores()
@@ -86,6 +92,12 @@ export default function ComprasPage() {
   const [origen, setOrigen] = useState('todos')
   const [estadoRem, setEstadoRem] = useState('todos')
   const [filtroOC, setFiltroOC] = useState('todos')
+  const [filtroRecep, setFiltroRecep] = useState('todos')
+  const [filtroHuemul, setFiltroHuemul] = useState('todos')
+  const [subIng, setSubIng] = useState<'guardia' | 'huemul'>('guardia')
+  const [refreshHuemul, setRefreshHuemul] = useState(0)
+  const [nombresVal, setNombresVal] = useState<Record<string, string>>({})
+  const [fotosVal, setFotosVal] = useState<string[]>([])
   const [itemsRemito, setItemsRemito] = useState<ItemRemito[]>([])
   const [recargarItems, setRecargarItems] = useState(0)
   const [fotoGrande, setFotoGrande] = useState<{ urls: string[]; i: number } | null>(null)
@@ -124,10 +136,12 @@ export default function ComprasPage() {
       const res = await fetch('/api/mi-perfil', { headers: session?.access_token ? { Authorization: `Bearer ${session.access_token}` } : {} })
       const { perfil } = await res.json()
       const r = perfil?.rol ?? ''
+      const roles = rolesDe(r, perfil?.roles_extra)
       const permisos = perfil?.permisos ?? null
-      const acceso = ['gerencia', 'admin_flota', 'compras'].includes(r) || (permisos?.compras && permisos.compras !== 'none')
+      const acceso = roles.some(x => ['gerencia', 'admin_flota', 'compras'].includes(x)) || (permisos?.compras && permisos.compras !== 'none') || permisos?.huemul === 'editor'
       if (!acceso || permisos?.compras === 'none') { router.push('/dashboard'); return }
-      setUserId(user.id); setRol(r); setPuedeEd(puedeEditar(permisos, r, 'compras'))
+      setUserId(user.id); setRol(r); setPuedeEd(puedeEditar(permisos, roles, 'compras'))
+      setPuedeMarcar(puedeEditar(permisos, roles, 'compras') || permisos?.huemul === 'editor')
       setCargando(false)
     })()
   }, [])
@@ -141,6 +155,7 @@ export default function ComprasPage() {
     if (origen !== 'todos') q = q.eq('origen', origen)
     const { data } = await q
     setIngresos(data ?? [])
+    setNombresVal(await nombresUsuarios((data ?? []).flatMap((i: any) => [i.validado_por, ...(i.proveedor_remitos ?? []).map((r: any) => r.huemul_cargado_por)])))
     setCargandoIng(false)
   }, [desde, hasta, sucursal, origen])
 
@@ -152,10 +167,34 @@ export default function ComprasPage() {
   useEffect(() => { if (!cargando && tab === 'ingresos') cargarIngresos() }, [cargando, tab, cargarIngresos])
   useEffect(() => { if (!cargando && tab === 'proveedores') cargarTodosProv() }, [cargando, tab, cargarTodosProv])
 
+  // Cada remito de guardia contra lo que hay cargado en Huemul
+  const remitosGuardia: RemitoGuardia[] = useMemo(() => ingresos.flatMap(ing =>
+    (ing.proveedor_remitos ?? []).map((rem: any) => ({
+      id: rem.id as string, numero_remito: rem.numero_remito as string, fecha: ing.fecha as string,
+      proveedor_id: (ing.proveedor_id ?? null) as string | null, proveedor_nombre: (ing.proveedores?.nombre ?? null) as string | null,
+    }))), [ingresos])
+  const { cruce: cruceHuemul, ultima: ultimaHuemul } = useCruceHuemul(remitosGuardia, refreshHuemul)
+  // Mientras el jefe de depósito no valida la recepción, el remito no se le pide a quien carga en Huemul
+  const estadoDe = useCallback((rem: any, ing?: any) => {
+    const e = estadoHuemulFinal(rem, rem ? cruceHuemul.get(rem.id) : undefined, ultimaHuemul?.exportado_en ?? null, !!ultimaHuemul)
+    if (ing?.validacion_estado === 'pendiente' && (e === 'sin_cargar' || e === 'posterior_al_export' || e === 'sin_numero')) return 'espera_validacion' as const
+    return e
+  }, [cruceHuemul, ultimaHuemul])
+
   const filas: Fila[] = useMemo(() => {
     const todas = ingresos.flatMap(ing => (ing.proveedor_remitos?.length ? ing.proveedor_remitos : [null]).map((rem: any) => ({ ing, rem })))
     return todas.filter(({ ing, rem }) => {
       if (estadoRem !== 'todos' && (rem?.estado ?? 'registrado') !== estadoRem) return false
+      if (filtroRecep !== 'todos' && (ing.validacion_estado ?? 'sin') !== filtroRecep) return false
+      if (filtroHuemul !== 'todos') {
+        const e = estadoDe(rem, ing)
+        // "Sin cargar" incluye lo que llegó después del último export (todavía no puede estar en el archivo);
+        // "Marcados" son los que alguien tildó como cargados y el export todavía no confirmó
+        const coincide = filtroHuemul === 'sin_cargar' ? (e === 'sin_cargar' || e === 'posterior_al_export')
+          : filtroHuemul === 'marcado' ? (e === 'marcado' || e === 'marcado_no_figura')
+          : e === filtroHuemul
+        if (!coincide) return false
+      }
       const nOC = rem?.proveedor_remito_ocs?.length ?? 0
       if (filtroOC === 'sin' && (nOC > 0 || rem?.sin_oc)) return false
       if (filtroOC === 'asociadas' && nOC === 0) return false
@@ -164,14 +203,29 @@ export default function ComprasPage() {
       const hay = [ing.proveedores?.nombre, rem?.numero_remito, rem?.numero_remito_leido, ing.patente, ing.camion_codigo, ing.chofer].filter(Boolean).join(' ')
       return coincideTexto(hay, texto)
     })
-  }, [ingresos, estadoRem, filtroOC, texto])
+  }, [ingresos, estadoRem, filtroOC, filtroRecep, filtroHuemul, estadoDe, texto])
+
+  const marcarHuemul = async (rem: any, valor: boolean) => {
+    if (!rem?.id) return
+    setMarcando(rem.id)
+    try {
+      await marcarRemitoHuemul(rem.id, valor)
+      const cambios = { huemul_cargado_por: valor ? userId : null, huemul_cargado_en: valor ? new Date().toISOString() : null }
+      setIngresos(prev => prev.map(ing => ({ ...ing, proveedor_remitos: (ing.proveedor_remitos ?? []).map((r: any) => r.id === rem.id ? { ...r, ...cambios } : r) })))
+      setSel(prev => (prev && prev.rem?.id === rem.id ? { ...prev, rem: { ...prev.rem, ...cambios } } : prev))
+      if (valor && userId) nombresUsuarios([userId]).then(nm => setNombresVal(prev => ({ ...prev, ...nm })))
+      showToast(valor ? 'Marcado como cargado en Huemul' : 'Marca quitada')
+    } catch (e: any) { showToast(e?.message || 'No se pudo guardar la marca', 'err') }
+    setMarcando(null)
+  }
 
   const abrirDetalle = async (f: Fila) => {
     setSel(f); setFNumero(f.rem?.numero_remito ?? ''); setFObs(f.rem?.observacion_compras ?? '')
     setFProv(f.ing.proveedores ? { id: f.ing.proveedores.id, nombre: f.ing.proveedores.nombre, cuit: f.ing.proveedores.cuit, estado: f.ing.proveedores.estado } : null)
-    setFotos(null); setItemsRemito([])
+    setFotos(null); setItemsRemito([]); setFotosVal([])
     const [camion, remito] = await Promise.all([firmarFotos(f.ing.fotos_camion ?? []), firmarFotos(f.rem?.fotos ?? [])])
     setFotos({ camion, remito })
+    setFotosVal(await firmarFotos(f.ing.validacion_fotos ?? []))
   }
 
   const guardarDetalle = async (marcar?: 'revisado' | 'registrado') => {
@@ -223,7 +277,8 @@ export default function ComprasPage() {
 
   const exportarCSV = () => {
     const cols = ['fecha', 'hora', 'sucursal', 'proveedor', 'cuit_proveedor', 'estado_proveedor', 'origen', 'patente', 'camion_propio', 'chofer',
-      'numero_remito', 'numero_leido', 'corregido_por_guardia', 'cuit_leido', 'oc_citada', 'oc_asociadas', 'sin_oc', 'fecha_remito', 'estado_remito', 'observacion_compras', 'cant_fotos']
+      'numero_remito', 'numero_leido', 'corregido_por_guardia', 'cuit_leido', 'oc_citada', 'oc_asociadas', 'sin_oc', 'fecha_remito', 'estado_remito', 'observacion_compras', 'cant_fotos',
+      'recepcion', 'recepcion_nota', 'recepcion_validada_por', 'recepcion_fecha_hora', 'huemul', 'ingresos_huemul', 'huemul_marcado_por', 'huemul_marcado_en']
     const lineas = [cols.join(';')]
     for (const { ing, rem } of filas) {
       const hora = new Date(ing.hora_ingreso)
@@ -234,6 +289,10 @@ export default function ComprasPage() {
         numero_remito: rem?.numero_remito, numero_leido: rem?.numero_remito_leido, corregido_por_guardia: rem ? (rem.remito_corregido ? 'si' : 'no') : '',
         cuit_leido: rem?.cuit_leido, oc_citada: rem?.oc_numero_leido, oc_asociadas: (rem?.proveedor_remito_ocs ?? []).map((x: any) => x.oc_id).join(' + '), sin_oc: rem ? (rem.sin_oc ? 'si' : 'no') : '', fecha_remito: rem?.fecha_remito, estado_remito: rem?.estado,
         observacion_compras: rem?.observacion_compras, cant_fotos: (rem?.fotos?.length ?? 0) + (ing.fotos_camion?.length ?? 0),
+        recepcion: ing.validacion_estado ? ETIQUETA_VALIDACION[ing.validacion_estado as EstadoValidacion] : 'sin validación', recepcion_nota: ing.validacion_nota,
+        recepcion_validada_por: nombresVal[ing.validado_por], recepcion_fecha_hora: ing.validado_en ? new Date(ing.validado_en).toLocaleString('es-AR') : '',
+        huemul: rem && estadoDe(rem, ing) ? ESTADO_HUEMUL[estadoDe(rem, ing)!].corto : '', ingresos_huemul: ((rem ? cruceHuemul.get(rem.id)?.ingresos : undefined) ?? []).join(' + '),
+        huemul_marcado_por: rem ? nombresVal[rem.huemul_cargado_por] : '', huemul_marcado_en: rem?.huemul_cargado_en ? new Date(rem.huemul_cargado_en).toLocaleString('es-AR') : '',
       }
       lineas.push(cols.map(c => csvCell(fila[c])).join(';'))
     }
@@ -338,6 +397,18 @@ export default function ComprasPage() {
         {/* ───────── INGRESOS ───────── */}
         {tab === 'ingresos' && (
           <>
+            <ImportadorHuemul puedeEd={puedeEd} showToast={showToast} onImportado={() => setRefreshHuemul(k => k + 1)} />
+            <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+              {([['guardia', '📋 Remitos de guardia sin cargar en Huemul'], ['huemul', '📦 Ingresos de Huemul']] as ['guardia' | 'huemul', string][]).map(([k, l]) => (
+                <button key={k} onClick={() => setSubIng(k)} style={{
+                  flex: 1, padding: '10px 8px', borderRadius: 12, fontSize: 14, fontWeight: 700, cursor: 'pointer',
+                  border: subIng === k ? '2px solid #254A96' : '1.5px solid #e0e0e0', background: subIng === k ? '#eef2fb' : '#fff', color: subIng === k ? '#254A96' : '#666',
+                }}>{l}</button>
+              ))}
+            </div>
+            {subIng === 'huemul' && <ListaIngresosHuemul showToast={showToast} refreshKey={refreshHuemul} />}
+            {subIng === 'guardia' && (
+            <>
             <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 12, alignItems: 'center' }}>
               <input type="date" value={desde} onChange={e => setDesde(e.target.value)} style={{ ...inputSt, width: 'auto' }} />
               <input type="date" value={hasta} onChange={e => setHasta(e.target.value)} style={{ ...inputSt, width: 'auto' }} />
@@ -350,6 +421,12 @@ export default function ComprasPage() {
               <select value={filtroOC} onChange={e => setFiltroOC(e.target.value)} style={{ ...inputSt, width: 'auto' }}>
                 <option value="todos">Con y sin OC</option><option value="sin">OC sin asociar</option><option value="asociadas">OC asociada</option><option value="sinoc">Marcados sin OC</option>
               </select>
+              <select value={filtroHuemul} onChange={e => setFiltroHuemul(e.target.value)} style={{ ...inputSt, width: 'auto' }}>
+                <option value="todos">Todos (cargados y sin cargar en Huemul)</option><option value="sin_cargar">❌ Sin cargar en Huemul</option><option value="espera_validacion">⏳ Esperando validación de depósito</option><option value="marcado">🟡 Marcados como cargados (falta confirmar)</option><option value="cargado">✅ Confirmados en el export</option><option value="sin_numero">❓ Sin número</option>
+              </select>
+              <select value={filtroRecep} onChange={e => setFiltroRecep(e.target.value)} style={{ ...inputSt, width: 'auto' }}>
+                <option value="todos">Toda recepción</option><option value="con_rotura">⚠️ Con rotura</option><option value="pendiente">⏳ Pendiente de recepción</option><option value="ok">✅ Recibido OK</option>
+              </select>
               <select value={origen} onChange={e => setOrigen(e.target.value)} style={{ ...inputSt, width: 'auto' }}>
                 <option value="todos">Externo y propio</option><option value="externo">Externo</option><option value="propio">Propio</option>
               </select>
@@ -358,8 +435,8 @@ export default function ComprasPage() {
             </div>
             <div style={{ ...card, padding: 0, overflow: 'hidden' }}>
               <div style={{ overflowX: 'auto' }}>
-                <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 900 }}>
-                  <thead><tr>{['Fecha / hora', 'Sucursal', 'Proveedor', 'Origen', 'N° remito', 'OC', 'Aviso', 'Estado', 'Fotos'].map(h => <th key={h} style={th}>{h}</th>)}</tr></thead>
+                <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 1140 }}>
+                  <thead><tr>{['Fecha / hora', 'Sucursal', 'Proveedor', 'Origen', 'N° remito', 'OC', 'Huemul', 'Aviso', 'Estado', 'Recepción', 'Fotos'].map(h => <th key={h} style={th}>{h}</th>)}</tr></thead>
                   <tbody>
                     {filas.map(({ ing, rem }, i) => {
                       const av = aviso(ing, rem)
@@ -375,21 +452,31 @@ export default function ComprasPage() {
                             {rem?.remito_corregido && <div style={{ fontSize: 11, color: '#92400e' }}>✎ corregido por guardia (leído: {rem.numero_remito_leido})</div>}
                           </td>
                           <td style={td}>{(rem?.proveedor_remito_ocs?.length ?? 0) > 0 ? <b>{rem.proveedor_remito_ocs.map((x: any) => `OC ${x.oc_id}`).join(' + ')}</b> : rem?.sin_oc ? <span style={{ color: '#666' }}>Sin OC</span> : <span style={{ color: '#aaa' }}>sin asociar</span>}</td>
+                          <td style={td}>
+                            <BadgeHuemul estado={estadoDe(rem, ing)} ingresos={rem ? cruceHuemul.get(rem.id)?.ingresos : undefined} marca={rem ? { por: nombresVal[rem.huemul_cargado_por] ?? null, en: rem.huemul_cargado_en } : undefined} />
+                            {puedeMarcar && rem && estadoDe(rem, ing) !== 'cargado' && estadoDe(rem, ing) !== 'espera_validacion' && (
+                              <div><CheckHuemul marcado={!!rem.huemul_cargado_en} trabajando={marcando === rem.id} onCambiar={v => marcarHuemul(rem, v)} /></div>
+                            )}
+                          </td>
                           <td style={{ ...td, color: av?.rojo ? '#b91c1c' : '#92400e', fontSize: 12 }}>{av?.texto ?? ''}</td>
                           <td style={td}><span style={{ background: rem?.estado === 'revisado' ? '#ecfdf5' : '#fffbeb', color: rem?.estado === 'revisado' ? '#065f46' : '#92400e', borderRadius: 10, padding: '1px 8px', fontSize: 11, fontWeight: 700 }}>{rem?.estado === 'revisado' ? 'Revisado' : 'Por revisar'}</span></td>
+                          <td style={td}>{ing.validacion_estado ? <span style={{ borderRadius: 10, padding: '1px 8px', fontSize: 11, fontWeight: 700, whiteSpace: 'nowrap', background: ing.validacion_estado === 'con_rotura' ? '#fef2f2' : ing.validacion_estado === 'ok' ? '#ecfdf5' : '#fffbeb', color: ing.validacion_estado === 'con_rotura' ? '#b91c1c' : ing.validacion_estado === 'ok' ? '#065f46' : '#92400e' }}>{ETIQUETA_VALIDACION[ing.validacion_estado as EstadoValidacion]}</span> : <span style={{ color: '#B9BBB7' }}>—</span>}{ing.validacion_estado === 'con_rotura' && ing.validacion_nota && <div style={{ marginTop: 4, fontSize: 15, fontWeight: 800, color: '#b91c1c', maxWidth: 220, overflowWrap: 'anywhere' }}>{ing.validacion_nota}</div>}</td>
                           <td style={td}>📷 {nFotos}</td>
                         </tr>
                       )
                     })}
-                    {filas.length === 0 && <tr><td colSpan={9} style={{ ...td, textAlign: 'center', color: '#B9BBB7', padding: 28 }}>{cargandoIng ? 'Cargando…' : 'Sin ingresos para los filtros elegidos'}</td></tr>}
+                    {filas.length === 0 && <tr><td colSpan={11} style={{ ...td, textAlign: 'center', color: '#B9BBB7', padding: 28 }}>{cargandoIng ? 'Cargando…' : 'Sin ingresos para los filtros elegidos'}</td></tr>}
                   </tbody>
                 </table>
               </div>
             </div>
+            </>
+            )}
           </>
         )}
 
         {/* ───────── PROVEEDORES ───────── */}
+
         {tab === 'oc' && <OrdenesCompra puedeEd={puedeEd} showToast={showToast} onImportado={() => { recargarProveedores(); cargarTodosProv() }} />}
 
         {tab === 'proveedores' && (
@@ -445,9 +532,12 @@ export default function ComprasPage() {
           <div onClick={e => e.stopPropagation()} style={{ background: '#f4f4f3', maxWidth: 920, margin: '0 auto', borderRadius: 18, padding: 18 }}>
             <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10, marginBottom: 12 }}>
               <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 18, fontWeight: 800 }}>{sel.ing.proveedores?.nombre ?? 'Proveedor'}</div>
-                <div style={{ fontSize: 13, color: '#666' }}>
-                  {fmtFechaHora(sel.ing.hora_ingreso)} · {sel.ing.sucursal} · {sel.ing.origen === 'propio' ? `Camión propio ${sel.ing.camion_codigo ?? ''}` : `Externo${sel.ing.patente ? ` · ${sel.ing.patente}` : ''}`}{sel.ing.chofer ? ` · ${sel.ing.chofer}` : ''}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                  <div style={{ fontSize: 18, fontWeight: 800 }}>{sel.ing.proveedores?.nombre ?? 'Proveedor'}</div>
+                  <span style={{ background: '#254A96', color: '#fff', borderRadius: 10, padding: '3px 14px', fontSize: 22, fontWeight: 900, letterSpacing: '.02em' }}>{sel.ing.sucursal}</span>
+                </div>
+                <div style={{ fontSize: 13, color: '#666', marginTop: 4 }}>
+                  {fmtFechaHora(sel.ing.hora_ingreso)} · {sel.ing.origen === 'propio' ? `Camión propio ${sel.ing.camion_codigo ?? ''}` : `Externo${sel.ing.patente ? ` · ${sel.ing.patente}` : ''}`}{sel.ing.chofer ? ` · ${sel.ing.chofer}` : ''}
                 </div>
               </div>
               <button onClick={() => setSel(null)} style={btnLine}>✕</button>
@@ -467,6 +557,41 @@ export default function ComprasPage() {
               )}
               <div style={{ fontSize: 11, color: '#999', marginTop: 6 }}>Tocá una foto para verla grande.</div>
             </div>
+
+            {sel.rem && (
+              <div style={card}>
+                <label style={labelSt}>Huemul</label>
+                <BadgeHuemul estado={estadoDe(sel.rem, sel.ing)} ingresos={cruceHuemul.get(sel.rem.id)?.ingresos} marca={{ por: nombresVal[sel.rem.huemul_cargado_por] ?? null, en: sel.rem.huemul_cargado_en }} />
+                {puedeMarcar && estadoDe(sel.rem, sel.ing) !== 'cargado' && estadoDe(sel.rem, sel.ing) !== 'espera_validacion' && (
+                  <div><CheckHuemul grande marcado={!!sel.rem.huemul_cargado_en} trabajando={marcando === sel.rem.id} onCambiar={v => marcarHuemul(sel.rem, v)} /></div>
+                )}
+              </div>
+            )}
+
+            {sel.ing.validacion_estado && (
+              <div style={{ ...card, borderColor: sel.ing.validacion_estado === 'con_rotura' ? '#fecaca' : undefined, background: sel.ing.validacion_estado === 'con_rotura' ? '#fef2f2' : undefined }}>
+                <label style={labelSt}>Recepción en depósito</label>
+                <div style={{ fontSize: 14, fontWeight: 700, color: sel.ing.validacion_estado === 'con_rotura' ? '#b91c1c' : sel.ing.validacion_estado === 'ok' ? '#065f46' : '#92400e' }}>
+                  {ETIQUETA_VALIDACION[sel.ing.validacion_estado as EstadoValidacion]}
+                </div>
+                {sel.ing.validado_en && (
+                  <div style={{ fontSize: 12, color: '#6b7280', marginTop: 2 }}>
+                    Validó {nombresVal[sel.ing.validado_por] ?? '—'} · {new Date(sel.ing.validado_en).toLocaleString('es-AR')}
+                  </div>
+                )}
+                {sel.ing.validacion_nota && (
+                  <div style={{ margin: '10px 0 0', background: '#fff', border: '2px solid #dc2626', borderRadius: 12, padding: '10px 14px' }}>
+                    <div style={{ fontSize: 11, fontWeight: 800, color: '#991b1b', textTransform: 'uppercase', letterSpacing: '.06em' }}>Mercadería rota</div>
+                    <div style={{ fontSize: 28, fontWeight: 900, color: '#b91c1c', lineHeight: 1.2, marginTop: 2, overflowWrap: 'anywhere' }}>{sel.ing.validacion_nota}</div>
+                  </div>
+                )}
+                {fotosVal.length > 0 && (
+                  <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 8 }}>
+                    {fotosVal.map((u, i) => <img key={i} src={u} alt="rotura" title="Tocá para ampliar" onClick={() => setFotoGrande({ urls: fotosVal, i })} style={{ width: 110, height: 110, objectFit: 'cover', borderRadius: 10, border: '1px solid #ddd', cursor: 'zoom-in' }} />)}
+                  </div>
+                )}
+              </div>
+            )}
 
             {sel.rem && (
               <div style={card}>

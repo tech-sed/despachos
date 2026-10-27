@@ -138,7 +138,7 @@ const comprimirFoto = (file: File): Promise<File> =>
     const url = URL.createObjectURL(file)
     img.onload = () => {
       URL.revokeObjectURL(url)
-      const MAX_PX = 1600
+      const MAX_PX = 1280
       let { width, height } = img
       if (width > MAX_PX || height > MAX_PX) {
         if (width > height) { height = Math.round(height * MAX_PX / width); width = MAX_PX }
@@ -149,7 +149,7 @@ const comprimirFoto = (file: File): Promise<File> =>
       canvas.getContext('2d')!.drawImage(img, 0, 0, width, height)
       canvas.toBlob(blob => {
         resolve(blob ? new File([blob], file.name.replace(/\.[^.]+$/, '.jpg'), { type: 'image/jpeg' }) : file)
-      }, 'image/jpeg', 0.82)
+      }, 'image/jpeg', 0.78)
     }
     img.onerror = () => { URL.revokeObjectURL(url); resolve(file) }
     img.src = url
@@ -186,6 +186,7 @@ export default function TallerPage() {
   const [rol, setRol] = useState('')
   const [permisos, setPermisos] = useState<Record<string, string> | null>(null)
   const [sucursal, setSucursal] = useState('Guernica')
+  const [sucursalLibre, setSucursalLibre] = useState(false) // usuario con "Todas las sucursales": puede cambiar de obra
   const [tab, setTab] = useState<Tab>('abiertas')
   const [toast, setToast] = useState<{ msg: string; tipo: 'ok' | 'err' } | null>(null)
   const [ahora, setAhora] = useState(Date.now())
@@ -301,7 +302,7 @@ export default function TallerPage() {
       if (!acceso || perfil?.permisos?.taller === 'none') { router.push('/dashboard'); return }
       setUserId(user.id); setRol(r); setPermisos(perfil?.permisos ?? null)
       const suc = SUCURSALES.includes(perfil?.sucursal) ? perfil.sucursal : 'Guernica'
-      setSucursal(suc); setExpSucursal(suc)
+      setSucursal(suc); setExpSucursal(suc); setSucursalLibre(!perfil?.sucursal)
       const { data: flota } = await supabase.from('camiones_flota').select('codigo').order('codigo')
       setCamiones((flota ?? []).map((c: any) => c.codigo))
       const { data: eq } = await supabase.from('taller_equipos').select('*').order('tipo').order('codigo')
@@ -357,10 +358,12 @@ export default function TallerPage() {
     if (!files) return
     const libres = MAX_FOTOS - actual.length
     if (libres <= 0) { showToast(`Máximo ${MAX_FOTOS} fotos`, 'err'); return }
-    const nuevas = await Promise.all(Array.from(files).slice(0, libres).map(async f => {
+    // Se procesan de a una para no saturar la memoria del celular
+    const nuevas: FotoItem[] = []
+    for (const f of Array.from(files).slice(0, libres)) {
       const c = await comprimirFoto(f)
-      return { file: c, preview: URL.createObjectURL(c) }
-    }))
+      nuevas.push({ file: c, preview: URL.createObjectURL(c) })
+    }
     setter([...actual, ...nuevas])
   }
 
@@ -792,11 +795,19 @@ export default function TallerPage() {
         </div>
       )}
       {fotos.length < MAX_FOTOS && (
-        <label style={{ display: 'inline-block', padding: '10px 16px', borderRadius: 10, border: '1.5px dashed #254A96', color: '#254A96', fontWeight: 600, fontSize: 14, cursor: 'pointer' }}>
-          📷 {fotos.length === 0 ? 'Agregar foto' : 'Agregar otra'}
-          <input type="file" accept="image/*" multiple style={{ display: 'none' }}
-            onChange={e => { agregarFotos(e.target.files, fotos, setter); e.target.value = '' }} />
-        </label>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          {/* Cámara directa: saca la foto y vuelve a esta pantalla; se repite para sacar otra */}
+          <label style={{ flex: '1 1 150px', textAlign: 'center', padding: '12px 14px', borderRadius: 10, border: '1.5px solid #254A96', background: '#eef2fb', color: '#254A96', fontWeight: 700, fontSize: 14, cursor: 'pointer' }}>
+            📷 {fotos.length === 0 ? 'Sacar foto' : 'Sacar otra foto'}
+            <input type="file" accept="image/*" capture="environment" style={{ display: 'none' }}
+              onChange={e => { agregarFotos(e.target.files, fotos, setter); e.target.value = '' }} />
+          </label>
+          <label style={{ flex: '1 1 150px', textAlign: 'center', padding: '12px 14px', borderRadius: 10, border: '1.5px dashed #c8c8c8', color: '#666', fontWeight: 600, fontSize: 14, cursor: 'pointer' }}>
+            🖼️ Elegir de la galería
+            <input type="file" accept="image/*" multiple style={{ display: 'none' }}
+              onChange={e => { agregarFotos(e.target.files, fotos, setter); e.target.value = '' }} />
+          </label>
+        </div>
       )}
     </div>
   )
@@ -827,7 +838,7 @@ export default function TallerPage() {
             <h1 style={{ color: '#fff', fontSize: 20, fontWeight: 700, margin: 0 }}>🔧 Taller</h1>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            {esAdmin ? (
+            {esAdmin || sucursalLibre ? (
               <select value={sucursal} onChange={e => setSucursal(e.target.value)}
                 style={{ padding: '7px 10px', borderRadius: 10, border: 'none', fontSize: 14, fontWeight: 600 }}>
                 {SUCURSALES.map(s => <option key={s}>{s}</option>)}
